@@ -493,11 +493,40 @@ function getTruckPosition(playback, geometry, currentMinute, truckId) {
 }
 
 function createTruckIcon(truckId) {
+  const svg = `
+    <svg width="44" height="44" viewBox="0 0 44 44" fill="none" xmlns="http://www.w3.org/2000/svg">
+      <g filter="url(#shadow)">
+        <path d="M10 24.5C10 20.9101 12.9101 18 16.5 18H25.5C28.5376 18 31 20.4624 31 23.5V28.5H10V24.5Z" fill="#3F3A8A"/>
+        <path d="M31 21H34.7C35.5546 21 36.3542 21.4091 36.85 22.1L39.15 25.3C39.6987 26.0634 40 27.0001 40 27.9403V28.5H31V21Z" fill="#5A54C5"/>
+        <rect x="14" y="20.5" width="6.5" height="4.5" rx="1.2" fill="#E8F0FF"/>
+        <rect x="22" y="20.5" width="6.5" height="4.5" rx="1.2" fill="#E8F0FF"/>
+        <circle cx="16.5" cy="30.5" r="3.5" fill="#1E1B4B"/>
+        <circle cx="16.5" cy="30.5" r="1.7" fill="#F8FAFC"/>
+        <circle cx="33.5" cy="30.5" r="3.5" fill="#1E1B4B"/>
+        <circle cx="33.5" cy="30.5" r="1.7" fill="#F8FAFC"/>
+        <path d="M31 23.2H35.1L36.8 25.6H31V23.2Z" fill="#E8F0FF"/>
+      </g>
+      <circle cx="35" cy="10" r="7" fill="#FF7A1A"/>
+      <text x="35" y="12.5" text-anchor="middle" font-family="Space Grotesk, sans-serif" font-size="8" font-weight="700" fill="white">${truckId}</text>
+      <defs>
+        <filter id="shadow" x="2" y="11" width="40" height="29" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
+          <feFlood flood-opacity="0" result="BackgroundImageFix"/>
+          <feColorMatrix in="SourceAlpha" type="matrix" values="0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 127 0" result="hardAlpha"/>
+          <feOffset dy="2"/>
+          <feGaussianBlur stdDeviation="3"/>
+          <feComposite in2="hardAlpha" operator="out"/>
+          <feColorMatrix type="matrix" values="0 0 0 0 0.149 0 0 0 0 0.137 0 0 0 0 0.404 0 0 0 0.28 0"/>
+          <feBlend mode="normal" in2="BackgroundImageFix" result="effect1_dropShadow_1_1"/>
+          <feBlend mode="normal" in="SourceGraphic" in2="effect1_dropShadow_1_1" result="shape"/>
+        </filter>
+      </defs>
+    </svg>`;
+
   return window.L.divIcon({
     className: "truck-marker-icon",
-    html: `<div class="truck-marker-body"><span class="truck-glyph">🚚</span><span class="truck-label">${truckId}</span></div>`,
-    iconSize: [34, 34],
-    iconAnchor: [17, 17],
+    html: `<div class="truck-marker-body">${svg}</div>`,
+    iconSize: [44, 44],
+    iconAnchor: [22, 22],
   });
 }
 
