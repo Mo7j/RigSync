@@ -70,18 +70,6 @@ export function HomePage({
             "RigSync uses digital twin technology to optimize logistics, reduce delays, and eliminate operational risk across complex rig move programs.",
           ),
           h(
-            "ul",
-            { className: "hero-points" },
-            FEATURE_ITEMS.map((item) =>
-              h(
-                "li",
-                { key: item.title },
-                h("span", { className: "hero-check" }, "✓"),
-                h("span", null, item.title),
-              ),
-            ),
-          ),
-          h(
             "div",
             { className: "hero-actions" },
             h(Button, {
@@ -105,9 +93,17 @@ export function HomePage({
           "div",
           { className: "hero-side-panel" },
           h(
-            Card,
+            "div",
             { className: "hero-side-card" },
-            h("p", { className: "muted-copy" }, "Trusted across large-scale move programs"),
+            h(
+              "div",
+              { className: "hero-side-badge" },
+              h("span", { className: "hero-side-badge-dot" }),
+              h("span", null, "Live Command View"),
+            ),
+            h("p", { className: "eyebrow" }, "Operations Signal"),
+            h("h3", { className: "hero-side-title" }, "Trusted across large-scale move programs"),
+            h("p", { className: "muted-copy" }, "Digital planning, live route visibility, and safer execution for high-value rig transfers."),
             h(
               "div",
               { className: "logo-cluster" },
@@ -116,12 +112,14 @@ export function HomePage({
               h("span", null, "SA"),
               h("strong", null, "+25k"),
             ),
-            h("p", { className: "hero-footnote" }, "World rig moves"),
-          ),
-          h(
-            "div",
-            { className: "hero-ring" },
-            h("span", null, "Explore More"),
+            h("div", { className: "hero-side-divider" }),
+            h(
+              "dl",
+              { className: "hero-side-metrics" },
+              h("div", null, h("dt", null, "Planning confidence"), h("dd", null, "98%")),
+              h("div", null, h("dt", null, "Ops visibility"), h("dd", null, "24/7")),
+            ),
+            h("p", { className: "hero-footnote" }, "World rig moves modeled and tracked through one command surface."),
           ),
         ),
       ),
@@ -209,18 +207,69 @@ export function HomePage({
       { className: "marketing-footer" },
       h(
         "div",
-        null,
-        h("strong", { className: "footer-brand" }, "RigSync"),
-        h("p", { className: "muted-copy" }, "Premium SaaS frontend for modern rig move operations."),
-      ),
-      h(
-        Button,
-        {
-          type: "button",
-          variant: "secondary",
-          onClick: hasSession ? onOpenDashboard : onOpenLogin,
-          children: hasSession ? "Go to Dashboard" : "Open Login",
-        },
+        { className: "marketing-footer-inner" },
+        h(
+          "div",
+          { className: "marketing-footer-grid" },
+          h(
+            "div",
+            { className: "marketing-footer-brand" },
+            h("strong", { className: "footer-brand" }, "RigSync"),
+            h("p", { className: "muted-copy" }, "Premium SaaS frontend for modern rig move operations, from planning through execution."),
+          ),
+          h(
+            "div",
+            { className: "marketing-footer-column" },
+            h("span", { className: "marketing-footer-heading" }, "Product"),
+            h(
+              "button",
+              {
+                type: "button",
+                className: "footer-link",
+                onClick: () => document.getElementById("features")?.scrollIntoView({ behavior: "smooth" }),
+              },
+              "Features",
+            ),
+            h(
+              "button",
+              {
+                type: "button",
+                className: "footer-link",
+                onClick: hasSession ? onOpenDashboard : onOpenLogin,
+              },
+              hasSession ? "Dashboard" : "Login",
+            ),
+          ),
+          h(
+            "div",
+            { className: "marketing-footer-column" },
+            h("span", { className: "marketing-footer-heading" }, "Company"),
+            h(
+              "button",
+              {
+                type: "button",
+                className: "footer-link",
+                onClick: () => document.getElementById("about")?.scrollIntoView({ behavior: "smooth" }),
+              },
+              "About Us",
+            ),
+            h(
+              "button",
+              {
+                type: "button",
+                className: "footer-link",
+                onClick: () => document.getElementById("faq")?.scrollIntoView({ behavior: "smooth" }),
+              },
+              "FAQ",
+            ),
+          ),
+        ),
+        h(
+          "div",
+          { className: "marketing-footer-bottom" },
+          h("span", null, "© 2026 RigSync"),
+          h("span", null, "Built for modern rig move operations"),
+        ),
       ),
     ),
   );
