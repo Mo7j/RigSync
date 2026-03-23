@@ -1,0 +1,14 @@
+{
+  "chat.mcp.gallery.enabled": true,
+    
+  "codex.mcpServers": {
+    "figma": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-figma"],
+      "env": {
+        "FIGMA_ACCESS_TOKEN": "figd_EoarVzLA6eF7oYaxA_rG-oqZnYRWcqsbyIIxKFM5"
+      }
+    }
+  
+}
+}

@@ -5,11 +5,13 @@ const MIN_LOAD_DURATION_MINUTES = 30;
 const MAX_LOAD_DURATION_MINUTES = 120;
 const DEFAULT_CENTER = [24.7136, 46.6753];
 const BASE_PLAYBACK_SECONDS = 40;
+const HISTORY_STORAGE_KEY = "rigsync-plan-history";
+const ALLOWED_SCREENS = new Set(["login", "home", "planner", "history", "compare"]);
 
-function Stat({ label, value }) {
+function Stat({ label, value, tone = "default" }) {
   return React.createElement(
     "div",
-    { className: "stat" },
+    { className: `stat-card tone-${tone}` },
     React.createElement("span", { className: "stat-label" }, label),
     React.createElement("strong", { className: "stat-value" }, value ?? "-"),
   );
@@ -38,8 +40,134 @@ function formatCoordinate(latlng) {
   return `${latlng.lat.toFixed(5)}, ${latlng.lng.toFixed(5)}`;
 }
 
+function parseCoordinateString(value) {
+  if (!value || typeof value !== "string") {
+    return null;
+  }
+
+  const [lat, lng] = value.split(",").map((item) => Number.parseFloat(item.trim()));
+  if (Number.isNaN(lat) || Number.isNaN(lng)) {
+    return null;
+  }
+
+  return { lat, lng };
+}
+
+function haversineKilometers(start, end) {
+  if (!start || !end) {
+    return 0;
+  }
+
+  const earthRadiusKm = 6371;
+  const dLat = ((end.lat - start.lat) * Math.PI) / 180;
+  const dLng = ((end.lng - start.lng) * Math.PI) / 180;
+  const a =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos((start.lat * Math.PI) / 180) *
+      Math.cos((end.lat * Math.PI) / 180) *
+      Math.sin(dLng / 2) ** 2;
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+
+  return earthRadiusKm * c;
+}
+
+function buildDashboardSnapshot({ history, simulation, currentMinute, loadCount }) {
+  const latestHistory = history[0] || null;
+  const startPoint = simulation?.startPoint || parseCoordinateString(latestHistory?.start) || { lat: 26.4207, lng: 50.0888 };
+  const endPoint = simulation?.endPoint || parseCoordinateString(latestHistory?.end) || { lat: 25.3632, lng: 49.5856 };
+  const routeKm = Math.max(1, Math.round(haversineKilometers(startPoint, endPoint) * 10) / 10);
+  const totalMinutes = simulation?.bestPlan?.totalMinutes || 514;
+  const elapsedMinutes = simulation?.bestPlan ? Math.min(totalMinutes, Math.round(currentMinute)) : Math.round(totalMinutes * 0.38);
+  const completion = Math.min(100, Math.max(0, Math.round((elapsedMinutes / Math.max(totalMinutes, 1)) * 100)));
+  const truckCount = simulation?.truckCount || Number.parseInt(latestHistory?.trucks, 10) || 4;
+  const workerCount = simulation?.workerCount || Number.parseInt(latestHistory?.workers, 10) || 6;
+  const savedPlans = history.length;
+  const activeTrips = simulation?.bestPlan?.playback?.trips?.filter((trip) => elapsedMinutes < (trip.returnToSource ?? trip.arrivalAtDestination)).length || Math.min(truckCount, 3);
+  const routeTime = simulation?.routeMinutes || latestHistory?.routeTime || formatMinutes(Math.round(routeKm * 3.1));
+  const eta = simulation?.bestPlan ? formatMinutes(totalMinutes) : latestHistory?.eta || "14 hr 22 min";
+
+  return {
+    startPoint,
+    endPoint,
+    routeKm,
+    totalMinutes,
+    elapsedMinutes,
+    completion,
+    truckCount,
+    workerCount,
+    savedPlans,
+    activeTrips,
+    routeTime,
+    eta,
+    loadCount: loadCount || 24,
+    planName: simulation?.bestPlan?.name || latestHistory?.planName || "Plan A",
+    routeTitle: latestHistory?.title || `${formatCoordinate(startPoint)} to ${formatCoordinate(endPoint)}`,
+    routeSource: simulation?.routeSource || "Operational estimate",
+  };
+}
+
+function buildNavigationItems(activeScreen) {
+  return [
+    { id: "planner", label: "planning", active: activeScreen === "planner" || activeScreen === "home" },
+    { id: "compare", label: "comparing", active: activeScreen === "compare" || activeScreen === "history" },
+  ];
+}
+
+function getInitialScreen() {
+  const params = new URLSearchParams(window.location.search);
+  const requestedScreen = params.get("screen");
+  if (!ALLOWED_SCREENS.has(requestedScreen)) {
+    return "login";
+  }
+  if (requestedScreen === "home") {
+    return "planner";
+  }
+  if (requestedScreen === "history") {
+    return "compare";
+  }
+  return requestedScreen;
+}
+
+function DashboardTopbar({ activeScreen, title, subtitle, onNavigate }) {
+  const navigationItems = buildNavigationItems(activeScreen);
+
+  return React.createElement(
+    "header",
+    { className: "dashboard-topbar" },
+    React.createElement(
+      "div",
+      { className: "dashboard-brand" },
+      React.createElement("p", { className: "eyebrow" }, "RigSync"),
+      React.createElement("h1", null, title),
+      subtitle ? React.createElement("p", { className: "panel-note dashboard-subtitle" }, subtitle) : null,
+    ),
+    React.createElement(
+      "div",
+      { className: "dashboard-nav" },
+      navigationItems.map((item) =>
+        React.createElement(
+          "button",
+          {
+            key: item.id,
+            type: "button",
+            className: `dashboard-nav-button${item.active ? " active" : ""}`,
+            onClick: () => onNavigate(item.id),
+          },
+          item.label,
+        ),
+      ),
+    ),
+    React.createElement(
+      "div",
+      { className: "dashboard-user" },
+      React.createElement("span", { className: "dashboard-user-dot" }),
+      React.createElement("span", null, "Operations"),
+    ),
+  );
+}
+
 function getLoadDurationMinutes(loadId) {
-  const seeded = ((loadId * 37) % (MAX_LOAD_DURATION_MINUTES - MIN_LOAD_DURATION_MINUTES + 1));
+  const seeded = (loadId * 37) % (MAX_LOAD_DURATION_MINUTES - MIN_LOAD_DURATION_MINUTES + 1);
   return MIN_LOAD_DURATION_MINUTES + seeded;
 }
 
@@ -141,7 +269,7 @@ function haversineMinutes(start, end) {
 async function fetchRouteData(start, end) {
   const coordinates = `${start.lng},${start.lat};${end.lng},${end.lat}`;
   const response = await fetch(
-    `https://router.project-osrm.org/route/v1/driving/${coordinates}?overview=full&geometries=geojson`
+    `https://router.project-osrm.org/route/v1/driving/${coordinates}?overview=full&geometries=geojson`,
   );
 
   if (!response.ok) {
@@ -265,6 +393,111 @@ function buildSchedules(loads) {
   }));
 }
 
+function buildScenarioPlans(logicalLoads, routeData, workerCount, truckCount) {
+  const scenarios = [
+    { name: "Plan A", workerCount, truckCount },
+    { name: "Plan B", workerCount: workerCount + 2, truckCount: truckCount + 1 },
+    { name: "Plan C", workerCount: workerCount + 3, truckCount: truckCount + 2 },
+  ];
+
+  const plannerVariants = buildSchedules(logicalLoads);
+
+  return scenarios.map((scenario) => {
+    const capacity = Math.max(1, Math.min(scenario.workerCount, scenario.truckCount));
+    const variantPlans = plannerVariants.map((variant) => {
+      const waves = variant.wavesForCapacity(capacity);
+      const playback = buildPlayback({ routeMinutes: routeData.minutes, waves }, scenario.truckCount);
+
+      return {
+        name: variant.name,
+        waves,
+        routeMinutes: routeData.minutes,
+        processingMinutes: Math.max(0, playback.totalMinutes - routeData.minutes),
+        totalMinutes: playback.totalMinutes,
+        playback,
+      };
+    });
+
+    variantPlans.sort((a, b) => a.totalMinutes - b.totalMinutes);
+    const bestVariant = variantPlans[0] || null;
+
+    return {
+      name: scenario.name,
+      workerCount: scenario.workerCount,
+      truckCount: scenario.truckCount,
+      capacity,
+      routeMinutes: routeData.minutes,
+      routeSource: routeData.source,
+      routeGeometry: routeData.geometry,
+      variantPlans,
+      bestVariant,
+      totalMinutes: bestVariant?.totalMinutes ?? 0,
+      processingMinutes: bestVariant?.processingMinutes ?? 0,
+      playback: bestVariant?.playback ?? null,
+      waves: bestVariant?.waves ?? [],
+    };
+  });
+}
+
+function buildComparisonRows(scenarioPlans) {
+  if (!scenarioPlans?.length) {
+    return [];
+  }
+
+  const stages = [
+    {
+      key: "routeMinutes",
+      label: "Travel time",
+      format: (plan) => formatMinutes(plan.routeMinutes),
+      compare: "min",
+    },
+    {
+      key: "processingMinutes",
+      label: "Rig work",
+      format: (plan) => formatMinutes(plan.processingMinutes),
+      compare: "min",
+    },
+    {
+      key: "totalMinutes",
+      label: "Total ETA",
+      format: (plan) => formatMinutes(plan.totalMinutes),
+      compare: "min",
+    },
+    {
+      key: "workerCount",
+      label: "Workers",
+      format: (plan) => String(plan.workerCount),
+      compare: "none",
+    },
+    {
+      key: "truckCount",
+      label: "Trucks",
+      format: (plan) => String(plan.truckCount),
+      compare: "none",
+    },
+    {
+      key: "capacity",
+      label: "Parallel capacity",
+      format: (plan) => String(plan.capacity),
+      compare: "max",
+    },
+  ];
+
+  return stages.map((row) => ({
+    label: row.label,
+    values: scenarioPlans.map((plan) => ({
+      planName: plan.name,
+      text: row.format(plan),
+      best:
+        row.compare === "min"
+          ? plan[row.key] === Math.min(...scenarioPlans.map((candidate) => candidate[row.key]))
+          : row.compare === "max"
+            ? plan[row.key] === Math.max(...scenarioPlans.map((candidate) => candidate[row.key]))
+            : false,
+    })),
+  }));
+}
+
 function buildPlayback(plan, truckCount) {
   const steps = [];
   const trucks = Array.from({ length: truckCount }, (_, index) => ({
@@ -306,37 +539,20 @@ function buildPlayback(plan, truckCount) {
       steps.push({
         type: "load-start",
         minute: loadStart,
-        truckId: truck.id,
-        loadId: load.id,
         title: `Truck ${truck.id} starts loading #${load.id}`,
-        description: `Stage ${waveIndex + 1}: rig down for ${load.description} at the source rig for ${formatMinutes(load.rig_down_duration || 0)}.`,
+        description: `${load.description} enters stage ${waveIndex + 1}.`,
       });
-
-      steps.push({
-        type: "load-finish",
-        minute: rigDownFinish,
-        truckId: truck.id,
-        loadId: load.id,
-        title: `Truck ${truck.id} departs with load #${load.id}`,
-        description: `${load.description} is secured and moving toward the destination rig.`,
-      });
-
       steps.push({
         type: "arrival",
         minute: arrivalAtDestination,
-        truckId: truck.id,
-        loadId: load.id,
-        title: `Truck ${truck.id} delivers load #${load.id}`,
-        description: `${load.description} arrives at the destination rig.`,
+        title: `Truck ${truck.id} delivers #${load.id}`,
+        description: `${load.description} reaches the destination rig.`,
       });
-
       steps.push({
         type: "rig-up-finish",
         minute: rigUpFinish,
-        truckId: truck.id,
-        loadId: load.id,
-        title: `Truck ${truck.id} completes rig up for #${load.id}`,
-        description: `${load.description} is rigged up at the destination in ${formatMinutes(load.rig_up_duration || 0)}.`,
+        title: `Rig up complete for #${load.id}`,
+        description: `${load.description} is positioned at the destination.`,
       });
 
       truck.availableAt = returnToSource;
@@ -344,12 +560,11 @@ function buildPlayback(plan, truckCount) {
     });
 
     stageReadyAt = Math.max(...stageArrivals);
-
     steps.push({
       type: "stage-complete",
       minute: stageReadyAt,
       title: `Stage ${waveIndex + 1} complete`,
-      description: `All loads in stage ${waveIndex + 1} have been transferred.`,
+      description: `All loads in stage ${waveIndex + 1} are complete.`,
     });
   });
 
@@ -431,20 +646,20 @@ function getTruckStatus(playback, currentMinute, truckId) {
     if (deliveredTrip) {
       return `Delivered #${deliveredTrip.loadId}`;
     }
-    return "Waiting at source";
+    return "Waiting";
   }
 
   if (currentMinute < activeTrip.rigDownFinish) {
     return `Loading #${activeTrip.loadId}`;
   }
   if (currentMinute < activeTrip.arrivalAtDestination) {
-    return `Going to destination with #${activeTrip.loadId}`;
+    return `In transit #${activeTrip.loadId}`;
   }
   if (currentMinute < activeTrip.rigUpFinish) {
-    return `Rig Up #${activeTrip.loadId}`;
+    return `Rig up #${activeTrip.loadId}`;
   }
   if (activeTrip.returnToSource && currentMinute < activeTrip.returnToSource) {
-    return "Returning empty";
+    return "Returning";
   }
   return `Delivered #${activeTrip.loadId}`;
 }
@@ -474,8 +689,7 @@ function getTruckPosition(playback, geometry, currentMinute, truckId) {
   if (currentMinute < activeTrip.arrivalAtDestination) {
     return interpolatePath(
       outbound,
-      (currentMinute - activeTrip.rigDownFinish) /
-        (activeTrip.arrivalAtDestination - activeTrip.rigDownFinish || 1)
+      (currentMinute - activeTrip.rigDownFinish) / (activeTrip.arrivalAtDestination - activeTrip.rigDownFinish || 1),
     );
   }
   if (currentMinute < activeTrip.rigUpFinish) {
@@ -484,8 +698,7 @@ function getTruckPosition(playback, geometry, currentMinute, truckId) {
   if (activeTrip.returnToSource && currentMinute < activeTrip.returnToSource) {
     return interpolatePath(
       inbound,
-      (currentMinute - activeTrip.rigUpFinish) /
-        (activeTrip.returnToSource - activeTrip.rigUpFinish || 1)
+      (currentMinute - activeTrip.rigUpFinish) / (activeTrip.returnToSource - activeTrip.rigUpFinish || 1),
     );
   }
 
@@ -494,39 +707,21 @@ function getTruckPosition(playback, geometry, currentMinute, truckId) {
 
 function createTruckIcon(truckId) {
   const svg = `
-    <svg width="44" height="44" viewBox="0 0 44 44" fill="none" xmlns="http://www.w3.org/2000/svg">
-      <g filter="url(#shadow)">
-        <path d="M10 24.5C10 20.9101 12.9101 18 16.5 18H25.5C28.5376 18 31 20.4624 31 23.5V28.5H10V24.5Z" fill="#3F3A8A"/>
-        <path d="M31 21H34.7C35.5546 21 36.3542 21.4091 36.85 22.1L39.15 25.3C39.6987 26.0634 40 27.0001 40 27.9403V28.5H31V21Z" fill="#5A54C5"/>
-        <rect x="14" y="20.5" width="6.5" height="4.5" rx="1.2" fill="#E8F0FF"/>
-        <rect x="22" y="20.5" width="6.5" height="4.5" rx="1.2" fill="#E8F0FF"/>
-        <circle cx="16.5" cy="30.5" r="3.5" fill="#1E1B4B"/>
-        <circle cx="16.5" cy="30.5" r="1.7" fill="#F8FAFC"/>
-        <circle cx="33.5" cy="30.5" r="3.5" fill="#1E1B4B"/>
-        <circle cx="33.5" cy="30.5" r="1.7" fill="#F8FAFC"/>
-        <path d="M31 23.2H35.1L36.8 25.6H31V23.2Z" fill="#E8F0FF"/>
-      </g>
-      <circle cx="35" cy="10" r="7" fill="#FF7A1A"/>
-      <text x="35" y="12.5" text-anchor="middle" font-family="Space Grotesk, sans-serif" font-size="8" font-weight="700" fill="white">${truckId}</text>
-      <defs>
-        <filter id="shadow" x="2" y="11" width="40" height="29" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
-          <feFlood flood-opacity="0" result="BackgroundImageFix"/>
-          <feColorMatrix in="SourceAlpha" type="matrix" values="0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 127 0" result="hardAlpha"/>
-          <feOffset dy="2"/>
-          <feGaussianBlur stdDeviation="3"/>
-          <feComposite in2="hardAlpha" operator="out"/>
-          <feColorMatrix type="matrix" values="0 0 0 0 0.149 0 0 0 0 0.137 0 0 0 0 0.404 0 0 0 0.28 0"/>
-          <feBlend mode="normal" in2="BackgroundImageFix" result="effect1_dropShadow_1_1"/>
-          <feBlend mode="normal" in="SourceGraphic" in2="effect1_dropShadow_1_1" result="shape"/>
-        </filter>
-      </defs>
+    <svg width="42" height="42" viewBox="0 0 42 42" fill="none" xmlns="http://www.w3.org/2000/svg">
+      <circle cx="21" cy="21" r="20" fill="rgba(122,86,255,0.18)" stroke="#7a56ff" />
+      <path d="M11 23.5C11 20.4624 13.4624 18 16.5 18H23.5C26.5376 18 29 20.4624 29 23.5V27H11V23.5Z" fill="#E8E4FF"/>
+      <path d="M29 20H32.2C33.0233 20 33.7933 20.4021 34.2627 21.076L36.2 23.8571C36.7194 24.6027 37 25.4897 37 26.3983V27H29V20Z" fill="#A58DFF"/>
+      <circle cx="16.5" cy="28.5" r="2.5" fill="#111013"/>
+      <circle cx="30.5" cy="28.5" r="2.5" fill="#111013"/>
+      <circle cx="31.5" cy="11" r="7" fill="#ff6d4d"/>
+      <text x="31.5" y="13.5" text-anchor="middle" font-family="Space Grotesk, sans-serif" font-size="8" font-weight="700" fill="white">${truckId}</text>
     </svg>`;
 
   return window.L.divIcon({
     className: "truck-marker-icon",
     html: `<div class="truck-marker-body">${svg}</div>`,
-    iconSize: [44, 44],
-    iconAnchor: [22, 22],
+    iconSize: [42, 42],
+    iconAnchor: [21, 21],
   });
 }
 
@@ -536,281 +731,135 @@ function buildRigTooltipHtml(simulation, currentMinute, side) {
   }
 
   const trips = simulation.bestPlan.playback.trips;
-  let title = "";
-  let items = [];
-
-  if (side === "start") {
-    title = "Loads still at start rig";
-    items = trips.filter((trip) => currentMinute < trip.arrivalAtDestination);
-  } else {
-    title = "Loads at end rig";
-    items = trips.filter((trip) => currentMinute >= trip.arrivalAtDestination);
-  }
+  const items =
+    side === "start"
+      ? trips.filter((trip) => currentMinute < trip.arrivalAtDestination)
+      : trips.filter((trip) => currentMinute >= trip.arrivalAtDestination);
 
   const rows = items
-    .slice(0, 8)
-    .map((trip) => {
-      let status = "";
-      if (side === "start") {
-        if (currentMinute < trip.loadStart) {
-          status = "waiting";
-        } else if (currentMinute < trip.rigDownFinish) {
-          status = "rig down";
-        } else if (currentMinute < trip.arrivalAtDestination) {
-          status = "in transit";
-        }
-      } else if (currentMinute < trip.rigUpFinish) {
-        status = "rig up";
-      } else {
-        status = "ready";
-      }
-
-      return `<li><span>#${trip.loadId} ${trip.description}</span><em>${status}</em></li>`;
-    })
+    .slice(0, 6)
+    .map((trip) => `<li><span>#${trip.loadId}</span><em>${trip.description}</em></li>`)
     .join("");
 
-  const extra =
-    items.length > 8 ? `<p class="rig-tooltip-more">+${items.length - 8} more</p>` : "";
-
-  return `<div class="rig-tooltip"><strong>${title}</strong>${items.length ? `<ul>${rows}</ul>${extra}` : `<p>None right now.</p>`}</div>`;
+  return `<div class="rig-tooltip"><strong>${side === "start" ? "Loads at source" : "Loads at destination"}</strong>${items.length ? `<ul>${rows}</ul>` : "<p>None right now.</p>"}</div>`;
 }
 
-function buildPhaseBreakdown(simulation, currentMinute) {
-  if (!simulation?.bestPlan) {
+function saveHistoryEntry(entry) {
+  const current = readHistoryEntries();
+  const next = [entry, ...current].slice(0, 10);
+  window.localStorage.setItem(HISTORY_STORAGE_KEY, JSON.stringify(next));
+  return next;
+}
+
+function readHistoryEntries() {
+  try {
+    const raw = window.localStorage.getItem(HISTORY_STORAGE_KEY);
+    const parsed = raw ? JSON.parse(raw) : [];
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
     return [];
   }
-
-  const loads = simulation.bestPlan.waves.flat();
-  const trips = simulation.bestPlan.playback.trips;
-
-  const rigDownTotal = loads.reduce(
-    (total, load) => total + (load.rig_down_duration || 0),
-    0
-  );
-  const rigDownCompleted = trips.reduce((total, trip) => {
-    const completedMinutes = Math.max(
-      0,
-      Math.min(currentMinute, trip.rigDownFinish) - trip.loadStart
-    );
-    const load = loads.find((item) => item.id === trip.loadId);
-    return total + Math.min(completedMinutes, load?.rig_down_duration || 0);
-  }, 0);
-
-  const rigMoveTotal = trips.length * simulation.routeMinutes;
-  const rigMoveCompleted = trips.reduce((total, trip) => {
-    const completedMinutes = Math.max(
-      0,
-      Math.min(currentMinute, trip.arrivalAtDestination) - trip.rigDownFinish
-    );
-    return total + Math.min(completedMinutes, simulation.routeMinutes);
-  }, 0);
-
-  const rigUpTotal = loads.reduce(
-    (total, load) => total + (load.rig_up_duration || 0),
-    0
-  );
-  const rigUpCompleted = trips.reduce((total, trip) => {
-    const load = loads.find((item) => item.id === trip.loadId);
-    const completedMinutes = Math.max(
-      0,
-      Math.min(currentMinute, trip.rigUpFinish) - trip.arrivalAtDestination
-    );
-    return total + Math.min(completedMinutes, load?.rig_up_duration || 0);
-  }, 0);
-
-  return [
-    {
-      label: "Rig Down",
-      completed: rigDownCompleted,
-      total: rigDownTotal,
-      percent: rigDownTotal ? (rigDownCompleted / rigDownTotal) * 100 : 0,
-    },
-    {
-      label: "Rig Move",
-      completed: rigMoveCompleted,
-      total: rigMoveTotal,
-      percent: rigMoveTotal ? (rigMoveCompleted / rigMoveTotal) * 100 : 0,
-    },
-    {
-      label: "Rig Up",
-      completed: rigUpCompleted,
-      total: rigUpTotal,
-      percent: rigUpTotal ? (rigUpCompleted / rigUpTotal) * 100 : 0,
-    },
-  ];
 }
 
-function PhaseBars({ simulation, currentMinute }) {
-  const phases = buildPhaseBreakdown(simulation, currentMinute);
-
-  return React.createElement(
-    "section",
-    { className: "phase-bars-panel" },
-    React.createElement("p", { className: "eyebrow" }, "Process Split"),
-    React.createElement("h3", null, "Rig Down / Move / Up"),
-    React.createElement(
-      "div",
-      { className: "phase-bars" },
-      phases.map((phase) =>
-        React.createElement(
-          "div",
-          { className: "phase-row", key: phase.label },
-          React.createElement(
-            "div",
-            { className: "phase-row-top" },
-            React.createElement("strong", null, phase.label),
-            React.createElement(
-              "span",
-              null,
-              `${Math.round(phase.percent)}%`,
-            )
-          ),
-          React.createElement(
-            "div",
-            { className: "phase-track" },
-            React.createElement("div", {
-              className: `phase-fill ${phase.label.toLowerCase().replace(/\s+/g, "-")}`,
-              style: { width: `${phase.percent}%` },
-            })
-          ),
-          React.createElement(
-            "p",
-            { className: "phase-caption" },
-            `${formatMinutes(phase.completed)} / ${formatMinutes(phase.total)} completed`
-          )
-        )
-      )
-    )
-  );
-}
-
-function SimulationPlayback({ simulation, currentMinute }) {
-  const [stepIndex, setStepIndex] = useState(0);
-
-  useEffect(() => {
-    setStepIndex(0);
-  }, [simulation, currentMinute]);
-
-  useEffect(() => {
-    if (!simulation?.bestPlan?.playback?.steps?.length) {
-      return undefined;
-    }
-
-    const visibleCount = simulation.bestPlan.playback.steps.filter(
-      (step) => step.minute <= currentMinute
-    ).length;
-    setStepIndex(Math.max(0, visibleCount - 1));
-    return undefined;
-  }, [simulation, currentMinute]);
-
+function PhasePanel({ simulation, currentMinute }) {
   if (!simulation?.bestPlan) {
     return null;
   }
 
-  const visibleSteps = simulation.bestPlan.playback.steps.slice(0, stepIndex + 1);
+  const total = Math.max(simulation.bestPlan.totalMinutes, 1);
+  const completion = Math.min(100, Math.round((currentMinute / total) * 100));
 
   return React.createElement(
     "section",
-    { className: "playback-panel" },
+    { className: "panel-block" },
     React.createElement(
       "div",
-      { className: "playback-header" },
-      React.createElement("p", { className: "eyebrow" }, "Best Plan Playback"),
-      React.createElement("h3", null, simulation.bestPlan.name),
-      React.createElement(
-        "p",
-        { className: "meta large" },
-        `Current simulation time: ${formatMinutes(currentMinute)} of ${formatMinutes(simulation.bestPlan.totalMinutes)}.`,
-      ),
+      { className: "panel-header" },
+      React.createElement("p", { className: "eyebrow" }, "Live Status"),
+      React.createElement("h3", null, "Transfer progress"),
     ),
     React.createElement(
       "div",
-      { className: "truck-strip" },
-      Array.from({ length: simulation.truckCount }, (_, index) =>
-        React.createElement(
-          "div",
-          { className: "truck-card", key: index + 1 },
-          React.createElement("strong", null, `Truck ${index + 1}`),
-          React.createElement(
-            "span",
-            { className: "truck-status" },
-            getTruckStatus(simulation.bestPlan.playback, currentMinute, index + 1),
-          ),
-        ),
-      ),
+      { className: "progress-shell" },
+      React.createElement("div", {
+        className: "progress-bar",
+        style: { width: `${completion}%` },
+      }),
     ),
-    React.createElement(
-      "div",
-      { className: "timeline" },
-      visibleSteps.map((step, index) =>
-        React.createElement(
-          "div",
-          {
-            className: `timeline-step${index === visibleSteps.length - 1 ? " current" : ""}`,
-            key: `${step.type}-${step.minute}-${index}`,
-          },
-          React.createElement("span", { className: "timeline-minute" }, formatMinutes(step.minute)),
-          React.createElement(
-            "div",
-            { className: "timeline-copy" },
-            React.createElement("strong", null, step.title),
-            React.createElement("p", null, step.description),
-          ),
-        ),
-      ),
-    ),
+    React.createElement("p", { className: "panel-note" }, `${completion}% complete at ${formatMinutes(Math.round(currentMinute))}`),
   );
 }
 
-function RecentLogs({ simulation, currentMinute }) {
+function SimulationPlayback({ simulation, currentMinute }) {
   if (!simulation?.bestPlan) {
-    return React.createElement(
-      "section",
-      { className: "log-panel" },
-      React.createElement("p", { className: "eyebrow" }, "Activity Log"),
-      React.createElement("h3", null, "Latest events"),
-      React.createElement(
-        "p",
-        { className: "empty-state" },
-        "Run the simulation to see the latest transfer events here."
-      )
-    );
+    return null;
   }
 
-  const logs = simulation.bestPlan.playback.steps
+  const truckCards = Array.from({ length: simulation.truckCount }, (_, index) => index + 1);
+  const steps = simulation.bestPlan.playback.steps
     .filter((step) => step.minute <= currentMinute)
-    .slice(-6)
+    .slice(-5)
     .reverse();
 
   return React.createElement(
-    "section",
-    { className: "log-panel" },
-    React.createElement("p", { className: "eyebrow" }, "Activity Log"),
-    React.createElement("h3", null, "Latest events"),
+    React.Fragment,
+    null,
     React.createElement(
-      "div",
-      { className: "log-list" },
-      logs.map((log, index) =>
-        React.createElement(
-          "div",
-          { className: "log-row", key: `${log.type}-${log.minute}-${index}` },
-          React.createElement("span", { className: "log-time" }, formatMinutes(log.minute)),
+      "section",
+      { className: "panel-block" },
+      React.createElement(
+        "div",
+        { className: "panel-header" },
+        React.createElement("p", { className: "eyebrow" }, "Fleet"),
+        React.createElement("h3", null, "Truck states"),
+      ),
+      React.createElement(
+        "div",
+        { className: "truck-grid" },
+        truckCards.map((truckId) =>
+          React.createElement(
+            "article",
+            { className: "truck-card", key: truckId },
+            React.createElement("span", { className: "truck-label" }, `Truck ${truckId}`),
+            React.createElement("strong", null, getTruckStatus(simulation.bestPlan.playback, currentMinute, truckId)),
+          ),
+        ),
+      ),
+    ),
+    React.createElement(
+      "section",
+      { className: "panel-block" },
+      React.createElement(
+        "div",
+        { className: "panel-header" },
+        React.createElement("p", { className: "eyebrow" }, "Recent Events"),
+        React.createElement("h3", null, "Operation log"),
+      ),
+      React.createElement(
+        "div",
+        { className: "event-list" },
+        steps.map((step, index) =>
           React.createElement(
             "div",
-            { className: "log-copy" },
-            React.createElement("strong", null, log.title),
-            React.createElement("p", null, log.description)
-          )
-        )
-      )
-    )
+            { className: "event-row", key: `${step.type}-${step.minute}-${index}` },
+            React.createElement("span", { className: "event-time" }, formatMinutes(Math.round(step.minute))),
+            React.createElement(
+              "div",
+              { className: "event-copy" },
+              React.createElement("strong", null, step.title),
+              React.createElement("p", null, step.description),
+            ),
+          ),
+        ),
+      ),
+    ),
   );
 }
 
 function SpeedControl({ speed, onChange }) {
   return React.createElement(
     "label",
-    { className: "speed-control" },
+    { className: "control-field" },
     React.createElement("span", null, "Playback speed"),
     React.createElement(
       "select",
@@ -822,14 +871,14 @@ function SpeedControl({ speed, onChange }) {
         React.createElement(
           "option",
           { key: option, value: String(option) },
-          `${option}x`
-        )
-      )
-    )
+          `${option}x`,
+        ),
+      ),
+    ),
   );
 }
 
-function RealMap({ startPoint, endPoint, onSelectStart, onSelectEnd, simulation, currentMinute }) {
+function RealMap({ startPoint, endPoint, onSelectStart, onSelectEnd, simulation, currentMinute, readOnly = false }) {
   const mapElementRef = useRef(null);
   const mapRef = useRef(null);
   const markersRef = useRef({ start: null, end: null });
@@ -841,10 +890,11 @@ function RealMap({ startPoint, endPoint, onSelectStart, onSelectEnd, simulation,
       return undefined;
     }
 
-    const map = window.L.map(mapElementRef.current).setView(DEFAULT_CENTER, 6);
-    window.L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+    const map = window.L.map(mapElementRef.current, { zoomControl: false }).setView(DEFAULT_CENTER, 6);
+    window.L.tileLayer("https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png", {
       maxZoom: 19,
-      attribution: "&copy; OpenStreetMap contributors",
+      subdomains: "abcd",
+      attribution: '&copy; OpenStreetMap contributors &copy; CARTO',
     }).addTo(map);
 
     mapRef.current = map;
@@ -870,22 +920,16 @@ function RealMap({ startPoint, endPoint, onSelectStart, onSelectEnd, simulation,
     }
 
     markersRef.current.start = startPoint
-      ? window.L.marker([startPoint.lat, startPoint.lng])
-          .addTo(map)
-          .bindTooltip(buildRigTooltipHtml(simulation, currentMinute, "start"), {
-            direction: "top",
-            offset: [0, -12],
-            opacity: 0.96,
-          })
+      ? window.L.marker([startPoint.lat, startPoint.lng]).addTo(map).bindTooltip(
+          buildRigTooltipHtml(simulation, currentMinute, "start"),
+          { direction: "top", offset: [0, -12], opacity: 0.96 },
+        )
       : null;
     markersRef.current.end = endPoint
-      ? window.L.marker([endPoint.lat, endPoint.lng])
-          .addTo(map)
-          .bindTooltip(buildRigTooltipHtml(simulation, currentMinute, "end"), {
-            direction: "top",
-            offset: [0, -12],
-            opacity: 0.96,
-          })
+      ? window.L.marker([endPoint.lat, endPoint.lng]).addTo(map).bindTooltip(
+          buildRigTooltipHtml(simulation, currentMinute, "end"),
+          { direction: "top", offset: [0, -12], opacity: 0.96 },
+        )
       : null;
   }, [startPoint, endPoint, simulation, currentMinute]);
 
@@ -905,9 +949,9 @@ function RealMap({ startPoint, endPoint, onSelectStart, onSelectEnd, simulation,
     }
 
     routeLineRef.current = window.L.polyline(simulation.routeGeometry, {
-      color: "#cb5c32",
-      weight: 5,
-      opacity: 0.85,
+      color: "#7a56ff",
+      weight: 4,
+      opacity: 0.9,
     }).addTo(map);
 
     map.fitBounds(routeLineRef.current.getBounds(), { padding: [30, 30] });
@@ -927,12 +971,7 @@ function RealMap({ startPoint, endPoint, onSelectStart, onSelectEnd, simulation,
     }
 
     for (let truckId = 1; truckId <= simulation.truckCount; truckId += 1) {
-      const position = getTruckPosition(
-        simulation.bestPlan.playback,
-        simulation.routeGeometry,
-        currentMinute,
-        truckId
-      );
+      const position = getTruckPosition(simulation.bestPlan.playback, simulation.routeGeometry, currentMinute, truckId);
 
       if (!position) {
         continue;
@@ -950,146 +989,886 @@ function RealMap({ startPoint, endPoint, onSelectStart, onSelectEnd, simulation,
 
   return React.createElement(
     "div",
-    { className: "real-map-shell" },
+    { className: "map-shell" },
     React.createElement("div", { ref: mapElementRef, className: "real-map" }),
     React.createElement(
       "div",
-      { className: "map-picker-actions" },
-      React.createElement(
-        "button",
-        {
-          type: "button",
-          className: "map-pick-button active-start",
-          onClick: () => {
-            const map = mapRef.current;
-            if (!map) {
-              return;
-            }
+      { className: "map-actions" },
+      readOnly
+        ? null
+        : React.createElement(
+            React.Fragment,
+            null,
+            React.createElement(
+              "button",
+              {
+                type: "button",
+                className: "secondary-button",
+                onClick: () => {
+                  const map = mapRef.current;
+                  if (!map) {
+                    return;
+                  }
 
-            map.once("click", (event) => {
-              onSelectStart({
-                lat: event.latlng.lat,
-                lng: event.latlng.lng,
-              });
-            });
-          },
-        },
-        "Pick start rig on map",
-      ),
-      React.createElement(
-        "button",
-        {
-          type: "button",
-          className: "map-pick-button active-end",
-          onClick: () => {
-            const map = mapRef.current;
-            if (!map) {
-              return;
-            }
+                  map.once("click", (event) => {
+                    onSelectStart({ lat: event.latlng.lat, lng: event.latlng.lng });
+                  });
+                },
+              },
+              "Pick source rig",
+            ),
+            React.createElement(
+              "button",
+              {
+                type: "button",
+                className: "secondary-button secondary-orange",
+                onClick: () => {
+                  const map = mapRef.current;
+                  if (!map) {
+                    return;
+                  }
 
-            map.once("click", (event) => {
-              onSelectEnd({
-                lat: event.latlng.lat,
-                lng: event.latlng.lng,
-              });
-            });
-          },
-        },
-        "Pick end rig on map",
-      ),
+                  map.once("click", (event) => {
+                    onSelectEnd({ lat: event.latlng.lat, lng: event.latlng.lng });
+                  });
+                },
+              },
+              "Pick destination rig",
+            ),
+          ),
     ),
   );
 }
 
-function PlanCard({ plan, best, onPickLoad }) {
+function PlanCard({ plan, best }) {
   return React.createElement(
     "article",
     { className: `plan-card${best ? " best" : ""}` },
     React.createElement(
       "div",
-      { className: "plan-top" },
+      { className: "plan-card-head" },
       React.createElement(
         "div",
         null,
         React.createElement("p", { className: "eyebrow" }, plan.name),
-        React.createElement("h3", null, best ? "Recommended path" : "Alternative path")
+        React.createElement("h3", null, best ? "Recommended plan" : "Alternative plan"),
       ),
-      best ? React.createElement("span", { className: "best-badge" }, "Best ETA") : null
+      best ? React.createElement("span", { className: "plan-badge" }, "Best ETA") : null,
     ),
     React.createElement(
       "div",
-      { className: "plan-stats" },
+      { className: "stats-grid compact" },
       React.createElement(Stat, { label: "Route", value: formatMinutes(plan.routeMinutes) }),
       React.createElement(Stat, { label: "Work", value: formatMinutes(plan.processingMinutes) }),
-      React.createElement(Stat, { label: "ETA", value: formatMinutes(plan.totalMinutes) })
+      React.createElement(Stat, { label: "ETA", value: formatMinutes(plan.totalMinutes), tone: best ? "accent" : "default" }),
     ),
     React.createElement(
       "div",
       { className: "wave-list" },
-      plan.waves.slice(0, 5).map((wave, index) =>
+      plan.waves.slice(0, 3).map((wave, index) =>
         React.createElement(
-          "section",
-          { className: "wave-box", key: `${plan.name}-${index}` },
+          "div",
+          { className: "wave-row", key: `${plan.name}-${index}` },
           React.createElement("strong", null, `Stage ${index + 1}`),
           React.createElement(
-            "div",
-            { className: "wave-loads" },
-            wave.map((load) =>
-              React.createElement(
-                "button",
-                {
-                  type: "button",
-                  className: "mini-load",
-                  key: load.id,
-                  onClick: () => onPickLoad(load.id),
-                },
-                `#${load.id} ${load.description}`
-              )
-            )
-          )
-        )
-      )
+            "p",
+            null,
+            wave.map((load) => `#${load.id}`).join(" • "),
+          ),
+        ),
+      ),
     ),
-    React.createElement(
-      "p",
-      { className: "plan-note" },
-      `First loads: ${plan.waves[0]?.map((load) => `#${load.id}`).join(", ") || "-"}`
-    )
   );
 }
 
-function LoadCard({ load, isSelected, onSelect }) {
+function ScenarioCard({ plan, active, onSelect }) {
   return React.createElement(
     "button",
     {
       type: "button",
-      className: `load-card${isSelected ? " selected" : ""}`,
-      onClick: () => onSelect(load.id),
+      className: `scenario-card${active ? " active" : ""}`,
+      onClick: onSelect,
     },
+    React.createElement("strong", null, plan.name),
+    React.createElement("span", null, formatMinutes(plan.totalMinutes)),
+    React.createElement("p", null, `${plan.workerCount} workers, ${plan.truckCount} trucks`),
+  );
+}
+
+function CompareScreen({ simulation, routeMode, onNavigate }) {
+  const scenarioPlans = simulation?.scenarioPlans || [];
+  const comparisonRows = buildComparisonRows(scenarioPlans);
+  const bestScenario = scenarioPlans.reduce(
+    (best, plan) => (!best || plan.totalMinutes < best.totalMinutes ? plan : best),
+    null,
+  );
+
+  return React.createElement(
+    "main",
+    { className: "screen dashboard-screen" },
+    React.createElement("div", { className: "screen-grid" }),
     React.createElement(
-      "div",
-      { className: "load-card-top" },
-      React.createElement("span", { className: "load-id" }, `Load #${load.id}`),
-      load.is_critical
-        ? React.createElement("span", { className: "critical-badge" }, "Critical")
-        : null
+      "section",
+      { className: "dashboard-shell" },
+      React.createElement(DashboardTopbar, {
+        activeScreen: "compare",
+        title: "Plan comparison",
+        subtitle: "Compare the three generated scenarios and choose the best pre-move strategy.",
+        onNavigate,
+      }),
+      React.createElement(
+        "div",
+        { className: "dashboard-layout compare-layout" },
+        React.createElement(
+          "aside",
+          { className: "dashboard-panel dashboard-panel-left" },
+          React.createElement("p", { className: "eyebrow" }, "Compare"),
+          React.createElement("h2", null, "Scenario overview"),
+          scenarioPlans.length
+            ? React.createElement(
+                "div",
+                { className: "dashboard-metric-stack" },
+                React.createElement(Stat, { label: "Best plan", value: bestScenario.name, tone: "accent" }),
+                React.createElement(Stat, { label: "Best ETA", value: formatMinutes(bestScenario.totalMinutes), tone: "warm" }),
+                React.createElement(Stat, { label: "Routing", value: routeMode === "live" ? "Live" : "Estimated" }),
+              )
+            : null,
+          React.createElement(
+            "div",
+            { className: "dashboard-note-card compare-note" },
+            React.createElement("span", { className: "dashboard-note-label" }, "Method"),
+            React.createElement("strong", null, "Three generated plans"),
+            React.createElement("p", null, "Plan A keeps your current staffing, while Plans B and C expand fleet and crew capacity to reduce the total move duration."),
+          ),
+        ),
+        React.createElement(
+          "section",
+          { className: "dashboard-map-stage compare-stage" },
+          scenarioPlans.length
+            ? React.createElement(
+                React.Fragment,
+                null,
+                React.createElement(
+                  "div",
+                  { className: "dashboard-map-header" },
+                  React.createElement("p", { className: "eyebrow" }, "Plan comparison"),
+                  React.createElement("h2", null, "Three-plan breakdown"),
+                  React.createElement("p", { className: "hero-copy" }, "Generated from the same route with progressively larger crew and truck allocations."),
+                ),
+                React.createElement(
+                  "div",
+                  { className: "compare-grid" },
+                  scenarioPlans.map((plan, index) =>
+                    React.createElement(
+                      "article",
+                      { key: plan.name, className: `compare-plan-card${index === 0 ? " best" : ""}` },
+                      React.createElement("p", { className: "eyebrow" }, plan.name),
+                      React.createElement("h3", null, formatMinutes(plan.totalMinutes)),
+                      React.createElement("p", { className: "panel-note" }, `${plan.workerCount} workers, ${plan.truckCount} trucks`),
+                      React.createElement(
+                        "div",
+                        { className: "stats-grid compact" },
+                        React.createElement(Stat, { label: "Travel", value: formatMinutes(plan.routeMinutes) }),
+                        React.createElement(Stat, { label: "Work", value: formatMinutes(plan.processingMinutes) }),
+                        React.createElement(Stat, { label: "Capacity", value: String(plan.capacity), tone: index === 0 ? "accent" : "default" }),
+                      ),
+                    ),
+                  ),
+                ),
+                React.createElement(
+                  "div",
+                  { className: "compare-table" },
+                  comparisonRows.map((row) =>
+                    React.createElement(
+                      "div",
+                      { key: row.label, className: "compare-row" },
+                      React.createElement("span", { className: "compare-label" }, row.label),
+                      row.values.map((value) =>
+                        React.createElement(
+                          "span",
+                          {
+                            key: `${row.label}-${value.planName}`,
+                            className: `compare-value${value.best ? " best" : ""}`,
+                          },
+                          value.text,
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+              )
+            : React.createElement(
+                "div",
+                { className: "empty-card tall" },
+                React.createElement("p", { className: "eyebrow" }, "No Comparison Yet"),
+                React.createElement("h3", null, "Generate plans first"),
+                React.createElement("p", null, "Open planning, select your route, and run the simulation. The compare page will then show the three generated scenarios."),
+              ),
+        ),
+          React.createElement(
+            "aside",
+          { className: "dashboard-panel dashboard-panel-right" },
+          React.createElement("p", { className: "eyebrow" }, "Recommendation"),
+          scenarioPlans.length
+            ? React.createElement(
+                React.Fragment,
+                null,
+                React.createElement(
+                  "div",
+                  { className: "dashboard-output-card" },
+                  React.createElement("span", { className: "dashboard-output-label" }, "Fastest option"),
+                  React.createElement("strong", { className: "dashboard-output-value" }, bestScenario.name),
+                ),
+                React.createElement(
+                  "div",
+                  { className: "dashboard-note-card" },
+                  React.createElement("span", { className: "dashboard-note-label" }, "Why it wins"),
+                  React.createElement("p", null, `${bestScenario.workerCount} workers and ${bestScenario.truckCount} trucks produce the shortest total ETA of ${formatMinutes(bestScenario.totalMinutes)}.`),
+                ),
+                React.createElement(
+                  "div",
+                  { className: "dashboard-recent-list" },
+                  scenarioPlans.map((plan, index) =>
+                    React.createElement(ScenarioCard, {
+                      key: plan.name,
+                      plan,
+                      active: plan.name === bestScenario.name,
+                      onSelect: () => onNavigate("planner"),
+                    }),
+                  ),
+                ),
+              )
+            : React.createElement(
+                "div",
+                { className: "dashboard-note-card" },
+                React.createElement("span", { className: "dashboard-note-label" }, "Status"),
+                React.createElement("p", null, "No scenario plans are available yet."),
+              ),
+        ),
+      ),
     ),
-    React.createElement("h3", null, load.description),
-    React.createElement("p", { className: "meta" }, `${load.phase} / ${load.category}`),
+  );
+}
+
+function LoginScreen({ email, password, onEmailChange, onPasswordChange, onSubmit }) {
+  return React.createElement(
+    "main",
+    { className: "screen login-screen" },
+    React.createElement("div", { className: "screen-grid" }),
     React.createElement(
-      "div",
-      { className: "tags" },
-      React.createElement("span", { className: "tag" }, load.priority || "No Priority"),
-      React.createElement("span", { className: "tag" }, load.truck_type || "No Truck"),
-      React.createElement("span", { className: "tag" }, `${getLoadDurationMinutes(load.id)} min`)
+      "section",
+      { className: "login-card" },
+      React.createElement("p", { className: "eyebrow" }, "RigSync Access"),
+      React.createElement("h1", null, "Mission control for rig moves"),
+      React.createElement(
+        "p",
+        { className: "hero-copy" },
+        "A dark operations dashboard inspired by your references, with quick access to planning and saved transfer runs.",
+      ),
+      React.createElement(
+        "form",
+        {
+          className: "login-form",
+          onSubmit: (event) => {
+            event.preventDefault();
+            onSubmit();
+          },
+        },
+        React.createElement(
+          "label",
+          { className: "control-field" },
+          React.createElement("span", null, "Email"),
+          React.createElement("input", {
+            type: "email",
+            value: email,
+            placeholder: "operations@rigsync.io",
+            onChange: (event) => onEmailChange(event.target.value),
+          }),
+        ),
+        React.createElement(
+          "label",
+          { className: "control-field" },
+          React.createElement("span", null, "Password"),
+          React.createElement("input", {
+            type: "password",
+            value: password,
+            placeholder: "Enter any password",
+            onChange: (event) => onPasswordChange(event.target.value),
+          }),
+        ),
+        React.createElement("button", { type: "submit", className: "primary-button" }, "Login"),
+      ),
+      React.createElement(
+        "div",
+        { className: "login-meta" },
+        React.createElement(Stat, { label: "Access", value: "Prototype" }),
+        React.createElement(Stat, { label: "Auth", value: "Bypass Enabled" }),
+      ),
     ),
+  );
+}
+
+function HomeScreen({ history, loadCount, simulation, currentMinute, onNavigate }) {
+  const snapshot = buildDashboardSnapshot({
+    history,
+    simulation,
+    currentMinute,
+    loadCount,
+  });
+  const recentPlans = history.slice(0, 3);
+  const stageData = [
+    {
+      label: "Rig down",
+      percentage: Math.min(100, Math.max(18, snapshot.completion + 14)),
+      tone: "warm",
+      duration: `${Math.max(3, Math.round(snapshot.totalMinutes * 0.31 / 60))} hr window`,
+    },
+    {
+      label: "Rig move",
+      percentage: Math.min(100, Math.max(12, snapshot.completion)),
+      tone: "accent",
+      duration: snapshot.routeTime,
+    },
+    {
+      label: "Rig up",
+      percentage: Math.min(100, Math.max(8, snapshot.completion - 21)),
+      tone: "ok",
+      duration: `${Math.max(2, Math.round(snapshot.totalMinutes * 0.24 / 60))} hr window`,
+    },
+  ];
+
+  return React.createElement(
+    "main",
+    { className: "screen home-screen dashboard-screen" },
+    React.createElement("div", { className: "screen-grid" }),
     React.createElement(
-      "p",
-      { className: "dependency-summary" },
-      load.dependency_ids.length
-        ? `Depends on ${load.dependency_ids.length} load${load.dependency_ids.length > 1 ? "s" : ""}`
-        : "No dependencies"
-    )
+      "section",
+      { className: "dashboard-shell" },
+      React.createElement(DashboardTopbar, {
+        activeScreen: "home",
+        title: "Futuristic logistics dashboard",
+        subtitle: "Command deck for rig transfer planning, routing, and archival review.",
+        onNavigate,
+      }),
+      React.createElement(
+        "div",
+        { className: "dashboard-layout" },
+        React.createElement(
+          "aside",
+          { className: "dashboard-panel dashboard-panel-left" },
+          React.createElement("p", { className: "eyebrow" }, "Simulation Inputs"),
+          React.createElement("h2", null, "Post-login command deck"),
+          React.createElement("p", { className: "panel-note" }, "Use the planner for new runs or jump into saved routes from the archive."),
+          React.createElement(
+            "div",
+            { className: "dashboard-metric-stack" },
+            React.createElement(Stat, { label: "Saved plans", value: String(snapshot.savedPlans).padStart(2, "0"), tone: "accent" }),
+            React.createElement(Stat, { label: "Logical loads", value: String(snapshot.loadCount).padStart(2, "0") }),
+            React.createElement(Stat, { label: "Fleet ready", value: `${snapshot.truckCount} trucks`, tone: "warm" }),
+            React.createElement(Stat, { label: "Crew pool", value: `${snapshot.workerCount} workers` }),
+          ),
+          React.createElement(
+            "div",
+            { className: "dashboard-action-stack" },
+            React.createElement(
+              "button",
+              { type: "button", className: "primary-button dashboard-launch", onClick: () => onNavigate("planner") },
+              "Open planner",
+            ),
+            React.createElement(
+              "button",
+              { type: "button", className: "ghost-button dashboard-launch ghost", onClick: () => onNavigate("history") },
+              "Review archive",
+            ),
+          ),
+          React.createElement(
+            "div",
+            { className: "dashboard-note-card" },
+            React.createElement("span", { className: "dashboard-note-label" }, "Scenario"),
+            React.createElement("strong", null, snapshot.planName),
+            React.createElement("p", null, `${snapshot.routeSource}. ${snapshot.activeTrips} active truck movements across the current route.`),
+          ),
+        ),
+        React.createElement(
+          "section",
+          { className: "dashboard-map-stage" },
+          React.createElement(
+            "div",
+            { className: "dashboard-map-header" },
+            React.createElement("p", { className: "eyebrow" }, "Route Visualization"),
+            React.createElement("h2", null, "Eastern Province rig corridor"),
+            React.createElement("p", { className: "hero-copy" }, snapshot.routeTitle),
+          ),
+          React.createElement(
+            "div",
+            { className: "dashboard-map-canvas" },
+            React.createElement(RealMap, {
+              startPoint: snapshot.startPoint,
+              endPoint: snapshot.endPoint,
+              onSelectStart: () => {},
+              onSelectEnd: () => {},
+              simulation,
+              currentMinute,
+              readOnly: true,
+            }),
+            React.createElement(
+              "div",
+              { className: "dashboard-summary-card" },
+              React.createElement("h3", null, "Route summary"),
+              React.createElement(
+                "div",
+                { className: "dashboard-summary-grid" },
+                React.createElement("span", null, "Distance"),
+                React.createElement("strong", null, `${snapshot.routeKm} km`),
+                React.createElement("span", null, "ETA"),
+                React.createElement("strong", null, snapshot.eta),
+                React.createElement("span", null, "Active trucks"),
+                React.createElement("strong", null, `${snapshot.activeTrips} / ${snapshot.truckCount}`),
+              ),
+            ),
+          ),
+          React.createElement(
+            "div",
+            { className: "dashboard-bottom-strip" },
+            React.createElement(
+              "div",
+              { className: "dashboard-mini-stat" },
+              React.createElement("span", null, "Current time"),
+              React.createElement("strong", null, formatMinutes(snapshot.elapsedMinutes)),
+            ),
+            React.createElement(
+              "div",
+              { className: "dashboard-mini-stat" },
+              React.createElement("span", null, "Travel window"),
+              React.createElement("strong", null, snapshot.routeTime),
+            ),
+            React.createElement(
+              "button",
+              { type: "button", className: "secondary-button", onClick: () => onNavigate("planner") },
+              "Run simulation",
+            ),
+          ),
+        ),
+        React.createElement(
+          "aside",
+          { className: "dashboard-panel dashboard-panel-right" },
+          React.createElement("p", { className: "eyebrow" }, "Simulation Output"),
+          React.createElement(
+            "div",
+            { className: "dashboard-output-card" },
+            React.createElement("span", { className: "dashboard-output-label" }, "Current time"),
+            React.createElement("strong", { className: "dashboard-output-value" }, formatMinutes(snapshot.elapsedMinutes)),
+          ),
+          React.createElement(
+            "div",
+            { className: "dashboard-output-card" },
+            React.createElement("span", { className: "dashboard-output-label" }, "Total distance"),
+            React.createElement("strong", { className: "dashboard-output-value" }, `${snapshot.routeKm} km`),
+          ),
+          React.createElement(
+            "div",
+            { className: "dashboard-progress-stack" },
+            stageData.map((item) =>
+              React.createElement(
+                "article",
+                { key: item.label, className: "dashboard-progress-card" },
+                React.createElement(
+                  "div",
+                  { className: "dashboard-progress-head" },
+                  React.createElement("span", null, item.label),
+                  React.createElement("strong", null, `${item.percentage}%`),
+                ),
+                React.createElement(
+                  "div",
+                  { className: "dashboard-progress-rail" },
+                  React.createElement("div", {
+                    className: `dashboard-progress-bar tone-${item.tone}`,
+                    style: { width: `${item.percentage}%` },
+                  }),
+                ),
+                React.createElement("p", { className: "panel-note" }, item.duration),
+              ),
+            ),
+          ),
+          React.createElement(
+            "div",
+            { className: "dashboard-note-card dashboard-note-card-right" },
+            React.createElement("span", { className: "dashboard-note-label" }, "Simulation notes"),
+            React.createElement(
+              "p",
+              null,
+              "Current estimates assume normal convoy spacing and direct route access. Open the planner to place exact rigs and regenerate the live map.",
+            ),
+          ),
+          React.createElement(
+            "section",
+            { className: "dashboard-recent-list" },
+            React.createElement("span", { className: "dashboard-note-label" }, "Recent plans"),
+            recentPlans.length
+              ? recentPlans.map((entry) =>
+                  React.createElement(
+                    "button",
+                    {
+                      key: entry.id,
+                      type: "button",
+                      className: "dashboard-recent-card",
+                      onClick: () => onNavigate("history"),
+                    },
+                    React.createElement("strong", null, entry.planName),
+                    React.createElement("span", null, entry.routeTime),
+                    React.createElement("p", null, entry.title),
+                  ),
+                )
+              : React.createElement(
+                  "div",
+                  { className: "dashboard-recent-card empty" },
+                  React.createElement("strong", null, "No saved plans yet"),
+                  React.createElement("p", null, "Run your first simulation to populate the archive."),
+                ),
+          ),
+        ),
+      ),
+    ),
+  );
+}
+
+function HistoryScreen({ history, onNavigate }) {
+  const latestEntry = history[0] || null;
+  const stats = latestEntry
+    ? [
+        { label: "Best ETA", value: latestEntry.eta, tone: "accent" },
+        { label: "Travel", value: latestEntry.routeTime },
+        { label: "Fleet", value: `${latestEntry.workers}W / ${latestEntry.trucks}T`, tone: "warm" },
+      ]
+    : [
+        { label: "Best ETA", value: "--" },
+        { label: "Travel", value: "--" },
+        { label: "Fleet", value: "--" },
+      ];
+
+  return React.createElement(
+    "main",
+    { className: "screen history-screen dashboard-screen" },
+    React.createElement("div", { className: "screen-grid" }),
+    React.createElement(
+      "section",
+      { className: "dashboard-shell" },
+      React.createElement(DashboardTopbar, {
+        activeScreen: "history",
+        title: "Saved rig plans",
+        subtitle: "Archive of generated routes, timings, and fleet allocations.",
+        onNavigate,
+      }),
+      React.createElement(
+        "div",
+        { className: "dashboard-layout archive-layout" },
+        React.createElement(
+          "aside",
+          { className: "dashboard-panel dashboard-panel-left" },
+          React.createElement("p", { className: "eyebrow" }, "Archive Summary"),
+          React.createElement("h2", null, "Stored operations"),
+          React.createElement("p", { className: "panel-note" }, "Review generated plans and reopen planning from the same dashboard system."),
+          React.createElement(
+            "div",
+            { className: "dashboard-metric-stack" },
+            React.createElement(Stat, { label: "Saved plans", value: String(history.length).padStart(2, "0"), tone: "accent" }),
+            stats.map((item) =>
+              React.createElement(Stat, {
+                key: item.label,
+                label: item.label,
+                value: item.value,
+                tone: item.tone || "default",
+              }),
+            ),
+          ),
+          React.createElement(
+            "div",
+            { className: "dashboard-action-stack" },
+            React.createElement(
+              "button",
+              { type: "button", className: "primary-button dashboard-launch", onClick: () => onNavigate("planner") },
+              "Create new plan",
+            ),
+            React.createElement(
+              "button",
+              { type: "button", className: "ghost-button dashboard-launch ghost", onClick: () => onNavigate("home") },
+              "Back to dashboard",
+            ),
+          ),
+        ),
+        React.createElement(
+          "section",
+          { className: "dashboard-map-stage archive-stage" },
+          React.createElement(
+            "div",
+            { className: "dashboard-map-header" },
+            React.createElement("p", { className: "eyebrow" }, "Archive"),
+            React.createElement("h2", null, "Saved route plans"),
+            React.createElement("p", { className: "hero-copy" }, "Historical runs captured from the planner, including ETA, route time, and crew / truck allocations."),
+          ),
+          React.createElement(
+            "section",
+            { className: "history-list dashboard-history-list" },
+            history.length
+              ? history.map((entry) =>
+                  React.createElement(
+                    "article",
+                    { className: "history-card dashboard-history-card", key: entry.id },
+                    React.createElement(
+                      "div",
+                      { className: "history-head" },
+                      React.createElement(
+                        "div",
+                        null,
+                        React.createElement("p", { className: "eyebrow" }, entry.planName),
+                        React.createElement("h3", null, entry.title),
+                      ),
+                      React.createElement("span", { className: "history-date" }, entry.createdAt),
+                    ),
+                    React.createElement(
+                      "div",
+                      { className: "stats-grid compact" },
+                      React.createElement(Stat, { label: "ETA", value: entry.eta }),
+                      React.createElement(Stat, { label: "Travel", value: entry.routeTime }),
+                      React.createElement(Stat, { label: "Fleet", value: `${entry.workers}W / ${entry.trucks}T` }),
+                    ),
+                    React.createElement("p", { className: "panel-note" }, `From ${entry.start} to ${entry.end}`),
+                  ),
+                )
+              : React.createElement(
+                  "div",
+                  { className: "empty-card" },
+                  React.createElement("h3", null, "No saved rig plans yet"),
+                  React.createElement("p", null, "Create a plan first, then it will appear here automatically."),
+                ),
+          ),
+        ),
+        React.createElement(
+          "aside",
+          { className: "dashboard-panel dashboard-panel-right" },
+          React.createElement("p", { className: "eyebrow" }, "Archive Notes"),
+          React.createElement(
+            "div",
+            { className: "dashboard-note-card" },
+            React.createElement("span", { className: "dashboard-note-label" }, "Retention"),
+            React.createElement("strong", null, "10 recent plans"),
+            React.createElement("p", null, "The archive is stored locally in browser history and updates automatically after each successful simulation."),
+          ),
+          React.createElement(
+            "div",
+            { className: "dashboard-note-card" },
+            React.createElement("span", { className: "dashboard-note-label" }, "Latest route"),
+            React.createElement("strong", null, latestEntry?.title || "No routes yet"),
+            React.createElement("p", null, latestEntry ? `${latestEntry.planName} • ${latestEntry.routeTime}` : "Run the planner to create the first route record."),
+          ),
+        ),
+      ),
+    ),
+  );
+}
+
+function PlannerScreen({
+  loads,
+  loading,
+  error,
+  routeMode,
+  routingMessage,
+  startPoint,
+  endPoint,
+  workers,
+  trucks,
+  simulation,
+  currentMinute,
+  playbackSpeed,
+  onNavigate,
+  onStartPoint,
+  onEndPoint,
+  onWorkers,
+  onTrucks,
+  onPlaybackSpeed,
+  onRun,
+}) {
+  const scenarioPlans = simulation?.scenarioPlans || [];
+  const bestScenario = scenarioPlans.reduce(
+    (best, plan) => (!best || plan.totalMinutes < best.totalMinutes ? plan : best),
+    null,
+  );
+
+  return React.createElement(
+    "main",
+    { className: "screen planner-screen dashboard-screen" },
+    React.createElement("div", { className: "screen-grid" }),
+    React.createElement(
+      "section",
+      { className: "dashboard-shell" },
+      React.createElement(DashboardTopbar, {
+        activeScreen: "planner",
+        title: "Pre-move planing",
+        subtitle: "",
+        onNavigate,
+      }),
+      React.createElement(
+        "div",
+        { className: "dashboard-layout" },
+        React.createElement(
+          "aside",
+          { className: "dashboard-panel dashboard-panel-left" },
+          React.createElement("p", { className: "eyebrow" }, "Simulation Inputs"),
+          React.createElement("h2", null, "Post-login command deck"),
+          React.createElement(
+            "div",
+            { className: "dashboard-metric-stack planning-input-stack" },
+            React.createElement(Stat, {
+              label: "Start location",
+              value: startPoint ? formatCoordinate(startPoint) : "Not selected",
+              tone: "accent",
+            }),
+            React.createElement(Stat, {
+              label: "Destination",
+              value: endPoint ? formatCoordinate(endPoint) : "Not selected",
+            }),
+            React.createElement(Stat, {
+              label: "Number of trucks",
+              value: `${trucks} trucks`,
+              tone: "warm",
+            }),
+            React.createElement(Stat, {
+              label: "Number of workers",
+              value: `${workers} workers`,
+            }),
+          ),
+          React.createElement(
+            "div",
+            { className: "planning-field-stack" },
+            React.createElement(
+              "label",
+              { className: "control-field" },
+              React.createElement("span", null, "Workers"),
+              React.createElement("input", {
+                type: "number",
+                min: "1",
+                value: workers,
+                onChange: (event) => onWorkers(event.target.value),
+              }),
+            ),
+            React.createElement(
+              "label",
+              { className: "control-field" },
+              React.createElement("span", null, "Trucks"),
+              React.createElement("input", {
+                type: "number",
+                min: "1",
+                value: trucks,
+                onChange: (event) => onTrucks(event.target.value),
+              }),
+            ),
+            React.createElement(SpeedControl, { speed: playbackSpeed, onChange: onPlaybackSpeed }),
+          ),
+          React.createElement("button", { type: "button", className: "primary-button dashboard-launch", onClick: onRun }, "Generate plan"),
+          React.createElement("p", { className: "panel-note" }, "Use the map buttons to pick the source and destination rigs."),
+          routingMessage ? React.createElement("p", { className: "panel-note" }, routingMessage) : null,
+          loading ? React.createElement("p", { className: "panel-note" }, "Loading load dataset...") : null,
+          error ? React.createElement("p", { className: "panel-note error-text" }, error) : null,
+        ),
+        React.createElement(
+          "section",
+          { className: "dashboard-map-stage planner-map-stage" },
+          React.createElement(
+            "div",
+            { className: "dashboard-map-header" },
+            React.createElement("p", { className: "eyebrow" }, "Route Visualization"),
+            React.createElement("h2", null, "Live route map"),
+            React.createElement("p", { className: "hero-copy" }, "Set the two rig points on the map, run the planner, and watch the recommended move play out."),
+          ),
+          React.createElement(
+            "div",
+            { className: "dashboard-map-canvas live-map-canvas" },
+            React.createElement(RealMap, {
+              startPoint,
+              endPoint,
+              onSelectStart: onStartPoint,
+              onSelectEnd: onEndPoint,
+              simulation,
+              currentMinute,
+            }),
+          ),
+          React.createElement(
+            "div",
+            { className: "dashboard-bottom-strip" },
+            React.createElement(
+              "div",
+              { className: "dashboard-mini-stat" },
+              React.createElement("span", null, "Loads"),
+              React.createElement("strong", null, loading ? "..." : String(buildLogicalLoads(loads).length)),
+            ),
+            React.createElement(
+              "div",
+              { className: "dashboard-mini-stat" },
+              React.createElement("span", null, "Routing"),
+              React.createElement("strong", null, routeMode === "live" ? "Live" : "Estimated"),
+            ),
+            React.createElement(
+              "button",
+              { type: "button", className: "ghost-button", onClick: () => onNavigate("home") },
+              "Back to dashboard",
+            ),
+          ),
+        ),
+        React.createElement(
+          "aside",
+          { className: "dashboard-panel dashboard-panel-right" },
+          simulation
+            ? React.createElement(
+                React.Fragment,
+                null,
+                React.createElement(
+                  "div",
+                  { className: "panel-block" },
+                  React.createElement("p", { className: "eyebrow" }, "Primary Result"),
+                  React.createElement("h2", null, "Recommended operation"),
+                  React.createElement(
+                    "div",
+                    { className: "stats-grid compact" },
+                    React.createElement(Stat, { label: "Travel", value: formatMinutes(simulation.routeMinutes) }),
+                    React.createElement(Stat, { label: "Routing", value: routeMode === "live" ? "Live" : "Estimated" }),
+                    React.createElement(Stat, { label: "ETA", value: formatMinutes(simulation.bestPlan.totalMinutes), tone: "accent" }),
+                  ),
+                ),
+                React.createElement(PhasePanel, { simulation, currentMinute }),
+                React.createElement(
+                  "section",
+                  { className: "dashboard-recent-list" },
+                  scenarioPlans.map((plan, index) =>
+                    React.createElement(ScenarioCard, {
+                      key: plan.name,
+                      plan,
+                      active: plan.name === bestScenario?.name,
+                      onSelect: () => onNavigate("compare"),
+                    }),
+                  ),
+                ),
+              )
+            : React.createElement(
+                "div",
+                { className: "empty-card tall" },
+                React.createElement("p", { className: "eyebrow" }, "No Run Yet"),
+                React.createElement("h3", null, "Generate your first plan"),
+                React.createElement(
+                  "p",
+                  null,
+                  "After you select both rig locations and click Generate plan, the recommended transfer path and saved history will appear here.",
+                ),
+                React.createElement(
+                  "div",
+                  { className: "stats-grid compact" },
+                  React.createElement(Stat, { label: "Loads", value: loading ? "..." : String(buildLogicalLoads(loads).length) }),
+                  React.createElement(Stat, { label: "Routing", value: "Ready" }),
+                  React.createElement(Stat, { label: "Archive", value: "Auto-save" }),
+                ),
+              ),
+        ),
+      ),
+    ),
   );
 }
 
@@ -1104,11 +1883,19 @@ function App() {
   const [workers, setWorkers] = useState("4");
   const [trucks, setTrucks] = useState("2");
   const [simulation, setSimulation] = useState(null);
+  const [history, setHistory] = useState([]);
   const [currentMinute, setCurrentMinute] = useState(0);
   const [playbackSpeed, setPlaybackSpeed] = useState(1);
+  const [screen, setScreen] = useState(getInitialScreen);
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
   const animationFrameRef = useRef(null);
   const animationStartedAtRef = useRef(null);
   const logicalLoads = buildLogicalLoads(loads);
+
+  useEffect(() => {
+    setHistory(readHistoryEntries());
+  }, []);
 
   useEffect(() => {
     async function fetchLoads() {
@@ -1144,9 +1931,7 @@ function App() {
 
       const elapsedSeconds = (timestamp - animationStartedAtRef.current) / 1000;
       const simulatedMinutes =
-        elapsedSeconds *
-        (simulation.bestPlan.totalMinutes / BASE_PLAYBACK_SECONDS) *
-        playbackSpeed;
+        elapsedSeconds * (simulation.bestPlan.totalMinutes / BASE_PLAYBACK_SECONDS) * playbackSpeed;
       const nextMinute = Math.min(simulation.bestPlan.totalMinutes, simulatedMinutes);
 
       setCurrentMinute(nextMinute);
@@ -1173,6 +1958,11 @@ function App() {
       return;
     }
 
+    if (!logicalLoads.length) {
+      setRoutingMessage("The load dataset has not finished loading yet.");
+      return;
+    }
+
     const workerCount = Math.max(1, Number.parseInt(workers, 10) || 1);
     const truckCount = Math.max(1, Number.parseInt(trucks, 10) || 1);
     const capacity = Math.max(1, Math.min(workerCount, truckCount));
@@ -1182,30 +1972,21 @@ function App() {
       routeData = await fetchRouteData(startPoint, endPoint);
       setRouteMode("live");
       setRoutingMessage("Using routed driving time from the map service.");
-    } catch (routeError) {
+    } catch {
       setRouteMode("estimated");
       setRoutingMessage("Live routing was unavailable. Using straight-line travel estimate.");
     }
 
-    const plannerVariants = buildSchedules(logicalLoads);
-    const plans = plannerVariants.map((variant) => {
-      const waves = variant.wavesForCapacity(capacity);
-      const playback = buildPlayback({ routeMinutes: routeData.minutes, waves }, truckCount);
+    const scenarioPlans = buildScenarioPlans(logicalLoads, routeData, workerCount, truckCount);
+    const bestScenario = scenarioPlans[0] || null;
+    const bestPlan = bestScenario?.bestVariant || null;
 
-      return {
-        name: variant.name,
-        waves,
-        routeMinutes: routeData.minutes,
-        processingMinutes: Math.max(0, playback.totalMinutes - routeData.minutes),
-        totalMinutes: playback.totalMinutes,
-        playback,
-      };
-    });
+    if (!bestPlan) {
+      setRoutingMessage("No plan variants could be generated from the current loads.");
+      return;
+    }
 
-    plans.sort((a, b) => a.totalMinutes - b.totalMinutes);
-    const bestPlan = plans[0] || null;
-
-    setSimulation({
+    const nextSimulation = {
       startPoint,
       endPoint,
       workerCount,
@@ -1214,142 +1995,74 @@ function App() {
       routeMinutes: routeData.minutes,
       routeSource: routeData.source,
       routeGeometry: routeData.geometry,
-      plans,
+      scenarioPlans,
+      plans: bestScenario.variantPlans,
       bestPlan,
-    });
+      bestScenario,
+    };
+
+    setSimulation(nextSimulation);
     setCurrentMinute(0);
+
+    const historyEntry = {
+      id: String(Date.now()),
+      createdAt: new Date().toLocaleString(),
+      title: `${formatCoordinate(startPoint)} to ${formatCoordinate(endPoint)}`,
+      planName: bestScenario.name,
+      eta: formatMinutes(bestPlan.totalMinutes),
+      routeTime: formatMinutes(routeData.minutes),
+      workers: bestScenario.workerCount,
+      trucks: bestScenario.truckCount,
+      start: formatCoordinate(startPoint),
+      end: formatCoordinate(endPoint),
+    };
+
+    setHistory(saveHistoryEntry(historyEntry));
   }
 
-  if (loading) {
-    return React.createElement(
-      "main",
-      { className: "page-shell" },
-      React.createElement("p", { className: "status" }, "Loading loads...")
-    );
+  if (screen === "login") {
+    return React.createElement(LoginScreen, {
+      email,
+      password,
+      onEmailChange: setEmail,
+      onPasswordChange: setPassword,
+      onSubmit: () => setScreen("planner"),
+    });
   }
 
-  if (error) {
-    return React.createElement(
-      "main",
-      { className: "page-shell" },
-      React.createElement("p", { className: "status error" }, error)
-    );
+  if (screen === "compare" || screen === "history") {
+    return React.createElement(CompareScreen, {
+      simulation,
+      routeMode,
+      onNavigate: setScreen,
+    });
   }
 
-  return React.createElement(
-    "main",
-    { className: "page-shell dashboard-shell" },
-    React.createElement(RealMap, {
+  if (screen === "home" || screen === "planner") {
+    return React.createElement(PlannerScreen, {
+      loads,
+      loading,
+      error,
+      routeMode,
+      routingMessage,
       startPoint,
       endPoint,
-      onSelectStart: setStartPoint,
-      onSelectEnd: setEndPoint,
+      workers,
+      trucks,
       simulation,
       currentMinute,
-    }),
-    React.createElement(
-      "section",
-      { className: "dashboard-overlays" },
-      React.createElement(
-        "aside",
-        { className: "left-panel control-panel" },
-        React.createElement("p", { className: "eyebrow" }, "RigSync"),
-        React.createElement("h2", null, "Transfer controls"),
-        React.createElement(
-          "div",
-          { className: "planner-box" },
-          React.createElement("p", { className: "eyebrow" }, "Planner"),
-          React.createElement("h3", null, "Rig transfer inputs"),
-          React.createElement(
-            "div",
-            { className: "form-grid" },
-            React.createElement(
-              "label",
-              { className: "field" },
-              React.createElement("span", null, "From rig"),
-              React.createElement("input", { type: "text", value: formatCoordinate(startPoint), readOnly: true })
-            ),
-            React.createElement(
-              "label",
-              { className: "field" },
-              React.createElement("span", null, "To rig"),
-              React.createElement("input", { type: "text", value: formatCoordinate(endPoint), readOnly: true })
-            ),
-            React.createElement(
-              "label",
-              { className: "field" },
-              React.createElement("span", null, "Workers"),
-              React.createElement("input", {
-                type: "number",
-                min: "1",
-                value: workers,
-                onChange: (event) => setWorkers(event.target.value),
-              })
-            ),
-            React.createElement(
-              "label",
-              { className: "field" },
-              React.createElement("span", null, "Trucks"),
-              React.createElement("input", {
-                type: "number",
-                min: "1",
-                value: trucks,
-                onChange: (event) => setTrucks(event.target.value),
-              })
-            )
-          ),
-          React.createElement("button", { type: "button", className: "run-button", onClick: runSimulation }, "Run transfer simulation"),
-          React.createElement(SpeedControl, { speed: playbackSpeed, onChange: setPlaybackSpeed }),
-          React.createElement("p", { className: "planner-note" }, "Use the full map to pick the source and destination rigs."),
-          routingMessage ? React.createElement("p", { className: "planner-note" }, routingMessage) : null
-        )
-      ),
-      React.createElement(
-        "div",
-        { className: "map-header-overlay" },
-        React.createElement("p", { className: "eyebrow" }, "Live Map"),
-        React.createElement("h1", null, "Rig transfer simulation"),
-        React.createElement(
-          "p",
-          { className: "hero-copy" },
-          "Pick rigs directly on the map, run the plan, and watch the best route play live."
-        )
-      ),
-      React.createElement(
-        "aside",
-        { className: "detail-panel stats-panel" },
-        simulation
-          ? React.createElement(
-              React.Fragment,
-              null,
-              React.createElement(
-                "div",
-                { className: "detail-header" },
-                React.createElement("p", { className: "eyebrow" }, "Simulation Result"),
-                React.createElement("h2", null, `${formatCoordinate(simulation.startPoint)} to ${formatCoordinate(simulation.endPoint)}`),
-                React.createElement("p", { className: "meta large" }, `Workers: ${simulation.workerCount} / Trucks: ${simulation.truckCount} / Parallel capacity: ${simulation.capacity}`),
-                React.createElement("p", { className: "meta large" }, `Route source: ${simulation.routeSource}`)
-              ),
-              React.createElement(
-                "div",
-                { className: "detail-stats" },
-                React.createElement(Stat, { label: "Travel time", value: formatMinutes(simulation.routeMinutes) }),
-                React.createElement(Stat, { label: "Routing", value: routeMode === "live" ? "Live map route" : "Fallback estimate" }),
-                React.createElement(Stat, { label: "Best ETA", value: formatMinutes(simulation.plans[0].totalMinutes) })
-              ),
-              React.createElement(PhaseBars, { simulation, currentMinute }),
-              React.createElement(SimulationPlayback, { simulation, currentMinute })
-            )
-          : React.createElement(
-              "div",
-              { className: "empty-panel" },
-              React.createElement("p", { className: "eyebrow" }, "Simulation Result"),
-              React.createElement("h2", null, "No run yet"),
-              React.createElement("p", { className: "empty-state" }, "Pick start and end rig coordinates on the map, then run the transfer simulation.")
-            )
-      )
-    )
-  );
+      playbackSpeed,
+      onNavigate: setScreen,
+      onStartPoint: setStartPoint,
+      onEndPoint: setEndPoint,
+      onWorkers: setWorkers,
+      onTrucks: setTrucks,
+      onPlaybackSpeed: setPlaybackSpeed,
+      onRun: runSimulation,
+    });
+  }
+
+  return null;
 }
 
 createRoot(document.getElementById("root")).render(React.createElement(App));
