@@ -9,3 +9,9 @@ export const DEFAULT_MOVE_SETTINGS = {
   workerCount: 6,
   truckCount: 4,
 };
+
+export const DEFAULT_TRUCK_SETUP = [
+  { id: "heavy-haul", type: "Heavy Haul", count: 2 },
+  { id: "flatbed", type: "Flatbed", count: 1 },
+  { id: "support", type: "Support", count: 1 },
+];

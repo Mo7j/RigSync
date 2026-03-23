@@ -341,49 +341,47 @@ export function buildPlayback(plan, truckCount) {
 }
 
 export function buildScenarioPlans(logicalLoads, routeData, workerCount, truckCount) {
-  const scenarios = [
-    { name: "Plan A", workerCount, truckCount },
-    { name: "Plan B", workerCount: workerCount + 2, truckCount: truckCount + 1 },
-    { name: "Plan C", workerCount: workerCount + 3, truckCount: truckCount + 2 },
-  ];
-
   const plannerVariants = buildSchedules(logicalLoads);
+  const capacity = Math.max(1, Math.min(workerCount, truckCount));
 
-  return scenarios.map((scenario) => {
-    const capacity = Math.max(1, Math.min(scenario.workerCount, scenario.truckCount));
-    const variantPlans = plannerVariants.map((variant) => {
+  return plannerVariants
+    .map((variant, index) => {
       const waves = variant.wavesForCapacity(capacity);
-      const playback = buildPlayback({ routeMinutes: routeData.minutes, waves }, scenario.truckCount);
+      const playback = buildPlayback({ routeMinutes: routeData.minutes, waves }, truckCount);
 
       return {
-        name: variant.name,
-        waves,
+        name: `Scenario ${String.fromCharCode(65 + index)}`,
+        workerCount,
+        truckCount,
+        capacity,
         routeMinutes: routeData.minutes,
-        processingMinutes: Math.max(0, playback.totalMinutes - routeData.minutes),
+        routeSource: routeData.source,
+        routeGeometry: routeData.geometry,
+        variantPlans: [
+          {
+            name: variant.name,
+            waves,
+            routeMinutes: routeData.minutes,
+            processingMinutes: Math.max(0, playback.totalMinutes - routeData.minutes),
+            totalMinutes: playback.totalMinutes,
+            playback,
+          },
+        ],
+        bestVariant: {
+          name: variant.name,
+          waves,
+          routeMinutes: routeData.minutes,
+          processingMinutes: Math.max(0, playback.totalMinutes - routeData.minutes),
+          totalMinutes: playback.totalMinutes,
+          playback,
+        },
         totalMinutes: playback.totalMinutes,
+        processingMinutes: Math.max(0, playback.totalMinutes - routeData.minutes),
         playback,
+        waves,
       };
-    });
-
-    variantPlans.sort((a, b) => a.totalMinutes - b.totalMinutes);
-    const bestVariant = variantPlans[0] || null;
-
-    return {
-      name: scenario.name,
-      workerCount: scenario.workerCount,
-      truckCount: scenario.truckCount,
-      capacity,
-      routeMinutes: routeData.minutes,
-      routeSource: routeData.source,
-      routeGeometry: routeData.geometry,
-      variantPlans,
-      bestVariant,
-      totalMinutes: bestVariant?.totalMinutes ?? 0,
-      processingMinutes: bestVariant?.processingMinutes ?? 0,
-      playback: bestVariant?.playback ?? null,
-      waves: bestVariant?.waves ?? [],
-    };
-  });
+    })
+    .sort((a, b) => a.totalMinutes - b.totalMinutes);
 }
 
 function reverseGeometry(geometry) {

@@ -1,6 +1,11 @@
 import { React, createRoot, h } from "./lib/react.js";
 import { useHashRoute, navigateTo } from "./lib/router.js";
-import { BASE_PLAYBACK_SECONDS, DEFAULT_MOVE_SETTINGS, HISTORY_STORAGE_KEY } from "./lib/constants.js";
+import {
+  BASE_PLAYBACK_SECONDS,
+  DEFAULT_MOVE_SETTINGS,
+  DEFAULT_TRUCK_SETUP,
+  HISTORY_STORAGE_KEY,
+} from "./lib/constants.js";
 import { fetchLoads } from "./features/rigMoves/api.js";
 import { buildLogicalLoads, buildScenarioPlans, fetchRouteData, fallbackRouteData } from "./features/rigMoves/simulation.js";
 import { createSession, getSession, clearSession, TEST_USER } from "./features/auth/auth.js";
@@ -8,13 +13,13 @@ import {
   readMoves,
   createMoveRecord,
   upsertMove,
-  updateMoveProgress,
   migrateLegacyHistory,
 } from "./features/rigMoves/storage.js";
 import { HomePage } from "./pages/HomePage.js";
 import { LoginPage } from "./pages/LoginPage.js";
 import { DashboardPage } from "./pages/DashboardPage.js";
 import { RigMovePage } from "./pages/RigMovePage.js";
+import { formatMinutes } from "./lib/format.js";
 
 const { useEffect, useRef, useState } = React;
 
@@ -27,6 +32,8 @@ function App() {
   const [moves, setMoves] = useState([]);
   const [createError, setCreateError] = useState("");
   const [isCreatingMove, setIsCreatingMove] = useState(false);
+  const [isSimulatingMove, setIsSimulatingMove] = useState(false);
+  const [moveSimulationError, setMoveSimulationError] = useState("");
   const [currentMinute, setCurrentMinute] = useState(0);
   const [playbackSpeed, setPlaybackSpeed] = useState(1);
   const animationFrameRef = useRef(null);
@@ -79,6 +86,11 @@ function App() {
 
   useEffect(() => {
     if (route.page !== "move" || !activeMove?.simulation?.bestPlan?.totalMinutes) {
+      if (animationFrameRef.current !== null) {
+        window.cancelAnimationFrame(animationFrameRef.current);
+      }
+      animationFrameRef.current = null;
+      animationStartedAtRef.current = null;
       setCurrentMinute(0);
       return undefined;
     }
@@ -106,12 +118,7 @@ function App() {
       const nextMinute = Math.min(activeMove.simulation.bestPlan.totalMinutes, simulatedMinutes);
 
       setCurrentMinute(nextMinute);
-
-      if (Math.abs(nextMinute - lastPersistedMinuteRef.current) >= 10 || nextMinute === activeMove.simulation.bestPlan.totalMinutes) {
-        lastPersistedMinuteRef.current = nextMinute;
-        const nextMoves = updateMoveProgress(activeMove.id, nextMinute);
-        setMoves(nextMoves);
-      }
+      lastPersistedMinuteRef.current = nextMinute;
 
       if (nextMinute < activeMove.simulation.bestPlan.totalMinutes) {
         animationFrameRef.current = window.requestAnimationFrame(animate);
@@ -126,10 +133,8 @@ function App() {
       }
       animationFrameRef.current = null;
       animationStartedAtRef.current = null;
-      const nextMoves = updateMoveProgress(activeMove.id, lastPersistedMinuteRef.current);
-      setMoves(nextMoves);
     };
-  }, [activeMove?.id, route.page, playbackSpeed]);
+  }, [activeMove?.id, activeMove?.updatedAt, route.page, playbackSpeed]);
 
   async function handleLogin({ email, password }) {
     if (email !== TEST_USER.email || password !== TEST_USER.password) {
@@ -157,48 +162,14 @@ function App() {
 
     setIsCreatingMove(true);
 
-    const workerCount = DEFAULT_MOVE_SETTINGS.workerCount;
-    const truckCount = DEFAULT_MOVE_SETTINGS.truckCount;
-    let routeData = fallbackRouteData(formValues.startPoint, formValues.endPoint);
-    let routeMode = "estimated";
-
     try {
-      routeData = await fetchRouteData(formValues.startPoint, formValues.endPoint);
-      routeMode = "live";
-    } catch {
-      routeMode = "estimated";
-    }
-
-    try {
-      const scenarioPlans = buildScenarioPlans(logicalLoads, routeData, workerCount, truckCount);
-      const bestScenario = scenarioPlans.reduce(
-        (best, plan) => (!best || plan.totalMinutes < best.totalMinutes ? plan : best),
-        null,
-      );
-      const bestPlan = bestScenario?.bestVariant || null;
-
-      if (!bestPlan) {
-        throw new Error("No valid simulation plan could be generated for this rig move.");
-      }
-
-      const move = createMoveRecord({
+      const move = await buildMoveWithSimulation({
         name: formValues.name,
         startPoint: formValues.startPoint,
         endPoint: formValues.endPoint,
-        routeMode,
         loadCount: logicalLoads.length,
-        simulation: {
-          startPoint: formValues.startPoint,
-          endPoint: formValues.endPoint,
-          workerCount: bestScenario.workerCount,
-          truckCount: bestScenario.truckCount,
-          routeMinutes: routeData.minutes,
-          routeSource: routeData.source,
-          routeGeometry: routeData.geometry,
-          scenarioPlans,
-          bestScenario,
-          bestPlan,
-        },
+        logicalLoads,
+        truckSetup: DEFAULT_TRUCK_SETUP,
       });
 
       const nextMoves = upsertMove(move);
@@ -209,6 +180,130 @@ function App() {
       setCreateError(error.message || "Failed to create the rig move.");
     } finally {
       setIsCreatingMove(false);
+    }
+  }
+
+  async function buildMoveWithSimulation({ name, startPoint, endPoint, loadCount, logicalLoads, truckSetup, previousMove }) {
+    const sanitizedTruckSetup = truckSetup
+      .map((item) => ({
+        ...item,
+        count: Math.max(0, Number.parseInt(item.count, 10) || 0),
+      }))
+      .filter((item) => item.type.trim());
+    const requestedTruckCount = sanitizedTruckSetup.reduce((sum, item) => sum + item.count, 0);
+    if (requestedTruckCount < 1) {
+      throw new Error("Add at least one truck before running the simulation.");
+    }
+    const truckCount = requestedTruckCount;
+    const workerCount = Math.max(DEFAULT_MOVE_SETTINGS.workerCount, truckCount + 2);
+
+    let routeData = fallbackRouteData(startPoint, endPoint);
+    let routeMode = "estimated";
+
+    try {
+      routeData = await fetchRouteData(startPoint, endPoint);
+      routeMode = "live";
+    } catch {
+      routeMode = "estimated";
+    }
+
+    const scenarioPlans = buildScenarioPlans(logicalLoads, routeData, workerCount, truckCount);
+    const bestScenario = scenarioPlans.reduce(
+      (best, plan) => (!best || plan.totalMinutes < best.totalMinutes ? plan : best),
+      null,
+    );
+    const bestPlan = bestScenario?.bestVariant || null;
+
+    if (!bestPlan) {
+      throw new Error("No valid simulation plan could be generated for this rig move.");
+    }
+
+    const simulation = {
+      startPoint,
+      endPoint,
+      workerCount: bestScenario.workerCount,
+      truckCount: bestScenario.truckCount,
+      truckSetup: sanitizedTruckSetup,
+      routeMinutes: routeData.minutes,
+      routeSource: routeData.source,
+      routeGeometry: routeData.geometry,
+      scenarioPlans,
+      bestScenario,
+      bestPlan,
+    };
+
+    if (!previousMove) {
+      return createMoveRecord({
+        name,
+        startPoint,
+        endPoint,
+        routeMode,
+        loadCount,
+        simulation,
+      });
+    }
+
+    return {
+      ...previousMove,
+      name,
+      updatedAt: new Date().toISOString(),
+      routeMode,
+      loadCount,
+      truckSetup: sanitizedTruckSetup,
+      eta: formatMinutes(bestPlan.totalMinutes),
+      routeTime: formatMinutes(routeData.minutes),
+      progressMinute: 0,
+      completionPercentage: 0,
+      simulation,
+    };
+  }
+
+  async function handleRunMoveSimulation({ moveId, truckSetup }) {
+    setMoveSimulationError("");
+
+    if (!logicalLoads.length) {
+      setMoveSimulationError("The load dataset is still loading. Try again in a moment.");
+      return;
+    }
+
+    const targetMove = moves.find((move) => move.id === moveId);
+    if (!targetMove) {
+      setMoveSimulationError("The selected move could not be found.");
+      return;
+    }
+
+    setIsSimulatingMove(true);
+
+    try {
+      if (animationFrameRef.current !== null) {
+        window.cancelAnimationFrame(animationFrameRef.current);
+      }
+      animationFrameRef.current = null;
+      animationStartedAtRef.current = null;
+      lastPersistedMinuteRef.current = 0;
+      setCurrentMinute(0);
+
+      const updatedMove = await buildMoveWithSimulation({
+        name: targetMove.name,
+        startPoint: targetMove.startPoint,
+        endPoint: targetMove.endPoint,
+        loadCount: logicalLoads.length,
+        logicalLoads,
+        truckSetup,
+        previousMove: targetMove,
+      });
+      const nextMoves = upsertMove({
+        ...updatedMove,
+        progressMinute: 0,
+        completionPercentage: 0,
+      });
+      setMoves(nextMoves);
+      setCurrentMinute(0);
+      setPlaybackSpeed(1);
+    } catch (error) {
+      setMoveSimulationError(error.message || "Failed to simulate the move.");
+    } finally {
+      setIsSimulatingMove(false);
     }
   }
 
@@ -244,7 +339,10 @@ function App() {
       move: activeMove,
       currentMinute,
       playbackSpeed,
+      isSimulating: isSimulatingMove,
+      simulationError: moveSimulationError,
       onPlaybackSpeedChange: setPlaybackSpeed,
+      onSimulate: handleRunMoveSimulation,
       onBack: () => navigateTo("/dashboard"),
       onLogout: handleLogout,
       currentUser: session,

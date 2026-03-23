@@ -65,6 +65,7 @@ export function createMoveRecord({ name, startPoint, endPoint, simulation, route
     routeTime: formatMinutes(simulation.routeMinutes),
     progressMinute: 0,
     completionPercentage: 0,
+    truckSetup: simulation.truckSetup || [],
     simulation,
     createdLabel: formatShortDate(now),
   };

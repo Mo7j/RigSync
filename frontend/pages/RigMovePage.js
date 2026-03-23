@@ -1,70 +1,138 @@
-import { h } from "../lib/react.js";
+import { React, h } from "../lib/react.js";
 import { AppLayout } from "../layouts/AppLayout.js";
 import { Button } from "../components/ui/Button.js";
 import { Card, StatCard } from "../components/ui/Card.js";
 import { ProgressBar } from "../components/ui/ProgressBar.js";
-import { SelectInput, Field } from "../components/ui/Field.js";
+import { Field, TextInput } from "../components/ui/Field.js";
 import { LeafletMap } from "../components/map/LeafletMap.js";
 import { formatMinutes } from "../lib/format.js";
-import { getTruckStatus } from "../features/rigMoves/simulation.js";
 
-function ScenarioSummary({ scenarioPlans, bestScenario }) {
+const { useEffect, useMemo, useState } = React;
+
+function normalizeTruckSetup(move) {
+  const source = move?.truckSetup?.length ? move.truckSetup : move?.simulation?.truckSetup || [];
+
+  if (source.length) {
+    return source.map((item, index) => ({
+      id: item.id || `truck-${index + 1}`,
+      type: item.type || "Truck",
+      count: String(item.count ?? 0),
+    }));
+  }
+
+  return [{ id: "fleet-default", type: "Heavy Haul", count: String(move?.simulation?.truckCount || 1) }];
+}
+
+function TruckSetupEditor({ truckSetup, onChange, onAddRow, onRemoveRow }) {
+  return h(
+    "div",
+    { className: "truck-setup-list" },
+    truckSetup.map((truck, index) =>
+      h(
+        "div",
+        { key: truck.id, className: "truck-setup-row" },
+        h(
+          Field,
+          { label: index === 0 ? "Truck Type" : "" },
+          h(TextInput, {
+            type: "text",
+            value: truck.type,
+            placeholder: "Heavy Haul",
+            onChange: (event) => onChange(truck.id, "type", event.target.value),
+          }),
+        ),
+        h(
+          Field,
+          { label: index === 0 ? "Count" : "" },
+          h(TextInput, {
+            type: "number",
+            min: "0",
+            value: truck.count,
+            onChange: (event) => onChange(truck.id, "count", event.target.value),
+          }),
+        ),
+        h(Button, {
+          type: "button",
+          variant: "ghost",
+          size: "sm",
+          className: "truck-row-remove",
+          onClick: () => onRemoveRow(truck.id),
+          children: "Remove",
+        }),
+      ),
+    ),
+    h(Button, {
+      type: "button",
+      variant: "ghost",
+      size: "sm",
+      onClick: onAddRow,
+      children: "Add Truck Type",
+    }),
+  );
+}
+
+function ScenarioBreakdown({ scenarios, activeScenarioName, onSelect }) {
   return h(
     "div",
     { className: "scenario-list" },
-    scenarioPlans.map((plan) =>
+    scenarios.map((scenario) =>
       h(
-        Card,
+        "button",
         {
-          key: plan.name,
-          className: `scenario-card${plan.name === bestScenario?.name ? " scenario-card-active" : ""}`,
+          key: scenario.name,
+          type: "button",
+          className: `scenario-card${scenario.name === activeScenarioName ? " scenario-card-active" : ""}`,
+          onClick: () => onSelect(scenario.name),
         },
-        h("div", { className: "scenario-head" }, h("strong", null, plan.name), h("span", null, formatMinutes(plan.totalMinutes))),
-        h("p", { className: "muted-copy" }, `${plan.workerCount} workers • ${plan.truckCount} trucks • Capacity ${plan.capacity}`),
+        h("div", { className: "scenario-head" }, h("strong", null, scenario.name), h("span", null, formatMinutes(scenario.totalMinutes))),
+        h("p", { className: "muted-copy" }, `${scenario.truckCount} trucks - ${scenario.workerCount} workers`),
       ),
     ),
   );
 }
 
-function EventFeed({ steps }) {
-  return h(
-    "div",
-    { className: "event-feed" },
-    steps.map((step, index) =>
-      h(
-        "article",
-        { key: `${step.type}-${step.minute}-${index}`, className: "event-row" },
-        h("span", { className: "event-time" }, formatMinutes(Math.round(step.minute))),
-        h("div", null, h("strong", null, step.title), h("p", { className: "muted-copy" }, step.description)),
-      ),
-    ),
-  );
+function getPhasePercentages(playback, currentMinute) {
+  const trips = playback?.trips || [];
+  const totalTrips = Math.max(trips.length, 1);
+  const down = (trips.filter((trip) => currentMinute >= trip.rigDownFinish).length / totalTrips) * 100;
+  const move = (trips.filter((trip) => currentMinute >= trip.arrivalAtDestination).length / totalTrips) * 100;
+  const up = (trips.filter((trip) => currentMinute >= trip.rigUpFinish).length / totalTrips) * 100;
+  return { down, move, up };
 }
 
-function FleetGrid({ simulation, currentMinute }) {
-  return h(
-    "div",
-    { className: "fleet-grid" },
-    Array.from({ length: simulation.truckCount }, (_, index) => index + 1).map((truckId) =>
-      h(
-        Card,
-        { key: truckId, className: "fleet-card" },
-        h("span", { className: "section-pill" }, `Truck ${truckId}`),
-        h("strong", null, getTruckStatus(simulation.bestPlan.playback, currentMinute, truckId)),
-      ),
-    ),
-  );
+function getRigLoadCounts(playback, currentMinute) {
+  const trips = playback?.trips || [];
+  const sourceCount = trips.filter((trip) => currentMinute < trip.rigDownFinish).length;
+  const movingCount = trips.filter(
+    (trip) => currentMinute >= trip.rigDownFinish && currentMinute < trip.rigUpFinish,
+  ).length;
+  const destinationCount = trips.filter((trip) => currentMinute >= trip.rigUpFinish).length;
+  return {
+    sourceCount,
+    movingCount,
+    destinationCount,
+    totalCount: trips.length,
+  };
 }
 
 export function RigMovePage({
   move,
   currentMinute,
-  playbackSpeed,
-  onPlaybackSpeedChange,
+  isSimulating,
+  simulationError,
+  onSimulate,
   onBack,
   onLogout,
   currentUser,
 }) {
+  const [truckSetup, setTruckSetup] = useState(() => normalizeTruckSetup(move));
+  const [activeScenarioName, setActiveScenarioName] = useState(move?.simulation?.bestScenario?.name || "");
+
+  useEffect(() => {
+    setTruckSetup(normalizeTruckSetup(move));
+    setActiveScenarioName(move?.simulation?.bestScenario?.name || "");
+  }, [move?.id, move?.updatedAt]);
+
   if (!move) {
     return h(
       AppLayout,
@@ -88,28 +156,48 @@ export function RigMovePage({
         currentUser,
         onLogout,
         onBack,
+        fullBleed: true,
       },
       h(
         Card,
         { className: "empty-state" },
-        h("h2", null, "Imported move"),
-        h("p", { className: "muted-copy" }, "This move came from legacy history data, so only the summary metadata is available."),
+        h("h2", null, "Move unavailable"),
+        h("p", { className: "muted-copy" }, "Open the dashboard and run the move simulation after setting the fleet."),
       ),
     );
   }
 
-  const totalMinutes = move.simulation.bestPlan.totalMinutes;
-  const completion = Math.min(100, Math.round((currentMinute / Math.max(totalMinutes, 1)) * 100));
-  const recentSteps = move.simulation.bestPlan.playback.steps
-    .filter((step) => step.minute <= currentMinute)
-    .slice(-6)
-    .reverse();
+  const scenarioPlans = move.simulation.scenarioPlans || [];
+  const activeScenario =
+    scenarioPlans.find((scenario) => scenario.name === activeScenarioName) ||
+    move.simulation.bestScenario ||
+    scenarioPlans[0];
+
+  const displaySimulation = useMemo(
+    () => ({
+      ...move.simulation,
+      workerCount: activeScenario.workerCount,
+      truckCount: activeScenario.truckCount,
+      bestPlan: activeScenario.bestVariant,
+      bestScenario: activeScenario,
+      routeGeometry: activeScenario.routeGeometry,
+      routeMinutes: activeScenario.routeMinutes,
+    }),
+    [move.simulation, activeScenario],
+  );
+
+  const totalMinutes = displaySimulation.bestPlan.totalMinutes;
+  const completion = Math.min(100, Math.round((Math.min(currentMinute, totalMinutes) / Math.max(totalMinutes, 1)) * 100));
+  const totalTrucks = truckSetup.reduce((sum, item) => sum + (Number.parseInt(item.count, 10) || 0), 0);
+  const phases = getPhasePercentages(displaySimulation.bestPlan.playback, currentMinute);
+  const rigLoads = getRigLoadCounts(displaySimulation.bestPlan.playback, currentMinute);
+  const lastLog = displaySimulation.bestPlan.playback.steps.filter((step) => step.minute <= currentMinute).slice(-1)[0] || displaySimulation.bestPlan.playback.steps[0];
 
   return h(
     AppLayout,
     {
       title: move.name,
-      subtitle: `${move.startLabel} → ${move.endLabel}`,
+      subtitle: `${move.startLabel} -> ${move.endLabel}`,
       currentUser,
       onLogout,
       onBack,
@@ -124,24 +212,40 @@ export function RigMovePage({
         h(
           Card,
           { className: "dashboard-section-card" },
-          h("div", { className: "section-heading" }, h("h2", null, "Move Progress"), h("span", { className: "section-pill" }, `${completion}%`)),
-          h(ProgressBar, { value: completion }),
-          h("p", { className: "muted-copy section-spacing" }, `${formatMinutes(Math.round(currentMinute))} elapsed of ${formatMinutes(totalMinutes)} total ETA.`),
+          h("div", { className: "section-heading" }, h("h2", null, "Simulation Setup"), h("span", { className: "section-pill" }, `${totalTrucks} trucks`)),
+          h("p", { className: "muted-copy section-spacing" }, "Set truck types and counts, then simulate using exactly this fleet."),
+          h(TruckSetupEditor, {
+            truckSetup,
+            onChange: (truckId, field, value) =>
+              setTruckSetup((current) =>
+                current.map((item) => (item.id === truckId ? { ...item, [field]: value } : item)),
+              ),
+            onAddRow: () =>
+              setTruckSetup((current) => [...current, { id: `truck-${Date.now()}`, type: "", count: "0" }]),
+            onRemoveRow: (truckId) =>
+              setTruckSetup((current) => current.filter((item) => item.id !== truckId)),
+          }),
+          simulationError ? h("p", { className: "field-error section-spacing" }, simulationError) : null,
           h(
             "div",
-            { className: "stat-grid" },
-            h(StatCard, { label: "Distance", value: `${move.routeKm} km`, meta: "Route span", tone: "green" }),
-            h(StatCard, { label: "Loads", value: String(move.loadCount), meta: "Logical move units", tone: "default" }),
-            h(StatCard, { label: "Best plan", value: move.simulation.bestScenario.name, meta: move.eta, tone: "green" }),
+            { className: "move-setup-actions" },
+            h(Button, {
+              type: "button",
+              isBusy: isSimulating,
+              onClick: () => onSimulate({ moveId: move.id, truckSetup }),
+              children: "Simulate",
+            }),
           ),
         ),
         h(
           Card,
           { className: "dashboard-section-card" },
           h("div", { className: "section-heading" }, h("h2", null, "Scenario Breakdown")),
-          h(ScenarioSummary, {
-            scenarioPlans: move.simulation.scenarioPlans,
-            bestScenario: move.simulation.bestScenario,
+          h("p", { className: "muted-copy section-spacing" }, "Switch between route/order scenarios generated with the same fleet size."),
+          h(ScenarioBreakdown, {
+            scenarios: scenarioPlans,
+            activeScenarioName: activeScenario.name,
+            onSelect: setActiveScenarioName,
           }),
         ),
       ),
@@ -153,32 +257,24 @@ export function RigMovePage({
           { className: "dashboard-section-card map-stage-card" },
           h(
             "div",
-            { className: "section-heading section-heading-space" },
-            h("div", null, h("h2", null, "Simulation View"), h("p", { className: "muted-copy" }, `${move.routeMode === "live" ? "Live routing" : "Estimated routing"} • ${move.routeTime}`)),
-            h(
-              "div",
-              { className: "speed-control" },
-              h(
-                Field,
-                { label: "Playback" },
-                h(
-                  SelectInput,
-                  {
-                    value: String(playbackSpeed),
-                    onChange: (event) => onPlaybackSpeedChange(Number(event.target.value)),
-                  },
-                  [0.5, 1, 2, 4, 8].map((speed) => h("option", { key: speed, value: String(speed) }, `${speed}x`)),
-                ),
-              ),
-            ),
+            { className: "section-heading" },
+            h("div", null, h("h2", null, "Simulation View"), h("p", { className: "muted-copy" }, `${move.routeMode === "live" ? "Live routing" : "Estimated routing"} - ${move.routeTime}`)),
+            h("span", { className: "section-pill" }, activeScenario.name),
           ),
           h(LeafletMap, {
             startPoint: move.startPoint,
             endPoint: move.endPoint,
-            simulation: move.simulation,
-            currentMinute,
-            heightClass: "map-frame map-frame-stage",
+            simulation: displaySimulation,
+            currentMinute: Math.min(currentMinute, totalMinutes),
+            heightClass: "map-frame map-frame-stage map-frame-stage-compact",
           }),
+          h(
+            "div",
+            { className: "map-log-card" },
+            h("span", { className: "section-pill" }, "Latest Log"),
+            h("strong", null, lastLog?.title || "Waiting for simulation"),
+            h("p", { className: "muted-copy" }, lastLog?.description || "No events yet."),
+          ),
         ),
       ),
       h(
@@ -187,25 +283,41 @@ export function RigMovePage({
         h(
           Card,
           { className: "dashboard-section-card" },
-          h("div", { className: "section-heading" }, h("h2", null, "Fleet Status")),
-          h(FleetGrid, { simulation: move.simulation, currentMinute }),
+          h("div", { className: "section-heading" }, h("h2", null, "Rig Load Counts")),
+          h("p", { className: "muted-copy section-spacing" }, "Live count of loads at the source, currently moving, and completed at the destination."),
+          h(
+            "div",
+            { className: "rig-load-grid" },
+            h(StatCard, {
+              label: "Source",
+              value: String(rigLoads.sourceCount),
+              meta: `${move.startLabel}`,
+              tone: "default",
+            }),
+            h(StatCard, {
+              label: "Moving",
+              value: String(rigLoads.movingCount),
+              meta: "In transfer or rig-up",
+              tone: "default",
+            }),
+            h(StatCard, {
+              label: "Destination",
+              value: String(rigLoads.destinationCount),
+              meta: `${move.endLabel}`,
+              tone: "green",
+            }),
+          ),
         ),
         h(
           Card,
           { className: "dashboard-section-card" },
-          h("div", { className: "section-heading" }, h("h2", null, "Operation Log")),
-          h(EventFeed, { steps: recentSteps }),
-        ),
-        h(
-          Card,
-          { className: "dashboard-section-card" },
-          h("div", { className: "section-heading" }, h("h2", null, "Controls")),
-          h(Button, {
-            type: "button",
-            variant: "secondary",
-            onClick: onBack,
-            children: "Back to Dashboard",
-          }),
+          h("div", { className: "section-heading" }, h("h2", null, "Move Progress"), h("span", { className: "section-pill" }, `${completion}%`)),
+          h(StatCard, { label: "Total Progress", value: `${completion}%`, meta: `${formatMinutes(Math.round(Math.min(currentMinute, totalMinutes)))} of ${formatMinutes(totalMinutes)}`, tone: "green" }),
+          h("div", { className: "phase-stack" },
+            h("div", { className: "phase-row" }, h("span", null, "Rig Down"), h("strong", null, `${Math.round(phases.down)}%`), h(ProgressBar, { value: phases.down })),
+            h("div", { className: "phase-row" }, h("span", null, "Move"), h("strong", null, `${Math.round(phases.move)}%`), h(ProgressBar, { value: phases.move })),
+            h("div", { className: "phase-row" }, h("span", null, "Rig Up"), h("strong", null, `${Math.round(phases.up)}%`), h(ProgressBar, { value: phases.up })),
+          ),
         ),
       ),
     ),

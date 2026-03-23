@@ -49,7 +49,9 @@ export function LeafletMap({
   const mapRef = useRef(null);
   const markersRef = useRef({ start: null, end: null });
   const routeLineRef = useRef(null);
-  const truckMarkersRef = useRef([]);
+  const truckMarkersRef = useRef(new Map());
+  const routeKeyRef = useRef("");
+  const pointBoundsKeyRef = useRef("");
 
   useEffect(() => {
     if (!mapElementRef.current || mapRef.current || !window.L) {
@@ -94,29 +96,51 @@ export function LeafletMap({
       return;
     }
 
-    const { start, end } = markersRef.current;
-    if (start) {
-      start.remove();
-    }
-    if (end) {
-      end.remove();
+    const sourceTrips =
+      simulation?.bestPlan?.playback?.trips?.filter((trip) => currentMinute < trip.arrivalAtDestination) || [];
+    const destinationTrips =
+      simulation?.bestPlan?.playback?.trips?.filter((trip) => currentMinute >= trip.arrivalAtDestination) || [];
+
+    if (startPoint) {
+      if (!markersRef.current.start) {
+        markersRef.current.start = window.L.marker([startPoint.lat, startPoint.lng]).addTo(map);
+      } else {
+        markersRef.current.start.setLatLng([startPoint.lat, startPoint.lng]);
+      }
+
+      markersRef.current.start.bindTooltip(buildTooltipHtml("Loads at source", sourceTrips), {
+        direction: "top",
+        offset: [0, -12],
+        opacity: 0.96,
+      });
+    } else if (markersRef.current.start) {
+      markersRef.current.start.remove();
+      markersRef.current.start = null;
     }
 
-    const sourceTrips = simulation?.bestPlan?.playback?.trips?.filter((trip) => currentMinute < trip.arrivalAtDestination) || [];
-    const destinationTrips = simulation?.bestPlan?.playback?.trips?.filter((trip) => currentMinute >= trip.arrivalAtDestination) || [];
+    if (endPoint) {
+      if (!markersRef.current.end) {
+        markersRef.current.end = window.L.marker([endPoint.lat, endPoint.lng]).addTo(map);
+      } else {
+        markersRef.current.end.setLatLng([endPoint.lat, endPoint.lng]);
+      }
 
-    markersRef.current.start = startPoint
-      ? window.L.marker([startPoint.lat, startPoint.lng]).addTo(map).bindTooltip(
-          buildTooltipHtml("Loads at source", sourceTrips),
-          { direction: "top", offset: [0, -12], opacity: 0.96 },
-        )
-      : null;
-    markersRef.current.end = endPoint
-      ? window.L.marker([endPoint.lat, endPoint.lng]).addTo(map).bindTooltip(
-          buildTooltipHtml("Loads at destination", destinationTrips),
-          { direction: "top", offset: [0, -12], opacity: 0.96 },
-        )
-      : null;
+      markersRef.current.end.bindTooltip(buildTooltipHtml("Loads at destination", destinationTrips), {
+        direction: "top",
+        offset: [0, -12],
+        opacity: 0.96,
+      });
+    } else if (markersRef.current.end) {
+      markersRef.current.end.remove();
+      markersRef.current.end = null;
+    }
+  }, [startPoint, endPoint, simulation, currentMinute]);
+
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || !window.L) {
+      return;
+    }
 
     const bounds = [];
     if (startPoint) {
@@ -125,10 +149,17 @@ export function LeafletMap({
     if (endPoint) {
       bounds.push([endPoint.lat, endPoint.lng]);
     }
+
     if (bounds.length) {
-      map.fitBounds(bounds, { padding: [50, 50], maxZoom: bounds.length === 1 ? 8 : 6 });
+      const nextBoundsKey = bounds.map((point) => point.join(",")).join("|");
+      if (pointBoundsKeyRef.current !== nextBoundsKey) {
+        pointBoundsKeyRef.current = nextBoundsKey;
+        map.fitBounds(bounds, { padding: [50, 50], maxZoom: bounds.length === 1 ? 8 : 6 });
+      }
+    } else {
+      pointBoundsKeyRef.current = "";
     }
-  }, [startPoint, endPoint, simulation, currentMinute]);
+  }, [startPoint, endPoint]);
 
   useEffect(() => {
     const map = mapRef.current;
@@ -142,8 +173,11 @@ export function LeafletMap({
     }
 
     if (!simulation?.routeGeometry?.length) {
+      routeKeyRef.current = "";
       return;
     }
+
+    const nextRouteKey = JSON.stringify(simulation.routeGeometry);
 
     routeLineRef.current = window.L.polyline(simulation.routeGeometry, {
       color: "#c6ff00",
@@ -151,7 +185,10 @@ export function LeafletMap({
       opacity: 0.9,
     }).addTo(map);
 
-    map.fitBounds(routeLineRef.current.getBounds(), { padding: [50, 50] });
+    if (routeKeyRef.current !== nextRouteKey) {
+      routeKeyRef.current = nextRouteKey;
+      map.fitBounds(routeLineRef.current.getBounds(), { padding: [50, 50] });
+    }
   }, [simulation]);
 
   useEffect(() => {
@@ -160,12 +197,13 @@ export function LeafletMap({
       return;
     }
 
-    truckMarkersRef.current.forEach((marker) => marker.remove());
-    truckMarkersRef.current = [];
-
     if (!simulation?.bestPlan?.playback?.trips?.length || !simulation?.routeGeometry?.length) {
+      truckMarkersRef.current.forEach((marker) => marker.remove());
+      truckMarkersRef.current.clear();
       return;
     }
+
+    const activeTruckIds = new Set();
 
     for (let truckId = 1; truckId <= simulation.truckCount; truckId += 1) {
       const position = getTruckPosition(simulation.bestPlan.playback, simulation.routeGeometry, currentMinute, truckId);
@@ -173,14 +211,30 @@ export function LeafletMap({
         continue;
       }
 
-      const marker = window.L.marker([position.lat, position.lng], {
-        icon: createTruckIcon(truckId),
-      })
-        .addTo(map)
-        .bindTooltip(`Truck ${truckId}: ${getTruckStatus(simulation.bestPlan.playback, currentMinute, truckId)}`);
+      activeTruckIds.add(truckId);
+      const status = getTruckStatus(simulation.bestPlan.playback, currentMinute, truckId);
+      const existingMarker = truckMarkersRef.current.get(truckId);
 
-      truckMarkersRef.current.push(marker);
+      if (existingMarker) {
+        existingMarker.setLatLng([position.lat, position.lng]);
+        existingMarker.bindTooltip(`Truck ${truckId}: ${status}`);
+      } else {
+        const marker = window.L.marker([position.lat, position.lng], {
+          icon: createTruckIcon(truckId),
+        })
+          .addTo(map)
+          .bindTooltip(`Truck ${truckId}: ${status}`);
+
+        truckMarkersRef.current.set(truckId, marker);
+      }
     }
+
+    truckMarkersRef.current.forEach((marker, truckId) => {
+      if (!activeTruckIds.has(truckId)) {
+        marker.remove();
+        truckMarkersRef.current.delete(truckId);
+      }
+    });
   }, [simulation, currentMinute]);
 
   return h(

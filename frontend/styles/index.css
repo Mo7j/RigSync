@@ -753,6 +753,27 @@ p {
   line-height: 1.5;
 }
 
+.rig-load-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+  margin-top: 16px;
+}
+
+.rig-load-grid .stat-card {
+  min-height: 0;
+  padding: 16px 14px;
+}
+
+.rig-load-grid .stat-card-value {
+  font-size: 1.1rem;
+}
+
+.rig-load-grid .stat-card-meta {
+  font-size: 0.78rem;
+  line-height: 1.4;
+}
+
 .modal-backdrop {
   position: fixed;
   inset: 0;
@@ -797,6 +818,10 @@ p {
   min-height: 640px;
 }
 
+.map-frame-stage-compact {
+  min-height: 460px;
+}
+
 .real-map {
   width: 100%;
   height: 100%;
@@ -806,6 +831,14 @@ p {
 .real-map .leaflet-control-attribution {
   background: rgba(0, 0, 0, 0.45);
   color: var(--muted);
+}
+
+.truck-marker-icon {
+  will-change: transform;
+}
+
+.truck-marker-body {
+  will-change: transform;
 }
 
 .map-picker-hint {
@@ -841,6 +874,94 @@ p {
   grid-template-columns: 320px minmax(0, 1fr) 360px;
   gap: var(--space-3);
   align-items: start;
+}
+
+.move-side-column,
+.move-main-column {
+  align-self: start;
+}
+
+.move-side-column .dashboard-section-card,
+.move-main-column .dashboard-section-card {
+  padding: 20px;
+  border-radius: 22px;
+}
+
+.map-stage-card {
+  padding: 20px;
+}
+
+.truck-setup-list {
+  display: grid;
+  gap: 12px;
+  margin-top: var(--space-3);
+}
+
+.truck-setup-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1.3fr) 92px auto;
+  gap: 12px;
+  align-items: end;
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  background: rgba(255, 255, 255, 0.025);
+}
+
+.truck-setup-row .field {
+  min-width: 0;
+}
+
+.truck-row-remove {
+  white-space: nowrap;
+}
+
+.move-setup-actions {
+  margin-top: var(--space-3);
+}
+
+.move-setup-actions .button {
+  width: 100%;
+}
+
+.map-log-card {
+  display: grid;
+  gap: 8px;
+  margin-top: 16px;
+  padding: 14px 16px;
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  background: rgba(255, 255, 255, 0.025);
+}
+
+
+.phase-stack {
+  display: grid;
+  gap: 14px;
+  margin-top: 16px;
+}
+
+.phase-row {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 8px 12px;
+  align-items: center;
+}
+
+.phase-row .progress-track {
+  grid-column: 1 / -1;
+}
+
+.speed-control {
+  width: 108px;
+}
+
+.speed-control .field {
+  gap: 6px;
+}
+
+.speed-control .field-label {
+  font-size: 0.8rem;
 }
 
 .fleet-grid,
@@ -903,6 +1024,14 @@ p {
 
   .feature-grid {
     grid-template-columns: 1fr 1fr;
+  }
+
+  .truck-setup-row {
+    grid-template-columns: minmax(0, 1fr) 96px auto;
+  }
+
+  .rig-load-grid {
+    grid-template-columns: 1fr;
   }
 
   .marketing-footer,
@@ -984,6 +1113,19 @@ p {
   }
 
   .event-row {
+    grid-template-columns: 1fr;
+  }
+
+  .truck-setup-row {
+    grid-template-columns: 1fr;
+    align-items: stretch;
+  }
+
+  .speed-control {
+    width: 100%;
+  }
+
+  .phase-row {
     grid-template-columns: 1fr;
   }
 }
