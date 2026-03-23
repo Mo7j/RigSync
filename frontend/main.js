@@ -6,7 +6,7 @@ import {
   DEFAULT_TRUCK_SETUP,
   HISTORY_STORAGE_KEY,
 } from "./lib/constants.js";
-import { fetchLoads } from "./features/rigMoves/api.js";
+import { fetchLoads, fetchLocationLabel } from "./features/rigMoves/api.js";
 import { buildLogicalLoads, buildScenarioPlans, fetchRouteData, fallbackRouteData } from "./features/rigMoves/simulation.js";
 import { createSession, getSession, clearSession, TEST_USER } from "./features/auth/auth.js";
 import {
@@ -19,7 +19,7 @@ import { HomePage } from "./pages/HomePage.js";
 import { LoginPage } from "./pages/LoginPage.js";
 import { DashboardPage } from "./pages/DashboardPage.js";
 import { RigMovePage } from "./pages/RigMovePage.js";
-import { formatMinutes } from "./lib/format.js";
+import { formatCoordinate, formatMinutes } from "./lib/format.js";
 
 const { useEffect, useRef, useState } = React;
 
@@ -167,6 +167,8 @@ function App() {
         name: formValues.name,
         startPoint: formValues.startPoint,
         endPoint: formValues.endPoint,
+        startLabel: formValues.startLabel,
+        endLabel: formValues.endLabel,
         loadCount: logicalLoads.length,
         logicalLoads,
         truckSetup: DEFAULT_TRUCK_SETUP,
@@ -183,7 +185,7 @@ function App() {
     }
   }
 
-  async function buildMoveWithSimulation({ name, startPoint, endPoint, loadCount, logicalLoads, truckSetup, previousMove }) {
+  async function buildMoveWithSimulation({ name, startPoint, endPoint, startLabel: providedStartLabel, endLabel: providedEndLabel, loadCount, logicalLoads, truckSetup, previousMove }) {
     const sanitizedTruckSetup = truckSetup
       .map((item) => ({
         ...item,
@@ -199,12 +201,25 @@ function App() {
 
     let routeData = fallbackRouteData(startPoint, endPoint);
     let routeMode = "estimated";
+    let startLabel = providedStartLabel || previousMove?.startLabel || formatCoordinate(startPoint);
+    let endLabel = providedEndLabel || previousMove?.endLabel || formatCoordinate(endPoint);
 
     try {
       routeData = await fetchRouteData(startPoint, endPoint);
       routeMode = "live";
     } catch {
       routeMode = "estimated";
+    }
+
+    try {
+      const [nextStartLabel, nextEndLabel] = await Promise.all([
+        fetchLocationLabel(startPoint),
+        fetchLocationLabel(endPoint),
+      ]);
+      startLabel = nextStartLabel || startLabel;
+      endLabel = nextEndLabel || endLabel;
+    } catch {
+      // Keep coordinate fallback labels when reverse geocoding is unavailable.
     }
 
     const scenarioPlans = buildScenarioPlans(logicalLoads, routeData, workerCount, truckCount);
@@ -237,6 +252,8 @@ function App() {
         name,
         startPoint,
         endPoint,
+        startLabel,
+        endLabel,
         routeMode,
         loadCount,
         simulation,
@@ -249,6 +266,8 @@ function App() {
       updatedAt: new Date().toISOString(),
       routeMode,
       loadCount,
+      startLabel,
+      endLabel,
       truckSetup: sanitizedTruckSetup,
       eta: formatMinutes(bestPlan.totalMinutes),
       routeTime: formatMinutes(routeData.minutes),

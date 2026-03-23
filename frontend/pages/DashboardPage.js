@@ -7,6 +7,7 @@ import { ProgressBar } from "../components/ui/ProgressBar.js";
 import { Modal } from "../components/ui/Modal.js";
 import { LeafletMap } from "../components/map/LeafletMap.js";
 import { formatCoordinate, formatDate } from "../lib/format.js";
+import { fetchLocationLabel } from "../features/rigMoves/api.js";
 
 const { useState } = React;
 
@@ -60,20 +61,39 @@ export function DashboardPage({
   const [name, setName] = useState("");
   const [startPoint, setStartPoint] = useState(null);
   const [endPoint, setEndPoint] = useState(null);
+  const [startLabel, setStartLabel] = useState("");
+  const [endLabel, setEndLabel] = useState("");
   const [pickerTarget, setPickerTarget] = useState(null);
   const [fieldErrors, setFieldErrors] = useState({});
+  const [isResolvingLocation, setIsResolvingLocation] = useState(false);
 
   function openPicker(target) {
     setPickerTarget(target);
   }
 
-  function handleMapPick({ target, point }) {
+  async function handleMapPick({ target, point }) {
     if (target === "start") {
       setStartPoint(point);
+      setStartLabel(formatCoordinate(point));
     } else {
       setEndPoint(point);
+      setEndLabel(formatCoordinate(point));
     }
     setPickerTarget(null);
+
+    setIsResolvingLocation(true);
+    try {
+      const resolvedLabel = await fetchLocationLabel(point);
+      if (target === "start") {
+        setStartLabel(resolvedLabel);
+      } else {
+        setEndLabel(resolvedLabel);
+      }
+    } catch {
+      // Keep coordinate fallback if reverse geocoding fails.
+    } finally {
+      setIsResolvingLocation(false);
+    }
   }
 
   async function handleSubmit(event) {
@@ -99,6 +119,8 @@ export function DashboardPage({
       name: name.trim(),
       startPoint,
       endPoint,
+      startLabel: startLabel || formatCoordinate(startPoint),
+      endLabel: endLabel || formatCoordinate(endPoint),
     });
   }
 
@@ -149,7 +171,7 @@ export function DashboardPage({
               Field,
               {
                 label: "Start Location",
-                hint: startPoint ? formatCoordinate(startPoint) : "Select the source rig on the map.",
+                hint: startPoint ? startLabel || formatCoordinate(startPoint) : "Select the source rig on the map.",
                 error: fieldErrors.start,
                 action: h(
                   Button,
@@ -164,7 +186,7 @@ export function DashboardPage({
               },
               h(TextInput, {
                 type: "text",
-                value: startPoint ? formatCoordinate(startPoint) : "",
+                value: startPoint ? startLabel || formatCoordinate(startPoint) : "",
                 placeholder: "Click Select to open map",
                 readOnly: true,
               }),
@@ -173,7 +195,7 @@ export function DashboardPage({
               Field,
               {
                 label: "End Location",
-                hint: endPoint ? formatCoordinate(endPoint) : "Select the destination rig on the map.",
+                hint: endPoint ? endLabel || formatCoordinate(endPoint) : "Select the destination rig on the map.",
                 error: fieldErrors.end,
                 action: h(
                   Button,
@@ -188,11 +210,12 @@ export function DashboardPage({
               },
               h(TextInput, {
                 type: "text",
-                value: endPoint ? formatCoordinate(endPoint) : "",
+                value: endPoint ? endLabel || formatCoordinate(endPoint) : "",
                 placeholder: "Click Select to open map",
                 readOnly: true,
               }),
             ),
+            isResolvingLocation ? h("p", { className: "muted-copy" }, "Resolving location name...") : null,
             createError ? h("p", { className: "field-error" }, createError) : null,
             loadsError ? h("p", { className: "field-error" }, loadsError) : null,
             h(Button, {

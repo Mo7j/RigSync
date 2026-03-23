@@ -115,52 +115,40 @@ function getRigLoadCounts(playback, currentMinute) {
   };
 }
 
-function buildStageRows(playback) {
+function buildTruckScheduleRows(playback, truckCount) {
   const trips = playback?.trips || [];
   const totalMinutes = Math.max(playback?.totalMinutes || 1, 1);
-  if (!trips.length) {
-    return [];
-  }
 
-  const rows = [
-    {
-      id: "rig-down",
-      title: "Rig Down",
-      meta: "Loading and rig-down operations at source",
-      start: Math.min(...trips.map((trip) => trip.loadStart)),
-      end: Math.max(...trips.map((trip) => trip.rigDownFinish)),
-      tone: "down",
-    },
-    {
-      id: "move",
-      title: "Move",
-      meta: "Loads in transfer across the route",
-      start: Math.min(...trips.map((trip) => trip.rigDownFinish)),
-      end: Math.max(...trips.map((trip) => trip.arrivalAtDestination)),
-      tone: "move",
-    },
-    {
-      id: "rig-up",
-      title: "Rig Up",
-      meta: "Rig-up and completion at destination",
-      start: Math.min(...trips.map((trip) => trip.arrivalAtDestination)),
-      end: Math.max(...trips.map((trip) => trip.rigUpFinish)),
-      tone: "up",
-    },
-  ];
+  return Array.from({ length: truckCount }, (_, index) => {
+    const truckId = index + 1;
+    const truckTrips = trips
+      .filter((trip) => trip.truckId === truckId)
+      .map((trip, tripIndex) => ({
+        ...trip,
+        key: `${truckId}-${trip.loadId}-${tripIndex}`,
+        left: (trip.loadStart / totalMinutes) * 100,
+        width: (((trip.rigUpFinish || trip.arrivalAtDestination) - trip.loadStart) / totalMinutes) * 100,
+        loadWidth: ((trip.rigDownFinish - trip.loadStart) / totalMinutes) * 100,
+        moveLeft: ((trip.rigDownFinish - trip.loadStart) / totalMinutes) * 100,
+        moveWidth: ((trip.arrivalAtDestination - trip.rigDownFinish) / totalMinutes) * 100,
+        upLeft: ((trip.arrivalAtDestination - trip.loadStart) / totalMinutes) * 100,
+        upWidth: ((trip.rigUpFinish - trip.arrivalAtDestination) / totalMinutes) * 100,
+      }));
 
-  return rows.map((row) => ({
-    ...row,
-    left: (row.start / totalMinutes) * 100,
-    width: ((row.end - row.start) / totalMinutes) * 100,
-  }));
+    return {
+      truckId,
+      trips: truckTrips,
+    };
+  });
 }
 
 function LoadScheduleTable({ playback, currentMinute }) {
   const totalMinutes = Math.max(playback?.totalMinutes || 1, 1);
-  const rows = buildStageRows(playback);
-  const ticks = Array.from({ length: 7 }, (_, index) => {
-    const ratio = index / 6;
+  const truckCount = Math.max(...(playback?.trips || []).map((trip) => trip.truckId), 1);
+  const rows = buildTruckScheduleRows(playback, truckCount);
+  const tickCount = 8;
+  const ticks = Array.from({ length: tickCount + 1 }, (_, index) => {
+    const ratio = index / tickCount;
     return {
       key: `tick-${index}`,
       left: `${ratio * 100}%`,
@@ -168,49 +156,90 @@ function LoadScheduleTable({ playback, currentMinute }) {
     };
   });
   const currentX = `${(Math.min(currentMinute, totalMinutes) / totalMinutes) * 100}%`;
+  const minTimelineWidth = Math.max(900, rows.reduce((sum, row) => Math.max(sum, row.trips.length * 180), 900));
 
   return h(
     "div",
     { className: "schedule-table" },
     h(
       "div",
-      { className: "schedule-ticks" },
-      ticks.map((tick) =>
+      { className: "schedule-scroll" },
+      h(
+        "div",
+        { className: "schedule-canvas", style: { minWidth: `${minTimelineWidth}px` } },
         h(
-          "span",
-          {
-            key: tick.key,
-            className: "schedule-tick",
-            style: { left: tick.left },
-          },
-          tick.label,
-        ),
-      ),
-    ),
-    h(
-      "div",
-      { className: "schedule-stage-frame" },
-      h("div", { className: "schedule-current-marker", style: { left: currentX } }),
-      rows.map((row) =>
-        h(
-          "article",
-          { key: row.id, className: "schedule-row" },
-          h(
-            "div",
-            { className: "schedule-row-copy" },
-            h("strong", null, row.title),
-            h("span", { className: "muted-copy" }, row.meta),
-          ),
-          h(
-            "div",
-            { className: "schedule-row-track" },
-            h("span", {
-              className: `schedule-segment schedule-segment-${row.tone}${currentMinute >= row.start && currentMinute <= row.end ? " active" : ""}`,
-              style: {
-                left: `${row.left}%`,
-                width: `${Math.max(row.width, 3)}%`,
+          "div",
+          { className: "schedule-ticks" },
+          ticks.map((tick) =>
+            h(
+              "span",
+              {
+                key: tick.key,
+                className: "schedule-tick",
+                style: { left: tick.left },
               },
-            }),
+              tick.label,
+            ),
+          ),
+        ),
+        h("div", { className: "schedule-current-marker", style: { left: currentX } }),
+        rows.map((row) =>
+          h(
+            "article",
+            { key: `truck-row-${row.truckId}`, className: "schedule-row" },
+            h(
+              "div",
+              { className: "schedule-row-copy" },
+              h("strong", null, `Truck ${row.truckId}`),
+              h("span", { className: "muted-copy" }, `${row.trips.length} loads in sequence`),
+            ),
+            h(
+              "div",
+              { className: "schedule-row-track" },
+              ticks.map((tick) =>
+                h("span", {
+                  key: `grid-${row.truckId}-${tick.key}`,
+                  className: "schedule-grid-line",
+                  style: { left: tick.left },
+                }),
+              ),
+              row.trips.map((trip) =>
+                h(
+                  "div",
+                  {
+                    key: trip.key,
+                    className: "schedule-trip",
+                    style: {
+                      left: `${trip.left}%`,
+                      width: `${Math.max(trip.width, 5)}%`,
+                    },
+                    title: `${trip.description} | ${formatMinutes(Math.round(trip.loadStart))} -> ${formatMinutes(Math.round(trip.rigUpFinish))}`,
+                  },
+                  h("span", { className: "schedule-trip-label" }, `#${trip.loadId}`),
+                  h("span", {
+                    className: "schedule-segment schedule-segment-down",
+                    style: {
+                      left: "0%",
+                      width: `${Math.max(trip.loadWidth, 8)}%`,
+                    },
+                  }),
+                  h("span", {
+                    className: "schedule-segment schedule-segment-move",
+                    style: {
+                      left: `${trip.moveLeft}%`,
+                      width: `${Math.max(trip.moveWidth, 8)}%`,
+                    },
+                  }),
+                  h("span", {
+                    className: "schedule-segment schedule-segment-up",
+                    style: {
+                      left: `${trip.upLeft}%`,
+                      width: `${Math.max(trip.upWidth, 8)}%`,
+                    },
+                  }),
+                ),
+              ),
+            ),
           ),
         ),
       ),
@@ -394,13 +423,15 @@ export function RigMovePage({
                 playback: displaySimulation.bestPlan.playback,
                 currentMinute: Math.min(currentMinute, totalMinutes),
               }),
-          h(
-            "div",
-            { className: "map-log-card" },
-            h("span", { className: "section-pill" }, "Latest Log"),
-            h("strong", null, lastLog?.title || "Waiting for simulation"),
-            h("p", { className: "muted-copy" }, lastLog?.description || "No events yet."),
-          ),
+          activeView === "map"
+            ? h(
+                "div",
+                { className: "map-log-card" },
+                h("span", { className: "section-pill" }, "Latest Log"),
+                h("strong", null, lastLog?.title || "Waiting for simulation"),
+                h("p", { className: "muted-copy" }, lastLog?.description || "No events yet."),
+              )
+            : null,
         ),
       ),
       h(

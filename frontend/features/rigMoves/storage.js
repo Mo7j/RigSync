@@ -44,7 +44,7 @@ export function updateMoveProgress(moveId, progressMinute) {
   return saveMoves(nextMoves);
 }
 
-export function createMoveRecord({ name, startPoint, endPoint, simulation, routeMode, loadCount }) {
+export function createMoveRecord({ name, startPoint, endPoint, startLabel, endLabel, simulation, routeMode, loadCount }) {
   const totalMinutes = simulation.bestPlan.totalMinutes;
   const routeKm = Math.max(1, Math.round(haversineKilometers(startPoint, endPoint) * 10) / 10);
   const now = new Date();
@@ -58,8 +58,8 @@ export function createMoveRecord({ name, startPoint, endPoint, simulation, route
     loadCount,
     startPoint,
     endPoint,
-    startLabel: formatCoordinate(startPoint),
-    endLabel: formatCoordinate(endPoint),
+    startLabel: startLabel || formatCoordinate(startPoint),
+    endLabel: endLabel || formatCoordinate(endPoint),
     routeKm,
     eta: formatMinutes(totalMinutes),
     routeTime: formatMinutes(simulation.routeMinutes),
