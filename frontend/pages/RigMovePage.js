@@ -258,12 +258,12 @@ export function RigMovePage({
   currentUser,
 }) {
   const [truckSetup, setTruckSetup] = useState(() => normalizeTruckSetup(move));
-  const [activeScenarioName, setActiveScenarioName] = useState(move?.simulation?.bestScenario?.name || "");
+  const [activeScenarioName, setActiveScenarioName] = useState(move?.simulation?.preferredScenarioName || "");
   const [activeView, setActiveView] = useState("map");
 
   useEffect(() => {
     setTruckSetup(normalizeTruckSetup(move));
-    setActiveScenarioName(move?.simulation?.bestScenario?.name || "");
+    setActiveScenarioName(move?.simulation?.preferredScenarioName || "");
     setActiveView("map");
   }, [move?.id, move?.updatedAt]);
 
@@ -281,7 +281,7 @@ export function RigMovePage({
     );
   }
 
-  if (!move.simulation?.bestPlan) {
+  if (!move.simulation?.scenarioPlans?.length) {
     return h(
       AppLayout,
       {
@@ -304,7 +304,6 @@ export function RigMovePage({
   const scenarioPlans = move.simulation.scenarioPlans || [];
   const activeScenario =
     scenarioPlans.find((scenario) => scenario.name === activeScenarioName) ||
-    move.simulation.bestScenario ||
     scenarioPlans[0];
 
   const displaySimulation = useMemo(
@@ -371,17 +370,6 @@ export function RigMovePage({
             }),
           ),
         ),
-        h(
-          Card,
-          { className: "dashboard-section-card" },
-          h("div", { className: "section-heading" }, h("h2", null, "Scenario Breakdown")),
-          h("p", { className: "muted-copy section-spacing" }, "Switch between route/order scenarios generated with the same fleet size."),
-          h(ScenarioBreakdown, {
-            scenarios: scenarioPlans,
-            activeScenarioName: activeScenario.name,
-            onSelect: setActiveScenarioName,
-          }),
-        ),
       ),
       h(
         "section",
@@ -423,15 +411,6 @@ export function RigMovePage({
                 playback: displaySimulation.bestPlan.playback,
                 currentMinute: Math.min(currentMinute, totalMinutes),
               }),
-          activeView === "map"
-            ? h(
-                "div",
-                { className: "map-log-card" },
-                h("span", { className: "section-pill" }, "Latest Log"),
-                h("strong", null, lastLog?.title || "Waiting for simulation"),
-                h("p", { className: "muted-copy" }, lastLog?.description || "No events yet."),
-              )
-            : null,
         ),
       ),
       h(
@@ -441,7 +420,6 @@ export function RigMovePage({
           Card,
           { className: "dashboard-section-card" },
           h("div", { className: "section-heading" }, h("h2", null, "Rig Load Counts")),
-          h("p", { className: "muted-copy section-spacing" }, "Live count of loads at the source, currently moving, and completed at the destination."),
           h(
             "div",
             { className: "rig-load-grid" },
@@ -469,11 +447,40 @@ export function RigMovePage({
           Card,
           { className: "dashboard-section-card" },
           h("div", { className: "section-heading" }, h("h2", null, "Move Progress"), h("span", { className: "section-pill" }, `${completion}%`)),
-          h(StatCard, { label: "Total Progress", value: `${completion}%`, meta: `${formatMinutes(Math.round(Math.min(currentMinute, totalMinutes)))} of ${formatMinutes(totalMinutes)}`, tone: "green" }),
           h("div", { className: "phase-stack" },
             h("div", { className: "phase-row" }, h("span", null, "Rig Down"), h("strong", null, `${Math.round(phases.down)}%`), h(ProgressBar, { value: phases.down })),
             h("div", { className: "phase-row" }, h("span", null, "Move"), h("strong", null, `${Math.round(phases.move)}%`), h(ProgressBar, { value: phases.move })),
             h("div", { className: "phase-row" }, h("span", null, "Rig Up"), h("strong", null, `${Math.round(phases.up)}%`), h(ProgressBar, { value: phases.up })),
+          ),
+        ),
+        h(
+          Card,
+          { className: "dashboard-section-card latest-log-card" },
+          h("div", { className: "section-heading" }, h("h2", null, "Latest Log")),
+          h("p", { className: "muted-copy section-spacing" }, lastLog?.title || "Waiting for simulation"),
+          h("p", { className: "muted-copy" }, lastLog?.description || "No events yet."),
+        ),
+      ),
+      h(
+        "section",
+        { className: "move-full-row" },
+        h(
+          Card,
+          { className: "dashboard-section-card" },
+          h(
+            "div",
+            { className: "scenario-breakdown-row" },
+            h(
+              "div",
+              { className: "scenario-breakdown-copy" },
+              h("div", { className: "section-heading" }, h("h2", null, "Scenario Breakdown")),
+              h("p", { className: "muted-copy section-spacing" }, "Switch between route/order scenarios generated with the same fleet size."),
+            ),
+            h(ScenarioBreakdown, {
+              scenarios: scenarioPlans,
+              activeScenarioName: activeScenario.name,
+              onSelect: setActiveScenarioName,
+            }),
           ),
         ),
       ),

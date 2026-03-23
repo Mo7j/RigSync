@@ -45,7 +45,7 @@ export function HomePage({
     MarketingLayout,
     {
       onPrimaryAction: hasSession ? onOpenDashboard : onOpenLogin,
-      primaryLabel: hasSession ? "Open Dashboard" : "Ask Us",
+      primaryLabel: "Ask Us",
     },
     h(
       "section",
@@ -200,6 +200,29 @@ export function HomePage({
             h("p", { className: "muted-copy" }, item.answer),
           ),
         ),
+      ),
+    ),
+    h(
+      "section",
+      { id: "rig-preview", className: "marketing-section model-preview-section" },
+      h("p", { className: "eyebrow" }, "3D Preview"),
+      h("h2", { className: "section-title" }, "Land rig embed preview on the home screen"),
+      h(
+        "p",
+        { className: "muted-copy section-copy" },
+        "A quick placement test for the Sketchfab model so the team can evaluate how a live 3D rig viewer feels at the end of the landing page.",
+      ),
+      h(
+        "div",
+        { className: "sketchfab-embed-wrapper model-preview-frame" },
+        h("iframe", {
+          title: "Land Rig",
+          frameBorder: "0",
+          allowFullScreen: true,
+          allow: "autoplay; fullscreen; xr-spatial-tracking",
+          loading: "lazy",
+          src: "https://sketchfab.com/models/72d5781728dc49f59c3d62c38da574c5/embed?autospin=1&autostart=1&annotations_visible=0&transparent=1&ui_animations=0&ui_infos=0&ui_stop=0&ui_inspector=0&ui_watermark_link=0&ui_watermark=0&ui_hint=0&ui_ar=0&ui_help=0&ui_settings=0&ui_vr=0&ui_fullscreen=0&ui_annotations=0&ui_color=000000",
+        }),
       ),
     ),
     h(

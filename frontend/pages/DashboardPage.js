@@ -1,7 +1,7 @@
 import { React, h } from "../lib/react.js";
 import { AppLayout } from "../layouts/AppLayout.js";
 import { Button } from "../components/ui/Button.js";
-import { Card, StatCard } from "../components/ui/Card.js";
+import { Card } from "../components/ui/Card.js";
 import { Field, TextInput } from "../components/ui/Field.js";
 import { ProgressBar } from "../components/ui/ProgressBar.js";
 import { Modal } from "../components/ui/Modal.js";
@@ -178,7 +178,7 @@ export function DashboardPage({
                   {
                     type: "button",
                     variant: "ghost",
-                    size: "sm",
+                    className: "dashboard-field-button",
                     onClick: () => openPicker("start"),
                     children: startPoint ? "Change" : "Select",
                   },
@@ -202,7 +202,7 @@ export function DashboardPage({
                   {
                     type: "button",
                     variant: "ghost",
-                    size: "sm",
+                    className: "dashboard-field-button",
                     onClick: () => openPicker("end"),
                     children: endPoint ? "Change" : "Select",
                   },
@@ -220,27 +220,12 @@ export function DashboardPage({
             loadsError ? h("p", { className: "field-error" }, loadsError) : null,
             h(Button, {
               type: "submit",
+              className: "dashboard-submit-button",
               isBusy: isCreatingMove,
               disabled: !loadsReady,
               children: "Create and Simulate Move",
             }),
           ),
-        ),
-        h(
-          "div",
-          { className: "dashboard-aside-stack" },
-          h(StatCard, {
-            label: "Routing readiness",
-            value: loadsReady ? "Ready" : "Loading",
-            meta: loadsReady ? "Dataset available" : "Waiting for backend loads",
-            tone: loadsReady ? "green" : "default",
-          }),
-          h(StatCard, {
-            label: "Settings",
-            value: "6 workers / 4 trucks",
-            meta: "Baseline scenario for new moves",
-            tone: "default",
-          }),
         ),
       ),
     ),

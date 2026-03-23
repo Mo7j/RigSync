@@ -4,6 +4,17 @@
   box-sizing: border-box;
 }
 
+:root {
+  --mouse-x: 50vw;
+  --mouse-y: 50vh;
+  --grid-shift-x: 0px;
+  --grid-shift-y: 0px;
+  --orbit-left-x: 0px;
+  --orbit-left-y: 0px;
+  --orbit-right-x: 0px;
+  --orbit-right-y: 0px;
+}
+
 html {
   scroll-behavior: smooth;
 }
@@ -31,9 +42,15 @@ body::before {
   background:
     linear-gradient(rgba(255, 255, 255, 0.025) 1px, transparent 1px),
     linear-gradient(90deg, rgba(255, 255, 255, 0.025) 1px, transparent 1px);
-  background-size: 96px 96px;
+  background-size: 52px 52px;
   mask-image: linear-gradient(180deg, rgba(0, 0, 0, 0.8), transparent 100%);
   pointer-events: none;
+  transform: translate3d(0, 0, 0);
+  transition: transform 140ms ease-out;
+}
+
+body.home-interactive::before {
+  transform: translate3d(var(--grid-shift-x), var(--grid-shift-y), 0);
 }
 
 button,
@@ -449,6 +466,14 @@ p {
   height: 72%;
 }
 
+.home-interactive .hero-orbit-left {
+  transform: translate3d(var(--orbit-left-x), var(--orbit-left-y), 0) rotate(-16deg);
+}
+
+.home-interactive .hero-orbit-right {
+  transform: translate3d(var(--orbit-right-x), var(--orbit-right-y), 0);
+}
+
 .marketing-section {
   margin-bottom: var(--space-5);
   padding: var(--space-5);
@@ -503,11 +528,28 @@ p {
 
 .about-stats,
 .auth-stats,
-.dashboard-aside-stack,
 .scenario-list,
 .control-stack {
   display: grid;
   gap: var(--space-2);
+}
+
+.model-preview-section {
+  display: grid;
+  gap: var(--space-3);
+}
+
+.model-preview-frame {
+  position: relative;
+  overflow: hidden;
+  margin-top: var(--space-2);
+}
+
+.model-preview-frame iframe {
+  display: block;
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  min-height: 360px;
 }
 
 .marketing-footer {
@@ -616,6 +658,7 @@ p {
   align-items: center;
   justify-content: space-between;
   gap: var(--space-2);
+  flex-wrap: wrap;
 }
 
 .field-label {
@@ -640,6 +683,17 @@ p {
   background: rgba(255, 255, 255, 0.03);
   color: var(--text);
   outline: none;
+}
+
+.dashboard-field-button {
+  min-width: 112px;
+  min-height: 52px;
+  padding: 0 18px;
+}
+
+.dashboard-submit-button {
+  width: 100%;
+  min-height: 52px;
 }
 
 .input:focus {
@@ -724,7 +778,7 @@ p {
 }
 
 .user-badge {
-  padding: 10px 14px;
+  padding: 10px 16px;
   border: 1px solid var(--line);
   border-radius: 999px;
   background: rgba(255, 255, 255, 0.04);
@@ -732,11 +786,14 @@ p {
 
 .user-badge > div {
   display: grid;
+  gap: 2px;
 }
 
 .user-badge span:last-child {
   color: var(--muted);
-  font-size: 0.8rem;
+  font-size: 0.82rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
 }
 
 .user-badge-dot {
@@ -1011,6 +1068,21 @@ p {
   align-items: start;
 }
 
+.move-full-row {
+  grid-column: 1 / -1;
+}
+
+.scenario-breakdown-row {
+  display: grid;
+  grid-template-columns: minmax(240px, 0.8fr) minmax(0, 1.2fr);
+  gap: var(--space-3);
+  align-items: start;
+}
+
+.scenario-breakdown-copy {
+  min-width: 0;
+}
+
 .move-side-column,
 .move-main-column {
   align-self: start;
@@ -1068,6 +1140,12 @@ p {
   border: 1px solid var(--line);
   border-radius: 16px;
   background: rgba(255, 255, 255, 0.025);
+}
+
+.latest-log-card {
+  min-height: 164px;
+  max-height: 164px;
+  overflow: hidden;
 }
 
 .move-view-switcher {
@@ -1328,6 +1406,10 @@ p {
   .hero-ring {
     justify-self: start;
   }
+
+  .model-preview-frame iframe {
+    min-height: 320px;
+  }
 }
 
 .fleet-grid,
@@ -1360,10 +1442,22 @@ p {
 }
 
 .scenario-list {
-  margin-top: var(--space-2);
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--space-2);
+  min-width: 0;
+  margin-top: 0;
+  overflow-x: auto;
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+
+.scenario-list::-webkit-scrollbar {
+  display: none;
 }
 
 .scenario-card {
+  flex: 0 0 220px;
   padding: var(--space-2);
 }
 
@@ -1431,6 +1525,14 @@ p {
   .hero-side-panel,
   .hero-side-card {
     justify-self: start;
+  }
+
+  .scenario-breakdown-row {
+    grid-template-columns: 1fr;
+  }
+
+  .scenario-list {
+    justify-content: flex-start;
   }
 }
 
@@ -1512,6 +1614,10 @@ p {
 
   .feature-grid {
     grid-template-columns: 1fr;
+  }
+
+  .model-preview-frame iframe {
+    min-height: 240px;
   }
 
   .event-row {

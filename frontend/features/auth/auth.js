@@ -4,7 +4,7 @@ export const TEST_USER = {
   email: "test@a.com",
   password: "123123",
   name: "Test User",
-  role: "Operations Lead",
+  role: "Manager",
 };
 
 export function getSession() {

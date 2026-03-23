@@ -23,6 +23,18 @@ import { formatCoordinate, formatMinutes } from "./lib/format.js";
 
 const { useEffect, useRef, useState } = React;
 
+function getActiveScenario(move) {
+  const scenarioPlans = move?.simulation?.scenarioPlans || [];
+  if (!scenarioPlans.length) {
+    return null;
+  }
+
+  return (
+    scenarioPlans.find((scenario) => scenario.name === move?.simulation?.preferredScenarioName) ||
+    scenarioPlans[0]
+  );
+}
+
 function App() {
   const route = useHashRoute();
   const [session, setSession] = useState(getSession);
@@ -75,8 +87,69 @@ function App() {
     };
   }, []);
 
+  useEffect(() => {
+    if (route.page !== "home") {
+      document.body.classList.remove("home-interactive");
+      document.documentElement.style.removeProperty("--mouse-x");
+      document.documentElement.style.removeProperty("--mouse-y");
+      document.documentElement.style.removeProperty("--grid-shift-x");
+      document.documentElement.style.removeProperty("--grid-shift-y");
+      document.documentElement.style.removeProperty("--orbit-left-x");
+      document.documentElement.style.removeProperty("--orbit-left-y");
+      document.documentElement.style.removeProperty("--orbit-right-x");
+      document.documentElement.style.removeProperty("--orbit-right-y");
+      return undefined;
+    }
+
+    document.body.classList.add("home-interactive");
+
+    const handleMouseMove = (event) => {
+      const x = event.clientX;
+      const y = event.clientY;
+      const centerX = window.innerWidth / 2;
+      const centerY = window.innerHeight / 2;
+      const shiftX = (x - centerX) * -0.018;
+      const shiftY = (y - centerY) * -0.018;
+      const orbitLeftX = shiftX * -0.35;
+      const orbitLeftY = shiftY * -0.35;
+      const orbitRightX = shiftX * 0.45;
+      const orbitRightY = shiftY * 0.45;
+
+      document.documentElement.style.setProperty("--mouse-x", `${x}px`);
+      document.documentElement.style.setProperty("--mouse-y", `${y}px`);
+      document.documentElement.style.setProperty("--grid-shift-x", `${shiftX}px`);
+      document.documentElement.style.setProperty("--grid-shift-y", `${shiftY}px`);
+      document.documentElement.style.setProperty("--orbit-left-x", `${orbitLeftX}px`);
+      document.documentElement.style.setProperty("--orbit-left-y", `${orbitLeftY}px`);
+      document.documentElement.style.setProperty("--orbit-right-x", `${orbitRightX}px`);
+      document.documentElement.style.setProperty("--orbit-right-y", `${orbitRightY}px`);
+    };
+
+    handleMouseMove({
+      clientX: window.innerWidth / 2,
+      clientY: window.innerHeight / 2,
+    });
+
+    window.addEventListener("mousemove", handleMouseMove);
+
+    return () => {
+      window.removeEventListener("mousemove", handleMouseMove);
+      document.body.classList.remove("home-interactive");
+      document.documentElement.style.removeProperty("--mouse-x");
+      document.documentElement.style.removeProperty("--mouse-y");
+      document.documentElement.style.removeProperty("--grid-shift-x");
+      document.documentElement.style.removeProperty("--grid-shift-y");
+      document.documentElement.style.removeProperty("--orbit-left-x");
+      document.documentElement.style.removeProperty("--orbit-left-y");
+      document.documentElement.style.removeProperty("--orbit-right-x");
+      document.documentElement.style.removeProperty("--orbit-right-y");
+    };
+  }, [route.page]);
+
   const logicalLoads = buildLogicalLoads(loads);
   const activeMove = route.page === "move" ? moves.find((move) => move.id === route.moveId) || null : null;
+  const activeScenario = getActiveScenario(activeMove);
+  const activeTotalMinutes = activeScenario?.bestVariant?.totalMinutes || 0;
 
   useEffect(() => {
     if (!session && (route.page === "dashboard" || route.page === "move")) {
@@ -85,7 +158,7 @@ function App() {
   }, [route.page, session]);
 
   useEffect(() => {
-    if (route.page !== "move" || !activeMove?.simulation?.bestPlan?.totalMinutes) {
+    if (route.page !== "move" || !activeTotalMinutes) {
       if (animationFrameRef.current !== null) {
         window.cancelAnimationFrame(animationFrameRef.current);
       }
@@ -97,7 +170,7 @@ function App() {
 
     const startingMinute = Math.min(
       activeMove.progressMinute || 0,
-      activeMove.simulation.bestPlan.totalMinutes,
+      activeTotalMinutes,
     );
 
     setCurrentMinute(startingMinute);
@@ -113,14 +186,14 @@ function App() {
       const simulatedMinutes =
         startingMinute +
         elapsedSeconds *
-          (activeMove.simulation.bestPlan.totalMinutes / BASE_PLAYBACK_SECONDS) *
+          (activeTotalMinutes / BASE_PLAYBACK_SECONDS) *
           playbackSpeed;
-      const nextMinute = Math.min(activeMove.simulation.bestPlan.totalMinutes, simulatedMinutes);
+      const nextMinute = Math.min(activeTotalMinutes, simulatedMinutes);
 
       setCurrentMinute(nextMinute);
       lastPersistedMinuteRef.current = nextMinute;
 
-      if (nextMinute < activeMove.simulation.bestPlan.totalMinutes) {
+      if (nextMinute < activeTotalMinutes) {
         animationFrameRef.current = window.requestAnimationFrame(animate);
       }
     };
@@ -134,7 +207,7 @@ function App() {
       animationFrameRef.current = null;
       animationStartedAtRef.current = null;
     };
-  }, [activeMove?.id, activeMove?.updatedAt, route.page, playbackSpeed]);
+  }, [activeMove?.id, activeMove?.updatedAt, route.page, playbackSpeed, activeTotalMinutes]);
 
   async function handleLogin({ email, password }) {
     if (email !== TEST_USER.email || password !== TEST_USER.password) {
@@ -242,6 +315,7 @@ function App() {
       routeMinutes: routeData.minutes,
       routeSource: routeData.source,
       routeGeometry: routeData.geometry,
+      preferredScenarioName: bestScenario.name,
       scenarioPlans,
       bestScenario,
       bestPlan,
