@@ -934,6 +934,117 @@ p {
   background: rgba(255, 255, 255, 0.025);
 }
 
+.move-view-switcher {
+  display: inline-flex;
+  align-self: center;
+  justify-self: center;
+  gap: 6px;
+  padding: 6px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.move-view-switcher-button {
+  min-height: 36px;
+  padding: 0 14px;
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--muted-strong);
+  cursor: pointer;
+  transition: background 180ms ease, color 180ms ease;
+}
+
+.move-view-switcher-button.active {
+  background: rgba(198, 255, 0, 0.14);
+  color: var(--text);
+}
+
+.schedule-table {
+  display: grid;
+  gap: 16px;
+}
+
+.schedule-ticks {
+  position: relative;
+  height: 28px;
+  margin-left: 220px;
+}
+
+.schedule-tick {
+  position: absolute;
+  top: 0;
+  transform: translateX(-50%);
+  color: var(--muted);
+  font-size: 0.78rem;
+}
+
+.schedule-stage-frame {
+  position: relative;
+  display: grid;
+  gap: 16px;
+}
+
+.schedule-current-marker {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  background: rgba(198, 255, 0, 0.6);
+  box-shadow: 0 0 10px rgba(198, 255, 0, 0.2);
+}
+
+.schedule-row {
+  display: grid;
+  grid-template-columns: 220px minmax(0, 1fr);
+  gap: 16px;
+  align-items: center;
+}
+
+.schedule-row-copy {
+  display: grid;
+  gap: 8px;
+}
+
+.schedule-row-track {
+  position: relative;
+  height: 44px;
+  border-left: 1px solid rgba(255, 255, 255, 0.06);
+  background:
+    repeating-linear-gradient(
+      90deg,
+      rgba(255, 255, 255, 0.04) 0,
+      rgba(255, 255, 255, 0.04) 1px,
+      transparent 1px,
+      transparent calc(100% / 6)
+    );
+}
+
+.schedule-segment {
+  position: absolute;
+  top: 10px;
+  height: 24px;
+  border-radius: 999px;
+  opacity: 0.92;
+}
+
+.schedule-segment.active {
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.24), 0 0 16px rgba(198, 255, 0, 0.16);
+}
+
+.schedule-segment-down {
+  background: linear-gradient(90deg, rgba(198, 255, 0, 0.18), rgba(198, 255, 0, 0.52));
+}
+
+.schedule-segment-move {
+  background: linear-gradient(90deg, rgba(255, 151, 151, 0.2), rgba(255, 151, 151, 0.62));
+}
+
+.schedule-segment-up {
+  background: linear-gradient(90deg, rgba(255, 215, 130, 0.18), rgba(255, 215, 130, 0.58));
+}
+
 
 .phase-stack {
   display: grid;
@@ -1031,6 +1142,14 @@ p {
   }
 
   .rig-load-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .schedule-ticks {
+    margin-left: 0;
+  }
+
+  .schedule-row {
     grid-template-columns: 1fr;
   }
 

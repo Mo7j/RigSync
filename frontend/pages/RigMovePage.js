@@ -115,6 +115,109 @@ function getRigLoadCounts(playback, currentMinute) {
   };
 }
 
+function buildStageRows(playback) {
+  const trips = playback?.trips || [];
+  const totalMinutes = Math.max(playback?.totalMinutes || 1, 1);
+  if (!trips.length) {
+    return [];
+  }
+
+  const rows = [
+    {
+      id: "rig-down",
+      title: "Rig Down",
+      meta: "Loading and rig-down operations at source",
+      start: Math.min(...trips.map((trip) => trip.loadStart)),
+      end: Math.max(...trips.map((trip) => trip.rigDownFinish)),
+      tone: "down",
+    },
+    {
+      id: "move",
+      title: "Move",
+      meta: "Loads in transfer across the route",
+      start: Math.min(...trips.map((trip) => trip.rigDownFinish)),
+      end: Math.max(...trips.map((trip) => trip.arrivalAtDestination)),
+      tone: "move",
+    },
+    {
+      id: "rig-up",
+      title: "Rig Up",
+      meta: "Rig-up and completion at destination",
+      start: Math.min(...trips.map((trip) => trip.arrivalAtDestination)),
+      end: Math.max(...trips.map((trip) => trip.rigUpFinish)),
+      tone: "up",
+    },
+  ];
+
+  return rows.map((row) => ({
+    ...row,
+    left: (row.start / totalMinutes) * 100,
+    width: ((row.end - row.start) / totalMinutes) * 100,
+  }));
+}
+
+function LoadScheduleTable({ playback, currentMinute }) {
+  const totalMinutes = Math.max(playback?.totalMinutes || 1, 1);
+  const rows = buildStageRows(playback);
+  const ticks = Array.from({ length: 7 }, (_, index) => {
+    const ratio = index / 6;
+    return {
+      key: `tick-${index}`,
+      left: `${ratio * 100}%`,
+      label: formatMinutes(Math.round(totalMinutes * ratio)),
+    };
+  });
+  const currentX = `${(Math.min(currentMinute, totalMinutes) / totalMinutes) * 100}%`;
+
+  return h(
+    "div",
+    { className: "schedule-table" },
+    h(
+      "div",
+      { className: "schedule-ticks" },
+      ticks.map((tick) =>
+        h(
+          "span",
+          {
+            key: tick.key,
+            className: "schedule-tick",
+            style: { left: tick.left },
+          },
+          tick.label,
+        ),
+      ),
+    ),
+    h(
+      "div",
+      { className: "schedule-stage-frame" },
+      h("div", { className: "schedule-current-marker", style: { left: currentX } }),
+      rows.map((row) =>
+        h(
+          "article",
+          { key: row.id, className: "schedule-row" },
+          h(
+            "div",
+            { className: "schedule-row-copy" },
+            h("strong", null, row.title),
+            h("span", { className: "muted-copy" }, row.meta),
+          ),
+          h(
+            "div",
+            { className: "schedule-row-track" },
+            h("span", {
+              className: `schedule-segment schedule-segment-${row.tone}${currentMinute >= row.start && currentMinute <= row.end ? " active" : ""}`,
+              style: {
+                left: `${row.left}%`,
+                width: `${Math.max(row.width, 3)}%`,
+              },
+            }),
+          ),
+        ),
+      ),
+    ),
+  );
+}
+
 export function RigMovePage({
   move,
   currentMinute,
@@ -127,10 +230,12 @@ export function RigMovePage({
 }) {
   const [truckSetup, setTruckSetup] = useState(() => normalizeTruckSetup(move));
   const [activeScenarioName, setActiveScenarioName] = useState(move?.simulation?.bestScenario?.name || "");
+  const [activeView, setActiveView] = useState("map");
 
   useEffect(() => {
     setTruckSetup(normalizeTruckSetup(move));
     setActiveScenarioName(move?.simulation?.bestScenario?.name || "");
+    setActiveView("map");
   }, [move?.id, move?.updatedAt]);
 
   if (!move) {
@@ -253,21 +358,42 @@ export function RigMovePage({
         "section",
         { className: "move-main-column" },
         h(
+          "div",
+          { className: "move-view-switcher" },
+          ["map", "schedule"].map((view) =>
+            h(
+              "button",
+              {
+                key: view,
+                type: "button",
+                className: `move-view-switcher-button${activeView === view ? " active" : ""}`,
+                onClick: () => setActiveView(view),
+              },
+              view === "map" ? "Map View" : "Load Schedule",
+            ),
+          ),
+        ),
+        h(
           Card,
           { className: "dashboard-section-card map-stage-card" },
           h(
             "div",
             { className: "section-heading" },
-            h("div", null, h("h2", null, "Simulation View"), h("p", { className: "muted-copy" }, `${move.routeMode === "live" ? "Live routing" : "Estimated routing"} - ${move.routeTime}`)),
+            h("div", null, h("h2", null, activeView === "map" ? "Simulation View" : "Load Schedule"), h("p", { className: "muted-copy" }, `${move.routeMode === "live" ? "Live routing" : "Estimated routing"} - ${move.routeTime}`)),
             h("span", { className: "section-pill" }, activeScenario.name),
           ),
-          h(LeafletMap, {
-            startPoint: move.startPoint,
-            endPoint: move.endPoint,
-            simulation: displaySimulation,
-            currentMinute: Math.min(currentMinute, totalMinutes),
-            heightClass: "map-frame map-frame-stage map-frame-stage-compact",
-          }),
+          activeView === "map"
+            ? h(LeafletMap, {
+                startPoint: move.startPoint,
+                endPoint: move.endPoint,
+                simulation: displaySimulation,
+                currentMinute: Math.min(currentMinute, totalMinutes),
+                heightClass: "map-frame map-frame-stage map-frame-stage-compact",
+              })
+            : h(LoadScheduleTable, {
+                playback: displaySimulation.bestPlan.playback,
+                currentMinute: Math.min(currentMinute, totalMinutes),
+              }),
           h(
             "div",
             { className: "map-log-card" },
