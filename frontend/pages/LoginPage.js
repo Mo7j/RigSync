@@ -1,6 +1,6 @@
 import { React, h } from "../lib/react.js";
 import { Button } from "../components/ui/Button.js";
-import { Card, StatCard } from "../components/ui/Card.js";
+import { Card } from "../components/ui/Card.js";
 import { Field, TextInput } from "../components/ui/Field.js";
 import { TEST_USER } from "../features/auth/auth.js";
 
@@ -30,37 +30,59 @@ export function LoginPage({ isAuthenticated, onLogin, onBackHome }) {
     "main",
     { className: "auth-shell" },
     h(
+      "button",
+      {
+        type: "button",
+        className: "icon-button auth-back-button",
+        onClick: onBackHome,
+        "aria-label": "Back to Home",
+      },
+      "<",
+    ),
+    h(
       Card,
       { className: "auth-card" },
-      h("p", { className: "eyebrow" }, "RigSync Access"),
-      h("h1", { className: "auth-title" }, isAuthenticated ? "Session already active" : "Secure entry for rig move control"),
+      h("p", { className: "eyebrow" }, "Welcome"),
+      h("h1", { className: "auth-title" }, isAuthenticated ? "Session already active" : "Login"),
       h(
         "p",
         { className: "muted-copy" },
-        "Use the provided test account to access the dashboard and simulation workspace.",
+        "Sign in to access the dashboard and operational workspace.",
       ),
       h(
         "form",
         { className: "auth-form", onSubmit: handleSubmit },
         h(
           Field,
-          { label: "Email", hint: "Test account: test@a.com" },
+          { label: "Email" },
           h(TextInput, {
             type: "email",
             value: email,
-            placeholder: "test@a.com",
+            placeholder: "name@company.com",
             onChange: (event) => setEmail(event.target.value),
           }),
         ),
         h(
           Field,
-          { label: "Password", hint: "Test password: 123123" },
+          { label: "Password" },
           h(TextInput, {
             type: "password",
             value: password,
-            placeholder: "123123",
+            placeholder: "Enter your password",
             onChange: (event) => setPassword(event.target.value),
           }),
+        ),
+        h(
+          "div",
+          { className: "auth-meta-row" },
+          h(
+            "button",
+            {
+              type: "button",
+              className: "auth-text-link",
+            },
+            "Forgot your password?",
+          ),
         ),
         error ? h("p", { className: "field-error auth-error" }, error) : null,
         h(
@@ -68,22 +90,24 @@ export function LoginPage({ isAuthenticated, onLogin, onBackHome }) {
           { className: "auth-actions" },
           h(Button, {
             type: "submit",
+            className: "login-primary",
             isBusy: isSubmitting,
             children: "Login",
           }),
-          h(Button, {
-            type: "button",
-            variant: "ghost",
-            onClick: onBackHome,
-            children: "Back to Home",
-          }),
         ),
-      ),
-      h(
-        "div",
-        { className: "auth-stats" },
-        h(StatCard, { label: "Environment", value: "Prototype", meta: "Validated flow", tone: "green" }),
-        h(StatCard, { label: "Auth", value: "Hardcoded", meta: "Scoped for demo", tone: "default" }),
+        h(
+          "div",
+          { className: "auth-footer-row" },
+          h("span", { className: "muted-copy" }, "Don't have an account?"),
+          h(
+            "button",
+            {
+              type: "button",
+              className: "auth-text-link auth-signup-link",
+            },
+            "Sign up",
+          ),
+        ),
       ),
     ),
   );

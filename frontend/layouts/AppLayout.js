@@ -72,7 +72,6 @@ export function AppLayout({
             h(
               "div",
               null,
-              h("strong", null, currentUser?.name || "Operations"),
               h("span", null, currentUser?.role || "Control room"),
             ),
           ),
@@ -89,6 +88,7 @@ export function AppLayout({
             type: "button",
             variant: "ghost",
             size: "sm",
+            className: "header-ghost-button",
             onClick: onLogout,
             children: "Logout",
           }),

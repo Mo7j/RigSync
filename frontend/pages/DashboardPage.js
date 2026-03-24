@@ -143,7 +143,7 @@ export function DashboardPage({
           Card,
           { className: "dashboard-section-card" },
           h("div", { className: "section-heading" }, h("h2", null, "Existing Rig Moves"), h("span", { className: "section-pill" }, `${moves.length} total`)),
-          h("p", { className: "muted-copy section-spacing" }, "Open any saved rig move to continue monitoring the simulation view."),
+          h("p", { className: "muted-copy section-spacing dashboard-existing-copy" }, "Open any saved rig move to continue monitoring the simulation view."),
           h(MoveList, { moves, onOpenMove }),
         ),
       ),
@@ -153,7 +153,7 @@ export function DashboardPage({
         h(
           Card,
           { className: "dashboard-section-card" },
-          h("div", { className: "section-heading" }, h("h2", null, "Create New Rig Move"), h("span", { className: "section-pill" }, "Standard crew preset")),
+          h("div", { className: "section-heading" }, h("h2", null, "Create New Rig Move")),
           h(
             "form",
             { className: "create-form", onSubmit: handleSubmit },

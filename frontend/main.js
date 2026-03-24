@@ -115,6 +115,40 @@ function App() {
   }, []);
 
   useEffect(() => {
+    const animatedNodes = [];
+    const selectors = [".card", ".move-row"];
+    const observer = new IntersectionObserver(
+      (entries) => {
+        entries.forEach((entry) => {
+          entry.target.classList.toggle("is-visible", entry.isIntersecting);
+        });
+      },
+      {
+        threshold: 0.1,
+        rootMargin: "-4% 0px -4% 0px",
+      },
+    );
+
+    const frameId = window.requestAnimationFrame(() => {
+      document.querySelectorAll(selectors.join(", ")).forEach((node, index) => {
+        node.classList.add("scroll-reveal");
+        node.style.setProperty("--reveal-delay", `${Math.min(index * 45, 220)}ms`);
+        observer.observe(node);
+        animatedNodes.push(node);
+      });
+    });
+
+    return () => {
+      window.cancelAnimationFrame(frameId);
+      observer.disconnect();
+      animatedNodes.forEach((node) => {
+        node.classList.remove("scroll-reveal", "is-visible");
+        node.style.removeProperty("--reveal-delay");
+      });
+    };
+  }, [route.page, moves.length]);
+
+  useEffect(() => {
     if (route.page !== "home") {
       document.body.classList.remove("home-interactive");
       document.documentElement.style.removeProperty("--mouse-x");
@@ -329,7 +363,7 @@ function App() {
 
   async function handleLogin({ email, password }) {
     if (email !== TEST_USER.email || password !== TEST_USER.password) {
-      throw new Error("Invalid credentials. Use the provided test account.");
+      throw new Error("Invalid credentials. Please check your email and password.");
     }
 
     const nextSession = createSession();
