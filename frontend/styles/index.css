@@ -1451,7 +1451,7 @@ p {
   height: 46px;
   transform: translateX(-50%);
   border-radius: 92px 92px 0 0;
-  background: #0a1018;
+  background: transparent;
   display: grid;
   place-items: center;
 }

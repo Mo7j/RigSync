@@ -39,29 +39,44 @@ function cloneModelWithUniqueMaterials(template) {
   return clone;
 }
 
+function hashString(value) {
+  let hash = 0;
+  for (let index = 0; index < value.length; index += 1) {
+    hash = ((hash << 5) - hash) + value.charCodeAt(index);
+    hash |= 0;
+  }
+  return Math.abs(hash);
+}
+
 function tintModel(root, color) {
   const tint = new THREE.Color(color);
-  const baseTone = new THREE.Color(0x5d6673);
   root.traverse((child) => {
     if (!child.isMesh || !child.material) {
       return;
     }
 
+    const partSeed = hashString(`${child.name || "mesh"}-${child.uuid}`).toString();
+    const toneOffset = (hashString(partSeed) % 7) / 100;
+    const shadeBase = 0.24 + toneOffset;
+    const detailTone = new THREE.Color().setRGB(shadeBase, shadeBase + 0.015, shadeBase + 0.03);
+    const accentMix = 0.05 + ((hashString(`${partSeed}-accent`) % 4) / 100);
     const materials = Array.isArray(child.material) ? child.material : [child.material];
     materials.forEach((material) => {
       if (material.color) {
-        material.color.lerp(baseTone, 0.8);
-        material.color.lerp(tint, 0.08);
+        material.color.lerp(detailTone, 0.88);
+        material.color.lerp(tint, accentMix);
       }
       if ("metalness" in material) {
-        material.metalness = Math.min(Math.max(material.metalness ?? 0.24, 0.1), 0.36);
+        const metalnessOffset = (hashString(`${partSeed}-metal`) % 14) / 100;
+        material.metalness = Math.min(Math.max((material.metalness ?? 0.24) * 0.72, 0.12), 0.22 + metalnessOffset);
       }
       if ("roughness" in material) {
-        material.roughness = Math.min(Math.max(material.roughness ?? 0.76, 0.52), 0.94);
+        const roughnessOffset = (hashString(`${partSeed}-rough`) % 10) / 100;
+        material.roughness = Math.min(Math.max((material.roughness ?? 0.76) * 0.92, 0.48), 0.82 + roughnessOffset);
       }
       if ("emissive" in material && material.emissive) {
-        material.emissive.copy(tint).multiplyScalar(0.08);
-        material.emissiveIntensity = 0.04;
+        material.emissive.copy(tint).multiplyScalar(0.03 + accentMix);
+        material.emissiveIntensity = 0.02;
       }
     });
   });
@@ -372,9 +387,9 @@ function createTruckFallbackMesh(accentColor) {
   const chassis = new THREE.Mesh(
     new THREE.BoxGeometry(7.2, 2.1, 3.4),
     new THREE.MeshStandardMaterial({
-      color: 0xd7e0ec,
-      metalness: 0.62,
-      roughness: 0.28,
+      color: 0x3a4048,
+      metalness: 0.46,
+      roughness: 0.48,
     }),
   );
   chassis.position.y = 2.2;
@@ -383,9 +398,9 @@ function createTruckFallbackMesh(accentColor) {
   const cab = new THREE.Mesh(
     new THREE.BoxGeometry(2.6, 2.4, 3.2),
     new THREE.MeshStandardMaterial({
-      color: 0xf5f7fb,
-      metalness: 0.58,
-      roughness: 0.22,
+      color: 0x4b525c,
+      metalness: 0.42,
+      roughness: 0.44,
     }),
   );
   cab.position.set(2.1, 3.3, 0);
@@ -394,9 +409,9 @@ function createTruckFallbackMesh(accentColor) {
   const bed = new THREE.Mesh(
     new THREE.BoxGeometry(3.6, 0.7, 2.9),
     new THREE.MeshStandardMaterial({
-      color: 0x0f1621,
-      metalness: 0.4,
-      roughness: 0.7,
+      color: 0x232931,
+      metalness: 0.28,
+      roughness: 0.78,
     }),
   );
   bed.position.set(-1.4, 3.1, 0);
@@ -407,9 +422,9 @@ function createTruckFallbackMesh(accentColor) {
     new THREE.MeshStandardMaterial({
       color: accentColor,
       emissive: accentColor,
-      emissiveIntensity: 1.8,
-      metalness: 0.3,
-      roughness: 0.4,
+      emissiveIntensity: 0.16,
+      metalness: 0.24,
+      roughness: 0.72,
     }),
   );
   beacon.rotation.z = Math.PI / 2;
@@ -502,33 +517,43 @@ function createRouteObjects(points) {
     return { objects: [] };
   }
 
-  const curve = new THREE.CatmullRomCurve3(points);
+  const routeSegments = new THREE.Group();
+  const routeMaterial = new THREE.MeshStandardMaterial({
+    color: 0x6f7782,
+    emissive: 0x2f353d,
+    emissiveIntensity: 0.16,
+    metalness: 0.18,
+    roughness: 0.56,
+    transparent: true,
+    opacity: 0.94,
+  });
 
-  const routeTube = new THREE.Mesh(
-    new THREE.TubeGeometry(curve, Math.max(points.length * 3, 60), 0.9, 10, false),
-    new THREE.MeshStandardMaterial({
-      color: 0xfbbf24,
-      emissive: 0xf59e0b,
-      emissiveIntensity: 1.08,
-      metalness: 0.1,
-      roughness: 0.3,
-      transparent: true,
-      opacity: 0.88,
-    }),
-  );
-  routeTube.position.y = 0.8;
+  for (let index = 0; index < points.length - 1; index += 1) {
+    const start = points[index];
+    const end = points[index + 1];
+    const segmentVector = new THREE.Vector3().subVectors(end, start);
+    const segmentLength = Math.max(segmentVector.length(), 0.001);
+    const segment = new THREE.Mesh(
+      new THREE.BoxGeometry(7.2, 0.95, segmentLength + 0.8),
+      routeMaterial,
+    );
+    segment.position.copy(start).lerp(end, 0.5);
+    segment.position.y = 0.72;
+    segment.lookAt(end.x, segment.position.y, end.z);
+    routeSegments.add(segment);
+  }
 
   const routeLine = new THREE.Line(
     new THREE.BufferGeometry().setFromPoints(points),
     new THREE.LineBasicMaterial({
-      color: 0xfde68a,
+      color: 0xb0b7c0,
       transparent: true,
-      opacity: 0.82,
+      opacity: 0.52,
     }),
   );
-  routeLine.position.y = 1.65;
+  routeLine.position.y = 1.16;
 
-  return { objects: [routeTube, routeLine] };
+  return { objects: [routeSegments, routeLine] };
 }
 
 function createFloor(extent) {
@@ -538,9 +563,9 @@ function createFloor(extent) {
   const base = new THREE.Mesh(
     new THREE.PlaneGeometry(size, size),
     new THREE.MeshStandardMaterial({
-      color: 0x0a0f15,
-      metalness: 0.06,
-      roughness: 0.95,
+      color: 0x21252a,
+      metalness: 0.12,
+      roughness: 0.96,
     }),
   );
   base.rotation.x = -Math.PI / 2;
@@ -549,54 +574,42 @@ function createFloor(extent) {
   const innerPlate = new THREE.Mesh(
     new THREE.PlaneGeometry(size * 0.9, size * 0.9),
     new THREE.MeshStandardMaterial({
-      color: 0x101722,
-      metalness: 0.12,
-      roughness: 0.9,
+      color: 0x2b3036,
+      metalness: 0.16,
+      roughness: 0.88,
     }),
   );
   innerPlate.rotation.x = -Math.PI / 2;
   innerPlate.position.y = 0.04;
   group.add(innerPlate);
 
-  const glow = new THREE.Mesh(
-    new THREE.RingGeometry(size * 0.26, size * 0.42, 64),
-    new THREE.MeshBasicMaterial({
-      color: 0x10303a,
+  const panelField = new THREE.Mesh(
+    new THREE.PlaneGeometry(size * 0.86, size * 0.86, 14, 14),
+    new THREE.MeshStandardMaterial({
+      color: 0x30353c,
+      metalness: 0.18,
+      roughness: 0.84,
+      wireframe: true,
       transparent: true,
-      opacity: 0.24,
+      opacity: 0.1,
     }),
   );
-  glow.rotation.x = -Math.PI / 2;
-  glow.position.y = 0.06;
-  group.add(glow);
+  panelField.rotation.x = -Math.PI / 2;
+  panelField.position.y = 0.06;
+  group.add(panelField);
 
-  const grid = new THREE.GridHelper(size, 12, 0x233243, 0x18202b);
+  const grid = new THREE.GridHelper(size, 12, 0x4b535c, 0x343a42);
   grid.position.y = 0.08;
+  grid.material.transparent = true;
+  grid.material.opacity = 0.24;
   group.add(grid);
 
-  const stage = new THREE.Mesh(
-    new THREE.BoxGeometry(size * 0.62, 3.2, size * 0.4),
-    new THREE.MeshStandardMaterial({
-      color: 0x111925,
-      metalness: 0.18,
-      roughness: 0.82,
-    }),
-  );
-  stage.position.y = 1.6;
-  group.add(stage);
-
-  const innerGlow = new THREE.Mesh(
-    new THREE.RingGeometry(size * 0.12, size * 0.24, 64),
-    new THREE.MeshBasicMaterial({
-      color: 0x5a3b09,
-      transparent: true,
-      opacity: 0.2,
-    }),
-  );
-  innerGlow.rotation.x = -Math.PI / 2;
-  innerGlow.position.y = 0.08;
-  innerGlow.userData = { pulse: true, pulseAmount: 0.05 };
-  group.add(innerGlow);
+  const diagonalGrid = new THREE.GridHelper(size * 0.82, 8, 0x3f464f, 0x2d3339);
+  diagonalGrid.rotation.y = Math.PI / 4;
+  diagonalGrid.position.y = 0.1;
+  diagonalGrid.material.transparent = true;
+  diagonalGrid.material.opacity = 0.12;
+  group.add(diagonalGrid);
 
   return group;
 }
@@ -791,8 +804,8 @@ export function SimulationScene3D({
     const straightEndWorld = projectedRoute[projectedRoute.length - 1] || new THREE.Vector3(0, 1.2, 0);
 
     const scene = new THREE.Scene();
-    scene.background = new THREE.Color(0x03060b);
-    scene.fog = new THREE.FogExp2(0x050b12, 0.0024);
+    scene.background = new THREE.Color(0x1e2126);
+    scene.fog = new THREE.FogExp2(0x25292f, 0.0018);
 
     const camera = new THREE.PerspectiveCamera(44, 1, 0.1, 1200);
     const cameraDistance = Math.max(120, Math.min(220, projection.extent * 0.12));
@@ -816,7 +829,7 @@ export function SimulationScene3D({
     renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 1.25));
     renderer.outputColorSpace = THREE.SRGBColorSpace;
     renderer.toneMapping = THREE.ACESFilmicToneMapping;
-    renderer.toneMappingExposure = 1.22;
+    renderer.toneMappingExposure = 0.98;
     renderer.shadowMap.enabled = true;
     renderer.shadowMap.type = THREE.PCFSoftShadowMap;
     host.innerHTML = "";
@@ -834,10 +847,10 @@ export function SimulationScene3D({
 
     scene.add(createFloor(projection.extent));
 
-    const ambientLight = new THREE.AmbientLight(0xd7c18a, 0.76);
+    const ambientLight = new THREE.AmbientLight(0xe2e5e9, 0.72);
     scene.add(ambientLight);
 
-    const keyLight = new THREE.DirectionalLight(0xfff1c2, 1.22);
+    const keyLight = new THREE.DirectionalLight(0xf2f3f5, 1.08);
     keyLight.position.set(78, 124, 44);
     keyLight.castShadow = true;
     keyLight.shadow.mapSize.width = 1024;
@@ -852,34 +865,34 @@ export function SimulationScene3D({
     keyLight.shadow.normalBias = 0.02;
     scene.add(keyLight);
 
-    const rimLight = new THREE.DirectionalLight(0xfbbf24, 1.46);
+    const rimLight = new THREE.DirectionalLight(0x9ba3af, 0.92);
     rimLight.position.set(-42, 28, -56);
     scene.add(rimLight);
 
-    const lowFill = new THREE.PointLight(0xd97706, 11, 220, 1.9);
+    const lowFill = new THREE.PointLight(0x7e8792, 6, 220, 1.9);
     lowFill.position.set(0, 14, 8);
     scene.add(lowFill);
 
-    const leftGlow = new THREE.PointLight(0xf59e0b, 18, 168, 1.7);
+    const leftGlow = new THREE.PointLight(0x656d77, 8, 168, 1.7);
     leftGlow.position.set(-42, 16, 12);
     scene.add(leftGlow);
 
-    const rightGlow = new THREE.PointLight(0xfacc15, 12, 132, 1.8);
+    const rightGlow = new THREE.PointLight(0x747d88, 7, 132, 1.8);
     rightGlow.position.set(46, 14, -10);
     scene.add(rightGlow);
 
-    const backGlow = new THREE.PointLight(0xb45309, 10, 180, 2);
+    const backGlow = new THREE.PointLight(0x5d666f, 6, 180, 2);
     backGlow.position.set(0, 22, -48);
     scene.add(backGlow);
 
     const groundShadow = new THREE.Mesh(
       new THREE.CircleGeometry(78, 48),
-      new THREE.MeshBasicMaterial({
-        color: 0x061118,
-        transparent: true,
-        opacity: 0.26,
-      }),
-    );
+        new THREE.MeshBasicMaterial({
+          color: 0x161a1f,
+          transparent: true,
+          opacity: 0.22,
+        }),
+      );
     groundShadow.rotation.x = -Math.PI / 2;
     groundShadow.position.y = 0.12;
     scene.add(groundShadow);
@@ -889,7 +902,7 @@ export function SimulationScene3D({
     routeObjects.objects.forEach((object) => routeGroup.add(object));
     scene.add(routeGroup);
 
-    const truckAccent = 0xfbbf24;
+    const truckAccent = 0x4d5560;
     const padAssetsGroup = new THREE.Group();
     scene.add(padAssetsGroup);
 
@@ -1038,7 +1051,6 @@ export function SimulationScene3D({
           : createTruckInstance(truckId);
         if (truckTemplate) {
           tintModel(truckMesh, truckAccent);
-          addAccentLines(truckMesh, 0xfde68a, 0.56);
           centerAndScaleModel(truckMesh, { targetWidth: 16.2, targetHeight: 9.2, lift: 0 });
         }
         truckMesh.visible = false;
