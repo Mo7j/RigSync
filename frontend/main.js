@@ -36,6 +36,17 @@ function getActiveScenario(move) {
   );
 }
 
+function hasMultiTruckPlans(move) {
+  const scenarioPlans = move?.simulation?.scenarioPlans || [];
+  const distinctTruckCounts = new Set(
+    scenarioPlans
+      .map((scenario) => scenario?.truckCount)
+      .filter((truckCount) => Number.isFinite(truckCount)),
+  );
+
+  return scenarioPlans.length >= 3 && distinctTruckCounts.size >= 3;
+}
+
 function App() {
   const route = useHashRoute();
   const [session, setSession] = useState(getSession);
@@ -49,6 +60,8 @@ function App() {
   const [moveSimulationError, setMoveSimulationError] = useState("");
   const [currentMinute, setCurrentMinute] = useState(0);
   const [playbackSpeed, setPlaybackSpeed] = useState(1);
+  const [isPlaybackRunning, setIsPlaybackRunning] = useState(false);
+  const [isPlaybackPaused, setIsPlaybackPaused] = useState(false);
   const [areSceneAssetsReady, setAreSceneAssetsReady] = useState(false);
   const [isScenePlaybackReady, setIsScenePlaybackReady] = useState(false);
   const animationFrameRef = useRef(null);
@@ -157,8 +170,44 @@ function App() {
   useEffect(() => {
     if (route.page !== "move") {
       setIsScenePlaybackReady(false);
+      setIsPlaybackRunning(false);
+      setIsPlaybackPaused(false);
     }
   }, [route.page, activeMove?.id]);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    async function ensureMovePlans() {
+      if (route.page !== "move" || !activeMove || !logicalLoads.length || hasMultiTruckPlans(activeMove)) {
+        return;
+      }
+
+      try {
+        const refreshedMove = await buildMoveWithSimulation({
+          name: activeMove.name,
+          startPoint: activeMove.startPoint,
+          endPoint: activeMove.endPoint,
+          loadCount: logicalLoads.length,
+          logicalLoads,
+          truckSetup: activeMove.truckSetup || activeMove.simulation?.truckSetup || DEFAULT_TRUCK_SETUP,
+          previousMove: activeMove,
+        });
+
+        if (!cancelled) {
+          setMoves(upsertMove(refreshedMove));
+        }
+      } catch {
+        // Keep the existing move if background plan generation fails.
+      }
+    }
+
+    ensureMovePlans();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [route.page, activeMove?.id, activeMove?.updatedAt, logicalLoads.length]);
 
   useEffect(() => {
     if (!session && (route.page === "dashboard" || route.page === "move")) {
@@ -195,18 +244,17 @@ function App() {
   }, [route.page, activeMove?.id, activeMove?.updatedAt, areSceneAssetsReady]);
 
   useEffect(() => {
-    if (route.page !== "move" || !activeTotalMinutes || !areSceneAssetsReady || !isScenePlaybackReady || isSimulatingMove) {
+    if (route.page !== "move" || !activeTotalMinutes || !areSceneAssetsReady || !isScenePlaybackReady || isSimulatingMove || !isPlaybackRunning) {
       if (animationFrameRef.current !== null) {
         window.cancelAnimationFrame(animationFrameRef.current);
       }
       animationFrameRef.current = null;
       animationStartedAtRef.current = null;
-      setCurrentMinute(0);
       return undefined;
     }
 
     const startingMinute = Math.min(
-      activeMove.progressMinute || 0,
+      lastPersistedMinuteRef.current || activeMove.progressMinute || 0,
       activeTotalMinutes,
     );
 
@@ -244,7 +292,7 @@ function App() {
       animationFrameRef.current = null;
       animationStartedAtRef.current = null;
     };
-  }, [activeMove?.id, activeMove?.updatedAt, route.page, playbackSpeed, activeTotalMinutes, areSceneAssetsReady, isScenePlaybackReady, isSimulatingMove]);
+  }, [activeMove?.id, activeMove?.updatedAt, route.page, playbackSpeed, activeTotalMinutes, areSceneAssetsReady, isScenePlaybackReady, isSimulatingMove, isPlaybackRunning]);
 
   async function handleLogin({ email, password }) {
     if (email !== TEST_USER.email || password !== TEST_USER.password) {
@@ -291,6 +339,8 @@ function App() {
       setMoves(nextMoves);
       setAreSceneAssetsReady(true);
       setPlaybackSpeed(1);
+      setIsPlaybackRunning(false);
+      setIsPlaybackPaused(false);
       navigateTo(`/move/${move.id}`);
     } catch (error) {
       setCreateError(error.message || "Failed to create the rig move.");
@@ -418,6 +468,8 @@ function App() {
       animationStartedAtRef.current = null;
       lastPersistedMinuteRef.current = 0;
       setCurrentMinute(0);
+      setIsPlaybackRunning(false);
+      setIsPlaybackPaused(false);
 
       const updatedMove = await buildMoveWithSimulation({
         name: targetMove.name,
@@ -437,10 +489,15 @@ function App() {
       setMoves(nextMoves);
       setAreSceneAssetsReady(true);
       setCurrentMinute(0);
+      lastPersistedMinuteRef.current = 0;
       setPlaybackSpeed(1);
+      setIsPlaybackRunning(false);
+      setIsPlaybackPaused(false);
+      return true;
     } catch (error) {
       setAreSceneAssetsReady(true);
       setMoveSimulationError(error.message || "Failed to simulate the move.");
+      return false;
     } finally {
       setIsSimulatingMove(false);
     }
@@ -449,6 +506,9 @@ function App() {
   async function handleOpenMove(moveId) {
     setAreSceneAssetsReady(false);
     setIsScenePlaybackReady(false);
+    setIsPlaybackRunning(false);
+    setCurrentMinute(0);
+    setIsPlaybackPaused(false);
     try {
       await preloadSimulationSceneAssets();
       setAreSceneAssetsReady(true);
@@ -457,6 +517,82 @@ function App() {
       setAreSceneAssetsReady(true);
       navigateTo(`/move/${moveId}`);
     }
+  }
+
+  function handleSelectMovePlan({ moveId, scenarioName }) {
+    const targetMove = moves.find((move) => move.id === moveId);
+    if (!targetMove?.simulation?.scenarioPlans?.length) {
+      return;
+    }
+
+    const hasScenario = targetMove.simulation.scenarioPlans.some((scenario) => scenario.name === scenarioName);
+    if (!hasScenario || targetMove.simulation.preferredScenarioName === scenarioName) {
+      return;
+    }
+
+    const updatedMove = {
+      ...targetMove,
+      updatedAt: new Date().toISOString(),
+      progressMinute: 0,
+      completionPercentage: 0,
+      simulation: {
+        ...targetMove.simulation,
+        preferredScenarioName: scenarioName,
+      },
+    };
+
+    setMoves(upsertMove(updatedMove));
+    setCurrentMinute(0);
+    setIsPlaybackRunning(false);
+    setIsPlaybackPaused(false);
+  }
+
+  function handleRunSelectedPlan() {
+    setIsPlaybackRunning(false);
+    setIsPlaybackPaused(false);
+    animationStartedAtRef.current = null;
+    window.requestAnimationFrame(() => {
+      setIsPlaybackRunning(true);
+    });
+  }
+
+  async function handleRunCustomPlan({ moveId, truckSetup }) {
+    const didUpdateMove = await handleRunMoveSimulation({ moveId, truckSetup });
+    if (!didUpdateMove) {
+      return;
+    }
+
+    animationStartedAtRef.current = null;
+    setIsPlaybackPaused(false);
+    window.requestAnimationFrame(() => {
+      setIsPlaybackRunning(true);
+    });
+  }
+
+  function handlePauseTogglePlayback() {
+    if (isPlaybackRunning) {
+      setIsPlaybackRunning(false);
+      setIsPlaybackPaused(true);
+      return;
+    }
+
+    setIsPlaybackPaused(false);
+    animationStartedAtRef.current = null;
+    window.requestAnimationFrame(() => {
+      setIsPlaybackRunning(true);
+    });
+  }
+
+  function handleEndPlayback() {
+    if (animationFrameRef.current !== null) {
+      window.cancelAnimationFrame(animationFrameRef.current);
+    }
+    animationFrameRef.current = null;
+    animationStartedAtRef.current = null;
+    lastPersistedMinuteRef.current = 0;
+    setCurrentMinute(0);
+    setIsPlaybackRunning(false);
+    setIsPlaybackPaused(false);
   }
 
   if (route.page === "login") {
@@ -490,9 +626,16 @@ function App() {
       onScenePlaybackReadyChange: setIsScenePlaybackReady,
       playbackSpeed,
       isSimulating: isSimulatingMove,
+      isPlaybackRunning,
+      isPlaybackPaused,
+      logicalLoads,
       simulationError: moveSimulationError,
       onPlaybackSpeedChange: setPlaybackSpeed,
-      onSimulate: handleRunMoveSimulation,
+      onSelectPlan: handleSelectMovePlan,
+      onRunPlayback: handleRunSelectedPlan,
+      onRunCustomPlan: handleRunCustomPlan,
+      onPausePlayback: handlePauseTogglePlayback,
+      onEndPlayback: handleEndPlayback,
       onBack: () => navigateTo("/dashboard"),
       onLogout: handleLogout,
       currentUser: session,

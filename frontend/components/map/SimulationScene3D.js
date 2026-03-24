@@ -609,6 +609,7 @@ export function SimulationScene3D({
   heightClass = "map-frame",
   showOverlay = true,
   onReadyStateChange = null,
+  onRigFocusChange = null,
 }) {
   const hostRef = useRef(null);
   const overlayRef = useRef(null);
@@ -1087,6 +1088,7 @@ export function SimulationScene3D({
       zoomState.desiredTarget.y = Math.max(center.y, 6);
       zoomState.desiredPosition.copy(center).add(direction.multiplyScalar(focusDistance * 1.8));
       focusedRigSideRef.current = targetObject.userData?.rigInfo?.side || null;
+      onRigFocusChange?.(focusedRigSideRef.current);
       cameraTransitioningRef.current = true;
     }
 
@@ -1094,6 +1096,7 @@ export function SimulationScene3D({
       zoomState.desiredTarget.copy(defaultTarget);
       zoomState.desiredPosition.copy(defaultCameraPosition);
       focusedRigSideRef.current = null;
+      onRigFocusChange?.(null);
       cameraTransitioningRef.current = true;
     }
 
@@ -1394,6 +1397,7 @@ export function SimulationScene3D({
     return () => {
       disposed = true;
       onReadyStateChange?.(false);
+      onRigFocusChange?.(null);
       assetsReadyRef.current = false;
       window.cancelAnimationFrame(animationFrameId);
       resizeObserver.disconnect();

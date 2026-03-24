@@ -6,8 +6,9 @@ import { ProgressBar } from "../components/ui/ProgressBar.js";
 import { Field, TextInput } from "../components/ui/Field.js";
 import { SimulationScene3D } from "../components/map/SimulationScene3D.js";
 import { formatMinutes } from "../lib/format.js";
+import { buildScenarioPlans } from "../features/rigMoves/simulation.js";
 
-const { useEffect, useMemo, useState } = React;
+const { useDeferredValue, useEffect, useMemo, useRef, useState } = React;
 
 function normalizeTruckSetup(move) {
   const source = move?.truckSetup?.length ? move.truckSetup : move?.simulation?.truckSetup || [];
@@ -85,10 +86,181 @@ function ScenarioBreakdown({ scenarios, activeScenarioName, onSelect }) {
           onClick: () => onSelect(scenario.name),
         },
         h("div", { className: "scenario-head" }, h("strong", null, scenario.name), h("span", null, formatMinutes(scenario.totalMinutes))),
-        h("p", { className: "muted-copy" }, `${scenario.truckCount} trucks - ${scenario.workerCount} workers`),
+        h("p", { className: "muted-copy" }, `${scenario.truckCount} trucks - ${scenario.bestVariant?.name || "Best route order"}`),
       ),
     ),
   );
+}
+
+function PlanSwitcher({ scenarios, activePlanKey, onSelect }) {
+  return h(
+    "nav",
+    { className: "plan-switcher", "aria-label": "Move plans" },
+    [
+      ...scenarios.map((scenario) => ({
+        key: scenario.name,
+        label: scenario.name,
+        meta: `${scenario.truckCount} trucks`,
+      })),
+      { key: "customize", label: "Customize", meta: "Manual" },
+    ].map((item) =>
+      h(
+        "button",
+        {
+          key: item.key,
+          type: "button",
+          className: `plan-switcher-button${item.key === activePlanKey ? " active" : ""}`,
+          onClick: () => onSelect(item.key),
+        },
+        h("span", { className: "plan-switcher-label" }, item.label),
+        h("span", { className: "plan-switcher-meta" }, item.meta),
+      ),
+    ),
+  );
+}
+
+function countRoundTrips(playback) {
+  return (playback?.trips || []).filter((trip) => trip.returnToSource !== null).length;
+}
+
+function getPlanSummary(scenario) {
+  const playback = scenario?.bestVariant?.playback;
+  const trips = playback?.trips || [];
+
+  return {
+    totalMinutes: scenario?.totalMinutes || 0,
+    totalLoads: trips.length,
+    roundTrips: countRoundTrips(playback),
+    routeOrder: scenario?.bestVariant?.name || "Best route order",
+    waves: scenario?.bestVariant?.waves?.length || scenario?.waves?.length || 0,
+  };
+}
+
+function formatCurrency(value) {
+  return new Intl.NumberFormat("en-US", {
+    style: "currency",
+    currency: "USD",
+    maximumFractionDigits: 0,
+  }).format(Math.max(0, value));
+}
+
+function getPlanDashboardStats(scenario, move) {
+  const playback = scenario?.bestVariant?.playback;
+  const trips = playback?.trips || [];
+  const totalMinutes = Math.max(scenario?.totalMinutes || 0, 1);
+  const truckCount = Math.max(1, Number.parseInt(scenario?.truckCount, 10) || 1);
+  const workerCount = Math.max(1, Number.parseInt(scenario?.workerCount, 10) || 1);
+  const activeMinutes = trips.reduce(
+    (sum, trip) => sum + Math.max(0, (trip.returnToSource ?? trip.rigUpFinish ?? trip.arrivalAtDestination) - trip.loadStart),
+    0,
+  );
+  const utilization = Math.min(100, Math.round((activeMinutes / (truckCount * totalMinutes)) * 100));
+  const costEstimate =
+    (totalMinutes / 60) * truckCount * 185 +
+    (totalMinutes / 60) * workerCount * 34 +
+    (move?.routeKm || 0) * Math.max(1, countRoundTrips(playback)) * 2.4;
+
+  return {
+    utilizationValue: utilization,
+    utilization: `${utilization}%`,
+    costEstimate: formatCurrency(costEstimate),
+    loadsPerTruck: (trips.length / truckCount).toFixed(1),
+    crewHours: String(Math.round((workerCount * totalMinutes) / 60)),
+  };
+}
+
+function getMinimumTruckCount(scenarios) {
+  return Math.max(1, Math.min(...scenarios.map((scenario) => Number.parseInt(scenario.truckCount, 10) || 1)));
+}
+
+function getSliderMaxCount(currentCount, minimumCount) {
+  return Math.max(minimumCount + 6, currentCount + 4);
+}
+
+function buildDisplayedTruckCounts(truckSetup, targetTotal) {
+  const normalized = (truckSetup || [])
+    .map((truck, index) => ({
+      id: truck.id || `truck-${index + 1}`,
+      type: truck.type || "Truck",
+      count: Math.max(0, Number.parseInt(truck.count, 10) || 0),
+    }))
+    .filter((truck) => truck.type.trim());
+
+  if (!normalized.length) {
+    return [{ id: "fleet-default", type: "Heavy Haul", count: Math.max(1, targetTotal || 1) }];
+  }
+
+  const safeTotal = Math.max(1, targetTotal || 1);
+  const currentTotal = normalized.reduce((sum, truck) => sum + truck.count, 0);
+
+  if (currentTotal <= 0) {
+    return normalized.map((truck, index) => ({
+      ...truck,
+      count: index === 0 ? safeTotal : 0,
+    }));
+  }
+
+  const scaled = normalized.map((truck) => {
+    const exact = (truck.count / currentTotal) * safeTotal;
+    return {
+      ...truck,
+      count: Math.floor(exact),
+      remainder: exact - Math.floor(exact),
+    };
+  });
+
+  let assigned = scaled.reduce((sum, truck) => sum + truck.count, 0);
+  const byRemainder = [...scaled].sort((a, b) => b.remainder - a.remainder);
+  let cursor = 0;
+
+  while (assigned < safeTotal && byRemainder.length) {
+    byRemainder[cursor % byRemainder.length].count += 1;
+    assigned += 1;
+    cursor += 1;
+  }
+
+  return scaled.map(({ remainder, ...truck }) => truck);
+}
+
+function getRigSiteStats({ side, move, playback, currentMinute, totalMinutes }) {
+  if (!side || !playback?.trips?.length) {
+    return null;
+  }
+
+  const trips = playback.trips;
+  const totalLoads = trips.length;
+  const completedLoads = trips.filter((trip) =>
+    side === "source" ? currentMinute >= trip.rigDownFinish : currentMinute >= trip.rigUpFinish,
+  ).length;
+  const movingLoads = trips.filter(
+    (trip) => currentMinute >= trip.rigDownFinish && currentMinute < trip.arrivalAtDestination,
+  ).length;
+  const progress = totalLoads > 0 ? Math.round((completedLoads / totalLoads) * 100) : 0;
+  const remainingLoads = Math.max(0, totalLoads - completedLoads);
+  const label = side === "source" ? move?.startLabel || "Source Site" : move?.endLabel || "Destination Site";
+  const stateLabel =
+    side === "source"
+      ? progress >= 100
+        ? "Shifted Out"
+        : progress > 0
+          ? "Shifting"
+          : "Waiting"
+      : progress >= 100
+        ? "Rig Up Complete"
+        : progress > 0
+          ? "Rigging Up"
+          : "Pending";
+
+  return {
+    label,
+    sideLabel: side === "source" ? "Source Rig Site" : "Destination Rig Site",
+    stateLabel,
+    progress,
+    completedLoads,
+    remainingLoads,
+    movingLoads,
+    timeLeft: formatMinutes(Math.max(0, Math.round(totalMinutes - currentMinute))),
+  };
 }
 
 function getPhasePercentages(playback, currentMinute) {
@@ -247,26 +419,70 @@ function LoadScheduleTable({ playback, currentMinute }) {
   );
 }
 
+function PlaybackActionButton({ isRunning, isBusy, isPaused, onRun, onEnd, onPauseToggle, label = "Run" }) {
+  return h(
+    "div",
+    { className: "scene-playback-action" },
+    h(Button, {
+      type: "button",
+      isBusy: isBusy,
+      onClick: isRunning || isPaused ? onEnd : onRun,
+      children: isRunning || isPaused ? "End" : label,
+    }),
+    (isRunning || isPaused)
+      ? h(
+          "button",
+          {
+            type: "button",
+            className: "scene-pause-fab",
+            onClick: onPauseToggle,
+            "aria-label": isPaused ? "Resume" : "Pause",
+          },
+          h("span", { className: `scene-playback-icon${isPaused ? " is-resume" : ""}` }),
+        )
+      : null,
+  );
+}
+
 export function RigMovePage({
   move,
   currentMinute,
   sceneAssetsReady,
   onScenePlaybackReadyChange,
   isSimulating,
+  isPlaybackRunning,
+  isPlaybackPaused,
+  logicalLoads,
   simulationError,
-  onSimulate,
+  onSelectPlan,
+  onRunPlayback,
+  onRunCustomPlan,
+  onPausePlayback,
+  onEndPlayback,
   onBack,
   onLogout,
   currentUser,
 }) {
+  const previousMoveIdRef = useRef(move?.id || null);
   const [truckSetup, setTruckSetup] = useState(() => normalizeTruckSetup(move));
   const [activeScenarioName, setActiveScenarioName] = useState(move?.simulation?.preferredScenarioName || "");
+  const [activePlanKey, setActivePlanKey] = useState(move?.simulation?.preferredScenarioName || "");
   const [activeView, setActiveView] = useState("map");
+  const [focusedRigSide, setFocusedRigSide] = useState(null);
 
   useEffect(() => {
     setTruckSetup(normalizeTruckSetup(move));
     setActiveScenarioName(move?.simulation?.preferredScenarioName || "");
+    setActivePlanKey((current) => {
+      if (previousMoveIdRef.current !== move?.id) {
+        previousMoveIdRef.current = move?.id || null;
+        return move?.simulation?.preferredScenarioName || "";
+      }
+
+      return current === "customize" ? "customize" : move?.simulation?.preferredScenarioName || "";
+    });
     setActiveView("map");
+    setFocusedRigSide(null);
   }, [move?.id, move?.updatedAt]);
 
   if (!move) {
@@ -307,6 +523,31 @@ export function RigMovePage({
   const activeScenario =
     scenarioPlans.find((scenario) => scenario.name === activeScenarioName) ||
     scenarioPlans[0];
+  const totalTrucks = truckSetup.reduce((sum, item) => sum + (Number.parseInt(item.count, 10) || 0), 0);
+  const minimumTruckCount = getMinimumTruckCount(scenarioPlans);
+  const isCustomizeActive = activePlanKey === "customize";
+  const deferredTruckSetup = useDeferredValue(truckSetup);
+  const deferredTotalTrucks = deferredTruckSetup.reduce((sum, item) => sum + (Number.parseInt(item.count, 10) || 0), 0);
+  const customPreviewScenario = useMemo(() => {
+    if (!isCustomizeActive || !logicalLoads?.length) {
+      return null;
+    }
+
+    const routeData = {
+      minutes: move.simulation?.routeMinutes || activeScenario?.routeMinutes || 0,
+      geometry: move.simulation?.routeGeometry || activeScenario?.routeGeometry || [],
+      source: move.simulation?.routeSource || activeScenario?.routeSource || "Preview route",
+    };
+    const previewWorkerCount = Math.max(move.simulation?.workerCount || 0, deferredTotalTrucks + 2);
+    const previewPlans = buildScenarioPlans(logicalLoads, routeData, previewWorkerCount, deferredTotalTrucks);
+
+    return (
+      previewPlans.find((scenario) => scenario.truckCount === deferredTotalTrucks) ||
+      previewPlans[0] ||
+      null
+    );
+  }, [isCustomizeActive, logicalLoads, move.simulation, activeScenario, deferredTotalTrucks]);
+  const selectedScenario = isCustomizeActive && customPreviewScenario ? customPreviewScenario : activeScenario;
 
   const displaySimulation = useMemo(
     () => ({
@@ -324,10 +565,42 @@ export function RigMovePage({
   const totalMinutes = displaySimulation.bestPlan.totalMinutes;
   const visibleMinute = sceneAssetsReady ? Math.min(currentMinute, totalMinutes) : 0;
   const completion = Math.min(100, Math.round((visibleMinute / Math.max(totalMinutes, 1)) * 100));
-  const totalTrucks = truckSetup.reduce((sum, item) => sum + (Number.parseInt(item.count, 10) || 0), 0);
   const phases = getPhasePercentages(displaySimulation.bestPlan.playback, visibleMinute);
   const rigLoads = getRigLoadCounts(displaySimulation.bestPlan.playback, visibleMinute);
   const lastLog = displaySimulation.bestPlan.playback.steps.filter((step) => step.minute <= visibleMinute).slice(-1)[0] || displaySimulation.bestPlan.playback.steps[0];
+  const activePlanSummary = getPlanSummary(selectedScenario);
+  const activePlanDashboard = getPlanDashboardStats(selectedScenario, move);
+  const displayedTruckCounts = useMemo(
+    () => buildDisplayedTruckCounts(truckSetup, selectedScenario?.truckCount || totalTrucks),
+    [truckSetup, selectedScenario, totalTrucks],
+  );
+  const focusedRigStats = useMemo(
+    () =>
+      getRigSiteStats({
+        side: focusedRigSide,
+        move,
+        playback: displaySimulation.bestPlan.playback,
+        currentMinute: visibleMinute,
+        totalMinutes,
+      }),
+    [focusedRigSide, move, displaySimulation, visibleMinute, totalMinutes],
+  );
+
+  function updateTruckCount(truckId, nextCountValue) {
+    const parsedCount = Math.max(0, Number.parseInt(nextCountValue, 10) || 0);
+    const currentTotalWithoutTarget = truckSetup.reduce(
+      (sum, item) => sum + (item.id === truckId ? 0 : Number.parseInt(item.count, 10) || 0),
+      0,
+    );
+    const minimumAllowedForTarget = Math.max(0, minimumTruckCount - currentTotalWithoutTarget);
+    const finalCount = Math.max(parsedCount, minimumAllowedForTarget);
+
+    setTruckSetup((current) =>
+      current.map((item) =>
+        item.id === truckId ? { ...item, count: String(finalCount) } : item,
+      ),
+    );
+  }
 
   if (!sceneAssetsReady) {
     return h(
@@ -353,6 +626,13 @@ export function RigMovePage({
     ? h(
         "main",
         { className: "scene-only-shell" },
+        h(Button, {
+          type: "button",
+          variant: "ghost",
+          className: "scene-back-button",
+          onClick: onBack,
+          children: "<",
+        }),
         h(SimulationScene3D, {
           startPoint: move.startPoint,
           endPoint: move.endPoint,
@@ -361,82 +641,268 @@ export function RigMovePage({
           heightClass: "scene-only-canvas",
           showOverlay: false,
           onReadyStateChange: onScenePlaybackReadyChange,
+          onRigFocusChange: setFocusedRigSide,
         }),
         h(
           "aside",
-          { className: "scene-panel scene-panel-right" },
-          h("div", { className: "scene-panel-head" }, h("span", { className: "scene-panel-kicker" }, "Simulation Stats"), h("strong", null, move.name)),
-          h(
-            "div",
-            { className: "scene-stat-grid" },
-            h("article", { className: "scene-stat-card" }, h("span", null, "Current Time"), h("strong", null, formatMinutes(Math.round(visibleMinute)))),
-            h("article", { className: "scene-stat-card" }, h("span", null, "Remaining"), h("strong", null, formatMinutes(Math.max(0, Math.round(totalMinutes - visibleMinute))))),
-            h("article", { className: "scene-stat-card" }, h("span", null, "Loads"), h("strong", null, String(rigLoads.totalCount))),
-            h("article", { className: "scene-stat-card" }, h("span", null, "Complete"), h("strong", null, `${completion}%`)),
-          ),
-          h(
-            "section",
-            { className: "scene-panel-section" },
-            h("div", { className: "scene-panel-row" }, h("span", null, "Rig Down"), h("strong", null, `${Math.round(phases.down)}%`)),
-            h(ProgressBar, { value: phases.down }),
-            h("div", { className: "scene-panel-row" }, h("span", null, "Move"), h("strong", null, `${Math.round(phases.move)}%`)),
-            h(ProgressBar, { value: phases.move }),
-            h("div", { className: "scene-panel-row" }, h("span", null, "Rig Up"), h("strong", null, `${Math.round(phases.up)}%`)),
-            h(ProgressBar, { value: phases.up }),
-          ),
-          h(
-            "section",
-            { className: "scene-panel-section" },
-            h("div", { className: "scene-panel-row" }, h("span", null, "Source Loads"), h("strong", null, String(rigLoads.sourceCount))),
-            h("div", { className: "scene-panel-row" }, h("span", null, "Moving"), h("strong", null, String(rigLoads.movingCount))),
-            h("div", { className: "scene-panel-row" }, h("span", null, "Destination"), h("strong", null, String(rigLoads.destinationCount))),
-          ),
-          h(
-            "section",
-            { className: "scene-panel-section scene-panel-log" },
-            h("span", { className: "scene-panel-kicker" }, "Last Log"),
-            h("strong", null, lastLog?.title || "Waiting for simulation"),
-            h("p", { className: "muted-copy" }, lastLog?.description || "No events yet."),
-          ),
-        ),
-        h(
-          "aside",
-          { className: "scene-panel scene-panel-left" },
-          h("div", { className: "scene-panel-head" }, h("span", { className: "scene-panel-kicker" }, "Controls"), h("strong", null, `${totalTrucks} Trucks`)),
-          h(
-            "section",
-            { className: "scene-panel-section" },
-            h("p", { className: "muted-copy" }, "Adjust the fleet and rerun the move from this control rail."),
-            h(TruckSetupEditor, {
-              truckSetup,
-              onChange: (truckId, field, value) =>
-                setTruckSetup((current) =>
-                  current.map((item) => (item.id === truckId ? { ...item, [field]: value } : item)),
+          { className: "scene-panel scene-panel-left scene-panel-left-merged" },
+          isCustomizeActive
+            ? [
+                h(
+                  "div",
+                  { className: "scene-plan-summary-stack" },
+                  h(
+                    "div",
+                    { className: "scene-plan-summary-card scene-plan-summary-card-title" },
+                    h("span", { className: "scene-panel-kicker" }, "Selected Plan"),
+                    h("strong", { className: "scene-plan-summary-title" }, `${isCustomizeActive ? "Customize" : activeScenario.name} | ${isCustomizeActive ? totalTrucks : activeScenario.truckCount} Trucks`),
+                  ),
                 ),
-              onAddRow: () =>
-                setTruckSetup((current) => [...current, { id: `truck-${Date.now()}`, type: "", count: "0" }]),
-              onRemoveRow: (truckId) =>
-                setTruckSetup((current) => current.filter((item) => item.id !== truckId)),
-            }),
-            simulationError ? h("p", { className: "field-error section-spacing" }, simulationError) : null,
-          ),
-          h(
-            "div",
-            { className: "scene-panel-actions" },
-            h(Button, {
-              type: "button",
-              isBusy: isSimulating,
-              onClick: () => onSimulate({ moveId: move.id, truckSetup }),
-              children: "Simulate",
-            }),
-            h(Button, {
-              type: "button",
-              variant: "ghost",
-              onClick: onBack,
-              children: "Back",
-            }),
-          ),
+                h(
+                  "section",
+                  { className: "scene-panel-section scene-panel-section-plain" },
+                  !isPlaybackRunning && !isPlaybackPaused
+                    ? truckSetup.map((truck) =>
+                        h(
+                          "label",
+                          { key: truck.id, className: "truck-slider-card" },
+                          h("div", { className: "truck-slider-head" }, h("span", null, truck.type || "Truck"), h("strong", null, truck.count)),
+                          h("input", {
+                            className: "truck-slider-input",
+                            type: "range",
+                            min: "0",
+                            max: String(getSliderMaxCount(Number.parseInt(truck.count, 10) || 0, minimumTruckCount)),
+                            step: "1",
+                            value: truck.count,
+                            onInput: (event) => updateTruckCount(truck.id, event.target.value),
+                            onChange: (event) => updateTruckCount(truck.id, event.target.value),
+                          }),
+                        ),
+                      )
+                    : truckSetup.map((truck) =>
+                        h(
+                          "div",
+                          { key: truck.id, className: "truck-count-row" },
+                          h("span", null, truck.type || "Truck"),
+                          h("strong", null, truck.count),
+                        ),
+                      ),
+                ),
+                simulationError ? h("p", { className: "field-error section-spacing" }, simulationError) : null,
+                h(
+                  "div",
+                  { className: "scene-panel-actions" },
+                  h(PlaybackActionButton, {
+                    isRunning: isPlaybackRunning,
+                    isBusy: isSimulating,
+                    isPaused: isPlaybackPaused,
+                    onRun: () => onRunCustomPlan({ moveId: move.id, truckSetup }),
+                    onEnd: onEndPlayback,
+                    onPauseToggle: onPausePlayback,
+                    label: "Run",
+                  }),
+                ),
+              ]
+            : [
+                h(
+                  "div",
+                  { className: "scene-plan-summary-stack" },
+                  h(
+                    "div",
+                    { className: "scene-plan-summary-card scene-plan-summary-card-title" },
+                    h("span", { className: "scene-panel-kicker" }, "Selected Plan"),
+                    h("strong", { className: "scene-plan-summary-title" }, `${isCustomizeActive ? "Customize" : activeScenario.name} | ${isCustomizeActive ? totalTrucks : activeScenario.truckCount} Trucks`),
+                  ),
+                ),
+                h(
+                  "section",
+                  { className: "scene-panel-section scene-panel-section-plain" },
+                  displayedTruckCounts.map((truck) =>
+                    h(
+                      "div",
+                      { key: truck.id, className: "truck-count-row" },
+                      h("span", null, truck.type || "Truck"),
+                      h("strong", null, String(truck.count)),
+                    ),
+                  ),
+                ),
+                h(
+                  "div",
+                  { className: "scene-panel-actions" },
+                  h(PlaybackActionButton, {
+                    isRunning: isPlaybackRunning,
+                    isPaused: isPlaybackPaused,
+                    onRun: onRunPlayback,
+                    onEnd: onEndPlayback,
+                    onPauseToggle: onPausePlayback,
+                    label: visibleMinute > 0 ? "Resume" : "Run",
+                  }),
+                ),
+              ],
         ),
+        focusedRigStats
+          ? h(
+              "div",
+              { className: "scene-top-info-strip" },
+              h(
+                "div",
+                { className: "scene-plan-kpis" },
+                h("div", { className: "scene-dashboard-stack-item" }, h("span", { className: "scene-dashboard-label" }, focusedRigStats.sideLabel), h("strong", null, focusedRigStats.label), h("p", { className: "scene-dashboard-copy" }, focusedRigStats.stateLabel)),
+                h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Completed Loads"), h("strong", null, String(focusedRigStats.completedLoads))),
+                h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Remaining Loads"), h("strong", null, String(focusedRigStats.remainingLoads))),
+                h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Loads Moving"), h("strong", null, String(focusedRigStats.movingLoads))),
+              ),
+              h(
+                "div",
+                { className: "scene-plan-dashboard" },
+                h(
+                  "div",
+                  { className: "scene-plan-summary-card scene-plan-summary-card-title" },
+                  h("span", { className: "scene-panel-kicker" }, "Site Progress"),
+                  h("strong", { className: "scene-plan-summary-title" }, `${focusedRigStats.progress}% Complete`),
+                ),
+                h(
+                  "div",
+                  { className: "scene-dashboard-phase-stack" },
+                  h(
+                    "div",
+                    { className: "scene-dashboard-phase-row" },
+                    h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Site Completion"), h("strong", null, `${focusedRigStats.progress}%`)),
+                    h(ProgressBar, { value: focusedRigStats.progress }),
+                  ),
+                  h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Time Left"), h("strong", null, focusedRigStats.timeLeft)),
+                ),
+              ),
+            )
+          : isPlaybackRunning || isPlaybackPaused
+          ? h(
+              "div",
+              { className: "scene-top-info-strip" },
+              h(
+                "div",
+                { className: "scene-plan-kpis" },
+                h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Total Completion"), h("strong", null, `${completion}%`)),
+                h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Hours Left"), h("strong", null, formatMinutes(Math.max(0, Math.round(totalMinutes - visibleMinute))))),
+                h("div", { className: "scene-dashboard-stack-item" }, h("span", { className: "scene-dashboard-label" }, "Last Operation"), h("strong", null, lastLog?.title || "Waiting for simulation"), h("p", { className: "scene-dashboard-copy" }, lastLog?.description || "No events yet.")),
+              ),
+              h(
+                "div",
+                { className: "scene-plan-dashboard" },
+                h(
+                  "div",
+                  { className: "scene-plan-summary-card scene-plan-summary-card-title" },
+                  h("span", { className: "scene-panel-kicker" }, "Live Progress"),
+                  h("strong", { className: "scene-plan-summary-title" }, isPlaybackPaused ? "Paused" : "Running"),
+                ),
+                h(
+                  "div",
+                  { className: "scene-dashboard-phase-stack" },
+                  h(
+                    "div",
+                    { className: "scene-dashboard-phase-row" },
+                    h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Rig Down"), h("strong", null, `${Math.round(phases.down)}%`)),
+                    h(ProgressBar, { value: phases.down }),
+                  ),
+                  h(
+                    "div",
+                    { className: "scene-dashboard-phase-row" },
+                    h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Move"), h("strong", null, `${Math.round(phases.move)}%`)),
+                    h(ProgressBar, { value: phases.move }),
+                  ),
+                  h(
+                    "div",
+                    { className: "scene-dashboard-phase-row" },
+                    h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Rig Up"), h("strong", null, `${Math.round(phases.up)}%`)),
+                    h(ProgressBar, { value: phases.up }),
+                  ),
+                ),
+              ),
+            )
+          : h(
+              "div",
+              { className: "scene-top-info-strip" },
+              h(
+                "div",
+                { className: "scene-plan-kpis" },
+                h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Total Time"), h("strong", null, formatMinutes(activePlanSummary.totalMinutes))),
+                h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Round Trips"), h("strong", null, String(activePlanSummary.roundTrips))),
+                h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Loads"), h("strong", null, String(activePlanSummary.totalLoads))),
+                h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Stages"), h("strong", null, String(activePlanSummary.waves))),
+              ),
+              h(
+                "div",
+                { className: "scene-plan-dashboard" },
+                h(
+                  "div",
+                  { className: "scene-plan-summary-card scene-plan-summary-card-title" },
+                  h("span", { className: "scene-panel-kicker" }, "Plan Dashboard"),
+                  h("strong", { className: "scene-plan-summary-title" }, isCustomizeActive ? "Customize Stats" : "Selection Stats"),
+                ),
+                h(
+                  "div",
+                  { className: "scene-dashboard-gauge-card" },
+                  h("span", { className: "scene-dashboard-label" }, "Utilization"),
+                  h(
+                    "div",
+                    { className: "scene-utilization-gauge" },
+                    h(
+                      "svg",
+                      {
+                        className: "scene-utilization-gauge-svg",
+                        viewBox: "0 0 120 70",
+                        "aria-hidden": "true",
+                      },
+                      h("path", {
+                        className: "scene-utilization-gauge-track",
+                        d: "M 10 60 A 50 50 0 0 1 110 60",
+                        pathLength: "100",
+                      }),
+                      h("path", {
+                        className: "scene-utilization-gauge-progress",
+                        d: "M 10 60 A 50 50 0 0 1 110 60",
+                        pathLength: "100",
+                        style: { "--utilization-progress": Math.max(0, Math.min(activePlanDashboard.utilizationValue, 100)) },
+                      }),
+                    ),
+                    h("div", { className: "scene-utilization-gauge-inner" }, h("strong", null, activePlanDashboard.utilization)),
+                  ),
+                ),
+                h(
+                  "div",
+                  { className: "scene-dashboard-cost" },
+                  h("span", { className: "scene-dashboard-label" }, "Cost"),
+                  h("strong", null, activePlanDashboard.costEstimate),
+                ),
+                h(
+                  "div",
+                  { className: "scene-dashboard-pair" },
+                  h("div", { className: "scene-dashboard-inline scene-dashboard-pair-item" }, h("span", { className: "scene-dashboard-label" }, "Loads / Truck"), h("strong", null, activePlanDashboard.loadsPerTruck)),
+                  h("div", { className: "scene-dashboard-inline scene-dashboard-pair-item" }, h("span", { className: "scene-dashboard-label" }, "Crew Hours"), h("strong", null, activePlanDashboard.crewHours)),
+                ),
+              ),
+            ),
+        !isPlaybackRunning && !isPlaybackPaused
+          ? h(
+              "div",
+              { className: "scene-plan-switcher-wrap" },
+              h(
+                "div",
+                { className: "plan-switcher-shell" },
+                h(PlanSwitcher, {
+                  scenarios: scenarioPlans,
+                  activePlanKey,
+                  onSelect: (planKey) => {
+                    setActivePlanKey(planKey);
+                    if (planKey === "customize") {
+                      return;
+                    }
+                    setActiveScenarioName(planKey);
+                    onSelectPlan({ moveId: move.id, scenarioName: planKey });
+                  },
+                }),
+              ),
+            )
+          : null,
       )
     : h(
         AppLayout,
@@ -458,13 +924,15 @@ export function RigMovePage({
               Card,
               { className: "dashboard-section-card" },
               h("div", { className: "section-heading" }, h("h2", null, "Simulation Setup"), h("span", { className: "section-pill" }, `${totalTrucks} trucks`)),
-              h("p", { className: "muted-copy section-spacing" }, "Set truck types and counts, then simulate using exactly this fleet."),
+              h("p", { className: "muted-copy section-spacing" }, "Set truck types and counts, then run the move using exactly this fleet."),
               h(TruckSetupEditor, {
                 truckSetup,
                 onChange: (truckId, field, value) =>
-                  setTruckSetup((current) =>
-                    current.map((item) => (item.id === truckId ? { ...item, [field]: value } : item)),
-                  ),
+                  field === "count"
+                    ? updateTruckCount(truckId, value)
+                    : setTruckSetup((current) =>
+                        current.map((item) => (item.id === truckId ? { ...item, [field]: value } : item)),
+                      ),
                 onAddRow: () =>
                   setTruckSetup((current) => [...current, { id: `truck-${Date.now()}`, type: "", count: "0" }]),
                 onRemoveRow: (truckId) =>
@@ -477,8 +945,8 @@ export function RigMovePage({
                 h(Button, {
                   type: "button",
                   isBusy: isSimulating,
-                  onClick: () => onSimulate({ moveId: move.id, truckSetup }),
-                  children: "Simulate",
+                  onClick: () => onRunCustomPlan({ moveId: move.id, truckSetup }),
+                  children: "Run",
                 }),
               ),
             ),
@@ -578,12 +1046,16 @@ export function RigMovePage({
                   "div",
                   { className: "scenario-breakdown-copy" },
                   h("div", { className: "section-heading" }, h("h2", null, "Scenario Breakdown")),
-                  h("p", { className: "muted-copy section-spacing" }, "Switch between route/order scenarios generated with the same fleet size."),
+                  h("p", { className: "muted-copy section-spacing" }, "Switch between automatically generated fleet plans with different truck counts."),
                 ),
                 h(ScenarioBreakdown, {
                   scenarios: scenarioPlans,
                   activeScenarioName: activeScenario.name,
-                  onSelect: setActiveScenarioName,
+                  onSelect: (scenarioName) => {
+                    setActivePlanKey(scenarioName);
+                    setActiveScenarioName(scenarioName);
+                    onSelectPlan({ moveId: move.id, scenarioName });
+                  },
                 }),
               ),
             ),
