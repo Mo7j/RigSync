@@ -1,7 +1,10 @@
-import { h } from "../lib/react.js";
+import { React, h } from "../lib/react.js";
 import { MarketingLayout } from "../layouts/MarketingLayout.js";
 import { Button } from "../components/ui/Button.js";
 import { Card, StatCard } from "../components/ui/Card.js";
+import { HeroNetwork } from "../components/map/HeroNetwork.js";
+
+const { useEffect } = React;
 
 const FEATURE_ITEMS = [
   {
@@ -41,33 +44,221 @@ export function HomePage({
   onOpenLogin,
   onOpenDashboard,
 }) {
+  useEffect(() => {
+    const scenes = Array.from(document.querySelectorAll(".marketing-scene"));
+    if (!scenes.length) {
+      return undefined;
+    }
+
+    const sceneTransforms = [
+      { x: "0px", y: "0px", scale: "1.04" },
+      { x: "220px", y: "-14px", scale: "0.92" },
+      { x: "0px", y: "8px", scale: "1.02" },
+      { x: "-220px", y: "18px", scale: "0.9" },
+    ];
+
+    function applySceneTransform(index) {
+      const transform = sceneTransforms[index] || sceneTransforms[0];
+      document.documentElement.style.setProperty("--home-cypher-x", transform.x);
+      document.documentElement.style.setProperty("--home-cypher-y", transform.y);
+      document.documentElement.style.setProperty("--home-cypher-scale", transform.scale);
+    }
+
+    const observer = new IntersectionObserver(
+      (entries) => {
+        entries.forEach((entry) => {
+          entry.target.classList.toggle("is-visible", entry.isIntersecting);
+          if (entry.isIntersecting) {
+            const index = scenes.indexOf(entry.target);
+            if (index >= 0) {
+              document.documentElement.style.setProperty("--home-scene-index", String(index));
+              applySceneTransform(index);
+              window.dispatchEvent(new CustomEvent("home-scene-change", { detail: { index } }));
+            }
+          }
+        });
+      },
+      {
+        threshold: 0.34,
+        rootMargin: "-8% 0px -8% 0px",
+      },
+    );
+
+    scenes.forEach((scene, index) => {
+      if (index === 0) {
+        scene.classList.add("is-visible");
+        document.documentElement.style.setProperty("--home-scene-index", "0");
+        applySceneTransform(0);
+        window.dispatchEvent(new CustomEvent("home-scene-change", { detail: { index: 0 } }));
+      }
+      observer.observe(scene);
+    });
+
+    return () => {
+      observer.disconnect();
+      document.documentElement.style.removeProperty("--home-cypher-x");
+      document.documentElement.style.removeProperty("--home-cypher-y");
+      document.documentElement.style.removeProperty("--home-cypher-scale");
+    };
+  }, []);
+
+  useEffect(() => {
+    const scenes = Array.from(document.querySelectorAll(".marketing-scene"));
+    if (!scenes.length) {
+      return undefined;
+    }
+
+    let isLocked = false;
+    let lockTimeoutId = 0;
+    let wheelDelta = 0;
+    let wheelResetTimeoutId = 0;
+    let lastSnapAt = 0;
+
+    function getSceneTargetTop(scene, index) {
+      if (index === 0) {
+        return 0;
+      }
+
+      const rect = scene.getBoundingClientRect();
+      const absoluteTop = window.scrollY + rect.top;
+      const offset = Math.max((window.innerHeight - rect.height) / 2, 0);
+      return Math.max(0, absoluteTop - offset);
+    }
+
+    function getActiveSceneIndex() {
+      const viewportCenter = window.innerHeight / 2;
+      let closestIndex = 0;
+      let closestDistance = Number.POSITIVE_INFINITY;
+
+      scenes.forEach((scene, index) => {
+        const rect = scene.getBoundingClientRect();
+        const sceneCenter = rect.top + (rect.height / 2);
+        const distance = Math.abs(sceneCenter - viewportCenter);
+        if (distance < closestDistance) {
+          closestDistance = distance;
+          closestIndex = index;
+        }
+      });
+
+      return closestIndex;
+    }
+
+    function snapToScene(nextIndex) {
+      const safeIndex = Math.max(0, Math.min(scenes.length - 1, nextIndex));
+      const scene = scenes[safeIndex];
+      if (!scene) {
+        return;
+      }
+
+      isLocked = true;
+      lastSnapAt = Date.now();
+      wheelDelta = 0;
+      window.scrollTo({
+        top: getSceneTargetTop(scene, safeIndex),
+        behavior: "smooth",
+      });
+
+      window.clearTimeout(lockTimeoutId);
+      lockTimeoutId = window.setTimeout(() => {
+        isLocked = false;
+      }, 1050);
+    }
+
+    function handleWheel(event) {
+      if (isLocked) {
+        event.preventDefault();
+        return;
+      }
+
+      if (Date.now() - lastSnapAt < 950) {
+        event.preventDefault();
+        return;
+      }
+
+      if (Math.abs(event.deltaY) < 4) {
+        return;
+      }
+
+      event.preventDefault();
+      wheelDelta += event.deltaY;
+
+      window.clearTimeout(wheelResetTimeoutId);
+      wheelResetTimeoutId = window.setTimeout(() => {
+        wheelDelta = 0;
+      }, 140);
+
+      if (Math.abs(wheelDelta) < 70) {
+        return;
+      }
+
+      const currentIndex = getActiveSceneIndex();
+      const nextIndex = wheelDelta > 0 ? currentIndex + 1 : currentIndex - 1;
+      if (nextIndex === currentIndex || nextIndex < 0 || nextIndex >= scenes.length) {
+        wheelDelta = 0;
+        return;
+      }
+
+      snapToScene(nextIndex);
+    }
+
+    function handleKeyDown(event) {
+      if (isLocked) {
+        return;
+      }
+
+      const currentIndex = getActiveSceneIndex();
+      if (event.key === "ArrowDown" || event.key === "PageDown" || event.key === " ") {
+        event.preventDefault();
+        snapToScene(currentIndex + 1);
+      } else if (event.key === "ArrowUp" || event.key === "PageUp") {
+        event.preventDefault();
+        snapToScene(currentIndex - 1);
+      }
+    }
+
+    window.addEventListener("wheel", handleWheel, { passive: false });
+    window.addEventListener("keydown", handleKeyDown);
+
+    return () => {
+      window.removeEventListener("wheel", handleWheel);
+      window.removeEventListener("keydown", handleKeyDown);
+      window.clearTimeout(lockTimeoutId);
+      window.clearTimeout(wheelResetTimeoutId);
+    };
+  }, []);
+
   return h(
     MarketingLayout,
     {
       onPrimaryAction: hasSession ? onOpenDashboard : onOpenLogin,
       primaryLabel: "Ask Us",
+      className: "marketing-shell-home",
     },
     h(
-      "section",
-      { id: "hero", className: "hero-section" },
-      h("div", { className: "hero-orbit hero-orbit-left" }),
-      h("div", { className: "hero-orbit hero-orbit-right" }),
+      "div",
+      { className: "home-story" },
       h(
         "div",
-        { className: "hero-grid" },
+        { className: "home-scene-backdrop", "aria-hidden": "true" },
+        h("div", { className: "hero-orbit hero-orbit-left" }),
+        h("div", { className: "hero-orbit hero-orbit-right" }),
+        h(HeroNetwork),
+      ),
+      h(
+        "section",
+        { id: "hero", className: "hero-section marketing-scene marketing-scene-hero" },
         h(
           "div",
-          { className: "hero-copy-block" },
-          h("p", { className: "eyebrow" }, "Digital Twin Logistics"),
+          { className: "home-scene-panel home-hero-scene-panel" },
           h(
             "h1",
             { className: "hero-title" },
-            "Plan, Simulate, and Execute Rig Moves with Precision",
+            "Operational Precision at Scale",
           ),
           h(
             "p",
             { className: "hero-text" },
-            "RigSync uses digital twin technology to optimize logistics, reduce delays, and eliminate operational risk across complex rig move programs.",
+            "Plan and execute rig moves with simulation-driven logistics and full operational visibility.",
           ),
           h(
             "div",
@@ -78,151 +269,103 @@ export function HomePage({
               onClick: hasSession ? onOpenDashboard : onOpenLogin,
               children: hasSession ? "Open Workspace" : "Digitize Now",
             }),
-            h(
-              "button",
-              {
-                type: "button",
-                className: "play-button",
-                onClick: () => document.getElementById("features")?.scrollIntoView({ behavior: "smooth" }),
-              },
-              "▶",
-            ),
           ),
         ),
+      ),
+      h(
+        "section",
+        { id: "features", className: "marketing-section marketing-scene marketing-scene-features" },
         h(
           "div",
-          { className: "hero-side-panel" },
+          { className: "home-scene-panel home-scene-panel-left" },
+          h("p", { className: "eyebrow" }, "Features"),
+          h("h2", { className: "section-title features-section-title" }, "Operations software designed for move clarity"),
           h(
             "div",
-            { className: "hero-side-card" },
-            h(
-              "div",
-              { className: "hero-side-badge" },
-              h("span", { className: "hero-side-badge-dot" }),
-              h("span", null, "Live Command View"),
+            { className: "feature-grid" },
+            FEATURE_ITEMS.map((item, index) =>
+              h(
+                Card,
+                { key: item.title, className: "feature-card home-scene-card" },
+                h("span", { className: "feature-index" }, `0${index + 1}`),
+                h("h3", null, item.title),
+                h("p", { className: "muted-copy" }, item.copy),
+              ),
             ),
-            h("p", { className: "eyebrow" }, "Operations Signal"),
-            h("h3", { className: "hero-side-title" }, "Trusted across large-scale move programs"),
-            h("p", { className: "muted-copy" }, "Digital planning, live route visibility, and safer execution for high-value rig transfers."),
-            h(
-              "div",
-              { className: "logo-cluster" },
-              h("span", null, "SL"),
-              h("span", null, "ADC"),
-              h("span", null, "SA"),
-              h("strong", null, "+25k"),
-            ),
-            h("div", { className: "hero-side-divider" }),
-            h(
-              "dl",
-              { className: "hero-side-metrics" },
-              h("div", null, h("dt", null, "Planning confidence"), h("dd", null, "98%")),
-              h("div", null, h("dt", null, "Ops visibility"), h("dd", null, "24/7")),
-            ),
-            h("p", { className: "hero-footnote" }, "World rig moves modeled and tracked through one command surface."),
           ),
         ),
       ),
-    ),
-    h(
-      "section",
-      { id: "features", className: "marketing-section" },
-      h("p", { className: "eyebrow" }, "Features"),
-      h("h2", { className: "section-title" }, "Operations software designed for move clarity"),
       h(
-        "div",
-        { className: "feature-grid" },
-        FEATURE_ITEMS.map((item, index) =>
-          h(
-            Card,
-            { key: item.title, className: "feature-card" },
-            h("span", { className: "feature-index" }, `0${index + 1}`),
-            h("h3", null, item.title),
-            h("p", { className: "muted-copy" }, item.copy),
-          ),
-        ),
-      ),
-    ),
-    h(
-      "section",
-      { id: "about", className: "marketing-section marketing-section-accent" },
-      h(
-        "div",
-        { className: "about-grid" },
+        "section",
+        { id: "about", className: "marketing-section marketing-scene marketing-section-accent marketing-scene-about" },
         h(
           "div",
-          null,
-          h("p", { className: "eyebrow" }, "About Us"),
-          h("h2", { className: "section-title" }, "Built for crews that need speed without losing control"),
+          { className: "home-scene-panel home-about-scene-panel home-scene-panel-center" },
           h(
-            "p",
-            { className: "muted-copy section-copy" },
-            "RigSync keeps the dark, command-center visual language of the existing product while turning it into a scalable operational frontend. The experience is tuned for pre-move planning, confident dashboarding, and production-grade readability on desktop and tablet.",
+            "div",
+            { className: "about-grid" },
+            h(
+              "div",
+              null,
+              h("p", { className: "eyebrow" }, "About Us"),
+              h("h2", { className: "section-title" }, "Built for crews that need speed without losing control"),
+              h(
+                "p",
+                { className: "muted-copy section-copy" },
+                "RigSync keeps the dark, command-center visual language of the existing product while turning it into a scalable operational frontend. The experience is tuned for pre-move planning, confident dashboarding, and production-grade readability on desktop and tablet.",
+              ),
+            ),
+            h(
+              "div",
+              { className: "about-stats" },
+              h(StatCard, {
+                label: "Rig moves tracked",
+                value: moveCount ? `${moveCount}+` : "0",
+                meta: "Saved operational runs",
+                tone: "green",
+              }),
+              h(StatCard, {
+                label: "Logical loads",
+                value: isLoadingLoads ? "..." : String(loadCount),
+                meta: "Available for planning",
+                tone: "default",
+              }),
+              h(StatCard, {
+                label: "Routing mode",
+                value: "Live + fallback",
+                meta: "Resilient by default",
+                tone: "green",
+              }),
+            ),
           ),
         ),
+      ),
+      h(
+        "section",
+        { id: "faq", className: "marketing-section marketing-scene marketing-scene-faq" },
         h(
           "div",
-          { className: "about-stats" },
-          h(StatCard, {
-            label: "Rig moves tracked",
-            value: moveCount ? `${moveCount}+` : "0",
-            meta: "Saved operational runs",
-            tone: "green",
-          }),
-          h(StatCard, {
-            label: "Logical loads",
-            value: isLoadingLoads ? "..." : String(loadCount),
-            meta: "Available for planning",
-            tone: "default",
-          }),
-          h(StatCard, {
-            label: "Routing mode",
-            value: "Live + fallback",
-            meta: "Resilient by default",
-            tone: "green",
-          }),
-        ),
-      ),
-    ),
-    h(
-      "section",
-      { id: "faq", className: "marketing-section" },
-      h("p", { className: "eyebrow" }, "FAQ"),
-      h("h2", { className: "section-title" }, "Questions the operations team actually asks"),
-      h(
-        "div",
-        { className: "faq-list" },
-        FAQ_ITEMS.map((item) =>
+          { className: "home-scene-panel home-faq-scene-panel home-scene-panel-right" },
+          h("p", { className: "eyebrow" }, "FAQ"),
+          h("h2", { className: "home-faq-title" }, "FAQ"),
           h(
-            Card,
-            { key: item.question, className: "faq-card" },
-            h("h3", null, item.question),
-            h("p", { className: "muted-copy" }, item.answer),
+            "div",
+            { className: "faq-list faq-list-compact" },
+            FAQ_ITEMS.map((item) =>
+              h(
+                "details",
+                { key: item.question, className: "faq-item-compact" },
+                h(
+                  "summary",
+                  { className: "faq-summary-compact" },
+                  h("span", { className: "faq-question-compact" }, item.question),
+                  h("span", { className: "faq-arrow-compact", "aria-hidden": "true" }, ">"),
+                ),
+                h("p", { className: "muted-copy faq-answer-compact" }, item.answer),
+              ),
+            ),
           ),
         ),
-      ),
-    ),
-    h(
-      "section",
-      { id: "rig-preview", className: "marketing-section model-preview-section" },
-      h("p", { className: "eyebrow" }, "3D Preview"),
-      h("h2", { className: "section-title" }, "Land rig embed preview on the home screen"),
-      h(
-        "p",
-        { className: "muted-copy section-copy" },
-        "A quick placement test for the Sketchfab model so the team can evaluate how a live 3D rig viewer feels at the end of the landing page.",
-      ),
-      h(
-        "div",
-        { className: "sketchfab-embed-wrapper model-preview-frame" },
-        h("iframe", {
-          title: "Land Rig",
-          frameBorder: "0",
-          allowFullScreen: true,
-          allow: "autoplay; fullscreen; xr-spatial-tracking",
-          loading: "lazy",
-          src: "https://sketchfab.com/models/72d5781728dc49f59c3d62c38da574c5/embed?autospin=1&autostart=1&annotations_visible=0&transparent=1&ui_animations=0&ui_infos=0&ui_stop=0&ui_inspector=0&ui_watermark_link=0&ui_watermark=0&ui_hint=0&ui_ar=0&ui_help=0&ui_settings=0&ui_vr=0&ui_fullscreen=0&ui_annotations=0&ui_color=000000",
-        }),
       ),
     ),
     h(

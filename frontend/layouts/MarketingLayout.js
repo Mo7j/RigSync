@@ -8,10 +8,10 @@ function scrollToSection(sectionId) {
   }
 }
 
-export function MarketingLayout({ onPrimaryAction, primaryLabel, children }) {
+export function MarketingLayout({ onPrimaryAction, primaryLabel, children, className = "" }) {
   return h(
     "div",
-    { className: "marketing-shell" },
+    { className: `marketing-shell${className ? ` ${className}` : ""}` },
     h(
       "header",
       { className: "marketing-header" },

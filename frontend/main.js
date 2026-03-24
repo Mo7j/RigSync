@@ -69,6 +69,17 @@ function App() {
   const lastPersistedMinuteRef = useRef(0);
 
   useEffect(() => {
+    if ("scrollRestoration" in window.history) {
+      const previous = window.history.scrollRestoration;
+      window.history.scrollRestoration = "manual";
+      return () => {
+        window.history.scrollRestoration = previous;
+      };
+    }
+    return undefined;
+  }, []);
+
+  useEffect(() => {
     migrateLegacyHistory(HISTORY_STORAGE_KEY);
     setMoves(readMoves());
   }, []);
@@ -114,6 +125,9 @@ function App() {
       document.documentElement.style.removeProperty("--orbit-left-y");
       document.documentElement.style.removeProperty("--orbit-right-x");
       document.documentElement.style.removeProperty("--orbit-right-y");
+      document.documentElement.style.removeProperty("--home-scroll-progress");
+      document.documentElement.style.removeProperty("--home-scroll-shift");
+      document.documentElement.style.removeProperty("--home-scene-index");
       return undefined;
     }
 
@@ -141,15 +155,25 @@ function App() {
       document.documentElement.style.setProperty("--orbit-right-y", `${orbitRightY}px`);
     };
 
+    const handleScroll = () => {
+      const maxScroll = Math.max(document.documentElement.scrollHeight - window.innerHeight, 1);
+      const progress = Math.min(Math.max(window.scrollY / maxScroll, 0), 1);
+      document.documentElement.style.setProperty("--home-scroll-progress", progress.toFixed(4));
+      document.documentElement.style.setProperty("--home-scroll-shift", `${Math.round(progress * 260)}px`);
+    };
+
     handleMouseMove({
       clientX: window.innerWidth / 2,
       clientY: window.innerHeight / 2,
     });
+    handleScroll();
 
     window.addEventListener("mousemove", handleMouseMove);
+    window.addEventListener("scroll", handleScroll, { passive: true });
 
     return () => {
       window.removeEventListener("mousemove", handleMouseMove);
+      window.removeEventListener("scroll", handleScroll);
       document.body.classList.remove("home-interactive");
       document.documentElement.style.removeProperty("--mouse-x");
       document.documentElement.style.removeProperty("--mouse-y");
@@ -159,7 +183,16 @@ function App() {
       document.documentElement.style.removeProperty("--orbit-left-y");
       document.documentElement.style.removeProperty("--orbit-right-x");
       document.documentElement.style.removeProperty("--orbit-right-y");
+      document.documentElement.style.removeProperty("--home-scroll-progress");
+      document.documentElement.style.removeProperty("--home-scroll-shift");
+      document.documentElement.style.removeProperty("--home-scene-index");
     };
+  }, [route.page]);
+
+  useEffect(() => {
+    if (route.page === "home") {
+      window.scrollTo(0, 0);
+    }
   }, [route.page]);
 
   const logicalLoads = buildLogicalLoads(loads);
