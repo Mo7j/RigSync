@@ -17,6 +17,15 @@ export function Button({
       className: variantClass,
       disabled: props.disabled || isBusy,
     },
-    isBusy ? "Loading..." : children,
+    h(
+      "span",
+      { className: "button-content" },
+      h(
+        "span",
+        { className: `button-label${isBusy ? " button-label-busy" : ""}` },
+        children,
+      ),
+      isBusy ? h("span", { className: "button-spinner", "aria-hidden": true }) : null,
+    ),
   );
 }

@@ -20,6 +20,7 @@ import { LoginPage } from "./pages/LoginPage.js";
 import { DashboardPage } from "./pages/DashboardPage.js";
 import { RigMovePage } from "./pages/RigMovePage.js";
 import { formatCoordinate, formatMinutes } from "./lib/format.js";
+import { preloadSimulationSceneAssets } from "./components/map/SimulationScene3D.js";
 
 const { useEffect, useRef, useState } = React;
 
@@ -48,6 +49,8 @@ function App() {
   const [moveSimulationError, setMoveSimulationError] = useState("");
   const [currentMinute, setCurrentMinute] = useState(0);
   const [playbackSpeed, setPlaybackSpeed] = useState(1);
+  const [areSceneAssetsReady, setAreSceneAssetsReady] = useState(false);
+  const [isScenePlaybackReady, setIsScenePlaybackReady] = useState(false);
   const animationFrameRef = useRef(null);
   const animationStartedAtRef = useRef(null);
   const lastPersistedMinuteRef = useRef(0);
@@ -152,13 +155,47 @@ function App() {
   const activeTotalMinutes = activeScenario?.bestVariant?.totalMinutes || 0;
 
   useEffect(() => {
+    if (route.page !== "move") {
+      setIsScenePlaybackReady(false);
+    }
+  }, [route.page, activeMove?.id]);
+
+  useEffect(() => {
     if (!session && (route.page === "dashboard" || route.page === "move")) {
       navigateTo("/login");
     }
   }, [route.page, session]);
 
   useEffect(() => {
-    if (route.page !== "move" || !activeTotalMinutes) {
+    let cancelled = false;
+
+    async function ensureMoveAssetsReady() {
+      if (route.page !== "move" || !activeMove) {
+        return;
+      }
+
+      if (areSceneAssetsReady) {
+        return;
+      }
+
+      try {
+        await preloadSimulationSceneAssets();
+      } finally {
+        if (!cancelled) {
+          setAreSceneAssetsReady(true);
+        }
+      }
+    }
+
+    ensureMoveAssetsReady();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [route.page, activeMove?.id, activeMove?.updatedAt, areSceneAssetsReady]);
+
+  useEffect(() => {
+    if (route.page !== "move" || !activeTotalMinutes || !areSceneAssetsReady || !isScenePlaybackReady || isSimulatingMove) {
       if (animationFrameRef.current !== null) {
         window.cancelAnimationFrame(animationFrameRef.current);
       }
@@ -207,7 +244,7 @@ function App() {
       animationFrameRef.current = null;
       animationStartedAtRef.current = null;
     };
-  }, [activeMove?.id, activeMove?.updatedAt, route.page, playbackSpeed, activeTotalMinutes]);
+  }, [activeMove?.id, activeMove?.updatedAt, route.page, playbackSpeed, activeTotalMinutes, areSceneAssetsReady, isScenePlaybackReady, isSimulatingMove]);
 
   async function handleLogin({ email, password }) {
     if (email !== TEST_USER.email || password !== TEST_USER.password) {
@@ -247,8 +284,12 @@ function App() {
         truckSetup: DEFAULT_TRUCK_SETUP,
       });
 
+      setAreSceneAssetsReady(false);
+      setIsScenePlaybackReady(false);
+      await preloadSimulationSceneAssets();
       const nextMoves = upsertMove(move);
       setMoves(nextMoves);
+      setAreSceneAssetsReady(true);
       setPlaybackSpeed(1);
       navigateTo(`/move/${move.id}`);
     } catch (error) {
@@ -368,6 +409,8 @@ function App() {
     setIsSimulatingMove(true);
 
     try {
+      setAreSceneAssetsReady(false);
+      setIsScenePlaybackReady(false);
       if (animationFrameRef.current !== null) {
         window.cancelAnimationFrame(animationFrameRef.current);
       }
@@ -385,23 +428,35 @@ function App() {
         truckSetup,
         previousMove: targetMove,
       });
+      await preloadSimulationSceneAssets();
       const nextMoves = upsertMove({
         ...updatedMove,
         progressMinute: 0,
         completionPercentage: 0,
       });
       setMoves(nextMoves);
+      setAreSceneAssetsReady(true);
       setCurrentMinute(0);
       setPlaybackSpeed(1);
     } catch (error) {
+      setAreSceneAssetsReady(true);
       setMoveSimulationError(error.message || "Failed to simulate the move.");
     } finally {
       setIsSimulatingMove(false);
     }
   }
 
-  function handleOpenMove(moveId) {
-    navigateTo(`/move/${moveId}`);
+  async function handleOpenMove(moveId) {
+    setAreSceneAssetsReady(false);
+    setIsScenePlaybackReady(false);
+    try {
+      await preloadSimulationSceneAssets();
+      setAreSceneAssetsReady(true);
+      navigateTo(`/move/${moveId}`);
+    } catch {
+      setAreSceneAssetsReady(true);
+      navigateTo(`/move/${moveId}`);
+    }
   }
 
   if (route.page === "login") {
@@ -431,6 +486,8 @@ function App() {
     return h(RigMovePage, {
       move: activeMove,
       currentMinute,
+      sceneAssetsReady: areSceneAssetsReady,
+      onScenePlaybackReadyChange: setIsScenePlaybackReady,
       playbackSpeed,
       isSimulating: isSimulatingMove,
       simulationError: moveSimulationError,

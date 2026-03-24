@@ -23,15 +23,18 @@ export function AppLayout({
   onLogout,
   onBack,
   fullBleed = false,
+  background = null,
+  className = "",
   children,
 }) {
   return h(
     "main",
-    { className: "app-shell" },
+    { className: `app-shell${background ? " app-shell-has-background" : ""}${className ? ` ${className}` : ""}` },
     h("div", { className: "app-grid" }),
+    background,
     h(
       "section",
-      { className: `app-frame${fullBleed ? " app-frame-bleed" : ""}` },
+      { className: `app-frame${fullBleed ? " app-frame-bleed" : ""}${background ? " app-frame-has-background" : ""}` },
       h(
         "header",
         { className: "app-header" },
