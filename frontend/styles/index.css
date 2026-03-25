@@ -2362,21 +2362,32 @@ p {
 .scene-playback-action .button {
   flex: 1 1 auto;
   width: 100%;
+  min-height: 40px;
+  height: 40px;
+  color: #1a1606;
+  backdrop-filter: none;
+  box-shadow: none;
+  font-size: 1.075rem;
 }
 
 .scene-pause-fab {
   flex: 0 0 auto;
-  width: 44px;
-  min-width: 44px;
-  height: 44px;
+  width: 40px;
+  min-width: 40px;
+  height: 40px;
   align-self: center;
   display: grid;
   place-items: center;
   border: 0;
   border-radius: 999px;
-  background: #f5b63a;
+  background: linear-gradient(180deg, rgba(251, 191, 36, 0.96), rgba(245, 158, 11, 0.92));
   color: #16120a;
-  box-shadow: 0 10px 24px rgba(245, 182, 58, 0.28);
+  box-shadow: none;
+  cursor: pointer;
+}
+
+.scene-pause-fab:hover:not(:disabled) {
+  transform: translateY(-1px) scale(1.01);
 }
 
 .scene-playback-icon {

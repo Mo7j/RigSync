@@ -632,6 +632,7 @@ export function RigMovePage({
 
   const totalMinutes = displaySimulation.bestPlan.totalMinutes;
   const visibleMinute = sceneAssetsReady ? Math.min(currentMinute, totalMinutes) : 0;
+  const canResumePlayback = visibleMinute > 0 && visibleMinute < totalMinutes;
   const completion = Math.min(100, Math.round((visibleMinute / Math.max(totalMinutes, 1)) * 100));
   const phases = getPhasePercentages(displaySimulation.bestPlan.playback, visibleMinute);
   const rigLoads = getRigLoadCounts(displaySimulation.bestPlan.playback, visibleMinute);
@@ -887,7 +888,7 @@ export function RigMovePage({
                     onRun: onRunPlayback,
                     onEnd: onEndPlayback,
                     onPauseToggle: onPausePlayback,
-                    label: visibleMinute > 0 ? "Resume" : "Run",
+                    label: canResumePlayback ? "Resume" : "Run",
                   }),
                 ),
               ],

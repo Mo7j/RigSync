@@ -15,6 +15,8 @@ const MODEL_PATHS = {
   heavyHaulerTruck: "/assets/models/HeavyHauler.glb",
   rig: "/assets/models/rig.glb",
   terrain: "/assets/models/mountain.glb",
+  lamp: "/assets/models/lamp.glb",
+  siteLamp: "/assets/models/siteLamp.glb",
 };
 
 export function preloadSimulationSceneAssets() {
@@ -24,6 +26,8 @@ export function preloadSimulationSceneAssets() {
     loadModelTemplate("heavyHaulerTruck"),
     loadModelTemplate("rig"),
     loadModelTemplate("terrain"),
+    loadModelTemplate("lamp"),
+    loadModelTemplate("siteLamp"),
   ]);
 }
 
@@ -198,12 +202,12 @@ function getTruckVariantWidthStretch(variantKey) {
 function getTruckVariantRoadOffset(truckType) {
   const variantKey = getTruckModelKey(truckType);
   if (variantKey === "heavyHaulerTruck") {
-    return 30;
+    return 5;
   }
   if (variantKey === "lowbedTruck") {
-    return 30;
+    return 5;
   }
-  return 27;
+  return 4;
 }
 
 function tintModel(root, color) {
@@ -629,40 +633,12 @@ function buildStylizedRoutePoints(points, routeMetrics) {
   const totalLength = Math.max(axis.length(), 0.001);
   axis.normalize();
   const side = new THREE.Vector3(-axis.z, 0, axis.x).normalize();
-  const totalKm = Math.max(routeMetrics?.totalKm || 0, 0.001);
-  const normalizedOffsets = points.map((point, index) => {
-    const routeProgress = routeMetrics?.cumulativeKm?.[index] != null
-      ? routeMetrics.cumulativeKm[index] / totalKm
-      : index / Math.max(points.length - 1, 1);
-    const idealPoint = start.clone().lerp(end, routeProgress);
-    const offsetVector = new THREE.Vector3().subVectors(point, idealPoint);
-    return side.dot(offsetVector);
-  });
-
-  const smoothedOffsets = normalizedOffsets.map((_, index) => {
-    let weightedSum = 0;
-    let weightTotal = 0;
-
-    for (let step = -2; step <= 2; step += 1) {
-      const sampleIndex = Math.max(0, Math.min(normalizedOffsets.length - 1, index + step));
-      const weight = step === 0 ? 0.4 : Math.abs(step) === 1 ? 0.22 : 0.08;
-      weightedSum += normalizedOffsets[sampleIndex] * weight;
-      weightTotal += weight;
-    }
-
-    return (weightedSum / Math.max(weightTotal, 0.001)) * 0.18;
-  });
 
   return points.map((_, index) => {
-    const routeProgress = routeMetrics?.cumulativeKm?.[index] != null
-      ? routeMetrics.cumulativeKm[index] / totalKm
-      : index / Math.max(points.length - 1, 1);
+    const routeProgress = index / Math.max(points.length - 1, 1);
     const idealPoint = start.clone().lerp(end, routeProgress);
-    const sCurve =
-      Math.sin(routeProgress * Math.PI * 2) *
-      Math.sin(routeProgress * Math.PI) *
-      25;
-    return idealPoint.add(side.clone().multiplyScalar(smoothedOffsets[index] + sCurve));
+    const centerArc = Math.sin(routeProgress * Math.PI) * 18;
+    return idealPoint.add(side.clone().multiplyScalar(centerArc));
   });
 }
 
@@ -775,6 +751,99 @@ function remapRouteToFixedAnchors(points, startAnchor, endAnchor) {
       .add(targetSide.clone().multiplyScalar(lateralOffset))
       .setY(targetBase.y + verticalOffset);
   });
+}
+
+function clamp01(value) {
+  return Math.max(0, Math.min(1, value));
+}
+
+function smoothstep(edge0, edge1, value) {
+  const t = clamp01((value - edge0) / Math.max(edge1 - edge0, 0.0001));
+  return t * t * (3 - (2 * t));
+}
+
+function getCenterIslandProfile(ratio) {
+  const t = clamp01(ratio);
+  const gateIn = smoothstep(0.1, 0.28, t);
+  const gateOut = 1 - smoothstep(0.72, 0.9, t);
+  const centerWeight = Math.sin(t * Math.PI) ** 1.35;
+  return gateIn * gateOut * centerWeight;
+}
+
+function buildSplitRoadPath(points, sideAxis, sideSign, baseOffset = 12.5, centerBulge = 14.5) {
+  if (!points?.length) {
+    return [];
+  }
+
+  const metrics = buildWorldPathMetrics(points);
+  const totalLength = Math.max(metrics.totalLength, 0.001);
+  let traversed = 0;
+
+  return points.map((point, index) => {
+    if (index > 0) {
+      traversed += metrics.segmentLengths[index - 1] || 0;
+    }
+    const ratio = traversed / totalLength;
+    const separation = baseOffset + (getCenterIslandProfile(ratio) * centerBulge);
+    return point.clone().add(sideAxis.clone().multiplyScalar(sideSign * separation));
+  });
+}
+
+function offsetCurvePointsLocally(points, offsetDistance) {
+  if (!points?.length) {
+    return [];
+  }
+
+  const metrics = buildWorldPathMetrics(points);
+  const totalLength = Math.max(metrics.totalLength, 0.001);
+  let traversed = 0;
+
+  return points.map((point, index) => {
+    if (index > 0) {
+      traversed += metrics.segmentLengths[index - 1] || 0;
+    }
+    const ratio = traversed / totalLength;
+    const taperIn = smoothstep(0.12, 0.26, ratio);
+    const taperOut = 1 - smoothstep(0.74, 0.88, ratio);
+    const taperedOffset = offsetDistance * taperIn * taperOut;
+    const previous = points[Math.max(0, index - 1)];
+    const next = points[Math.min(points.length - 1, index + 1)];
+    const tangent = next.clone().sub(previous).setY(0);
+    if (tangent.lengthSq() < 0.0001) {
+      tangent.set(1, 0, 0);
+    } else {
+      tangent.normalize();
+    }
+    const side = new THREE.Vector3(-tangent.z, 0, tangent.x).multiplyScalar(taperedOffset);
+    return point.clone().add(side);
+  });
+}
+
+function connectLaneToAnchors(points, startAnchor, endAnchor) {
+  if (!points?.length) {
+    return [startAnchor.clone(), endAnchor.clone()];
+  }
+
+  const firstPoint = points[0].clone();
+  const lastPoint = points[points.length - 1].clone();
+  return [
+    startAnchor.clone(),
+    startAnchor.clone().lerp(firstPoint, 0.55),
+    ...points.map((point) => point.clone()),
+    lastPoint.clone().lerp(endAnchor, 0.55),
+    endAnchor.clone(),
+  ];
+}
+
+function getContinuousAngle(nextAngle, previousAngle = 0) {
+  let adjusted = nextAngle;
+  while ((adjusted - previousAngle) > Math.PI) {
+    adjusted -= Math.PI * 2;
+  }
+  while ((adjusted - previousAngle) < -Math.PI) {
+    adjusted += Math.PI * 2;
+  }
+  return adjusted;
 }
 
 function createTruckFallbackMesh(accentColor) {
@@ -908,12 +977,13 @@ function createPadFallback(position, color, labelOffsetX) {
   return group;
 }
 
-function createRouteObjects(points) {
-  if (points.length < 2) {
-    return { objects: [], root: null };
+function createRouteObjects(routeDefinitions) {
+  if (!routeDefinitions?.length) {
+    return { objects: [], routes: [] };
   }
 
   const routeRoot = new THREE.Group();
+  const routeEntries = [];
   const routeMaterial = new THREE.MeshStandardMaterial({
     color: 0x31383f,
     emissive: 0x07090b,
@@ -931,181 +1001,49 @@ function createRouteObjects(points) {
     roughness: 0.92,
   });
 
-  function addRoadCurve(curvePoints, width = 4.4, shoulderWidth = 5.2, sampleMultiplier = 8) {
-    if (curvePoints.length < 2) {
-      return;
-    }
-    const routeCurve = new THREE.CatmullRomCurve3(curvePoints.map((point) => point.clone().setY(0.72)), false, "centripetal", 0.08);
-    const tubularSegments = Math.max(40, curvePoints.length * sampleMultiplier);
-    const routeGeometry = new THREE.TubeGeometry(routeCurve, tubularSegments, width, 12, false);
-    const routeSurface = new THREE.Mesh(routeGeometry, routeMaterial);
-    routeSurface.scale.y = 0.13;
-    routeSurface.position.y = 0.12;
-    routeRoot.add(routeSurface);
+  function addFlatRoad(startPoint, endPoint, key, width = 10.8, shoulderWidth = 12.6) {
+    const roadGroup = new THREE.Group();
+    const roadSurfaceMaterial = routeMaterial.clone();
+    const roadShoulderMaterial = shoulderMaterial.clone();
+    const direction = new THREE.Vector3().subVectors(endPoint, startPoint).setY(0);
+    const length = Math.max(direction.length(), 0.001);
+    direction.normalize();
+    const heading = Math.atan2(direction.x, direction.z);
+    const center = startPoint.clone().lerp(endPoint, 0.5).setY(0.22);
+
+    const routeSurface = new THREE.Mesh(
+      new THREE.BoxGeometry(width, 0.18, length),
+      roadSurfaceMaterial,
+    );
+    routeSurface.position.copy(center);
+    routeSurface.rotation.y = heading;
+    roadGroup.add(routeSurface);
 
     const routeShoulder = new THREE.Mesh(
-      new THREE.TubeGeometry(routeCurve, tubularSegments, shoulderWidth, 10, false),
-      shoulderMaterial,
+      new THREE.BoxGeometry(shoulderWidth, 0.08, length),
+      roadShoulderMaterial,
     );
-    routeShoulder.scale.y = 0.08;
-    routeShoulder.position.y = 0.04;
-    routeRoot.add(routeShoulder);
+    routeShoulder.position.copy(center.clone().setY(0.08));
+    routeShoulder.rotation.y = heading;
+    roadGroup.add(routeShoulder);
+    routeRoot.add(roadGroup);
+    routeEntries.push({ key, root: roadGroup, points: [startPoint.clone(), endPoint.clone()] });
   }
 
-  function getTrimmedRoadPoints(curvePoints, trimDistance = 23) {
-    if (curvePoints.length < 2) {
-      return curvePoints;
-    }
-    const metrics = buildWorldPathMetrics(curvePoints);
-    const totalLength = metrics.totalLength || 0;
-    if (totalLength <= trimDistance * 2) {
-      return curvePoints;
-    }
-    const startRatio = trimDistance / totalLength;
-    const endRatio = (totalLength - trimDistance) / totalLength;
-    const trimmed = [interpolateWorldPath(metrics, startRatio, curvePoints[0]?.y ?? 0)];
-    let traversed = 0;
-    for (let index = 1; index < curvePoints.length - 1; index += 1) {
-      traversed += metrics.segmentLengths[index - 1] || 0;
-      if (traversed <= trimDistance || traversed >= totalLength - trimDistance) {
-        continue;
-      }
-      trimmed.push(curvePoints[index].clone());
-    }
+  routeDefinitions.forEach(({ key, start, end, width, shoulderWidth }) => {
+    addFlatRoad(start, end, key, width, shoulderWidth);
+  });
 
-    trimmed.push(interpolateWorldPath(metrics, endRatio, curvePoints[curvePoints.length - 1]?.y ?? 0));
-    return trimmed;
-  }
-
-  function addCenterDividerDashes(curvePoints) {
-    if (curvePoints.length < 2) {
-      return;
-    }
-
-    const dividerCurve = new THREE.CatmullRomCurve3(
-      curvePoints.map((point) => point.clone().setY(1.18)),
-      false,
-      "centripetal",
-      0.08,
-    );
-    const dividerLength = Math.max(dividerCurve.getLength(), 0.001);
-    const dashLength = 4.8;
-    const gapLength = 2.8;
-    const dashThickness = 0.32;
-    const dashStep = dashLength + gapLength;
-    const dashCount = Math.max(1, Math.floor(dividerLength / dashStep));
-    const dashMaterial = new THREE.MeshBasicMaterial({
-      color: 0xaab1b9,
-      transparent: false,
-      opacity: 1,
-      depthTest: true,
-      depthWrite: false,
-      side: THREE.DoubleSide,
-      fog: false,
-      toneMapped: false,
-      polygonOffset: true,
-      polygonOffsetFactor: -6,
-      polygonOffsetUnits: -12,
-    });
-
-    function createDashRibbon(pointsAlongDash, thickness) {
-      if (pointsAlongDash.length < 2) {
-        return null;
-      }
-
-      const positions = [];
-      const indices = [];
-
-      for (let pointIndex = 0; pointIndex < pointsAlongDash.length; pointIndex += 1) {
-        const current = pointsAlongDash[pointIndex];
-        const previous = pointsAlongDash[Math.max(0, pointIndex - 1)];
-        const next = pointsAlongDash[Math.min(pointsAlongDash.length - 1, pointIndex + 1)];
-        const tangent = next.clone().sub(previous).setY(0);
-        if (tangent.lengthSq() < 0.0001) {
-          tangent.set(1, 0, 0);
-        } else {
-          tangent.normalize();
-        }
-        const side = new THREE.Vector3(-tangent.z, 0, tangent.x).multiplyScalar(thickness * 0.5);
-        const left = current.clone().sub(side);
-        const right = current.clone().add(side);
-        positions.push(left.x, left.y, left.z, right.x, right.y, right.z);
-
-        if (pointIndex < pointsAlongDash.length - 1) {
-          const baseIndex = pointIndex * 2;
-          indices.push(
-            baseIndex,
-            baseIndex + 1,
-            baseIndex + 2,
-            baseIndex + 1,
-            baseIndex + 3,
-            baseIndex + 2,
-          );
-        }
-      }
-
-      const geometry = new THREE.BufferGeometry();
-      geometry.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3));
-      geometry.setIndex(indices);
-      geometry.computeVertexNormals();
-      return geometry;
-    }
-
-    for (let index = 0; index < dashCount; index += 1) {
-      const startDistance = index * dashStep;
-      const endDistance = Math.min(startDistance + dashLength, dividerLength);
-      const segmentLength = Math.max(0.1, endDistance - startDistance);
-      const sampleCount = Math.max(3, Math.ceil(segmentLength / 0.9));
-      const dashPoints = [];
-
-      for (let sampleIndex = 0; sampleIndex <= sampleCount; sampleIndex += 1) {
-        const sampleDistance = startDistance + ((segmentLength * sampleIndex) / sampleCount);
-        const sampleRatio = Math.max(0, Math.min(1, sampleDistance / dividerLength));
-        dashPoints.push(dividerCurve.getPointAt(sampleRatio));
-      }
-
-      const dashGeometry = createDashRibbon(dashPoints, dashThickness);
-      if (!dashGeometry) {
-        continue;
-      }
-      const dashMesh = new THREE.Mesh(dashGeometry, dashMaterial);
-      dashMesh.position.y += 0.36;
-      dashMesh.renderOrder = 4;
-      routeRoot.add(dashMesh);
-    }
-  }
-
-  addRoadCurve(points, 11.2, 13.1, 8);
-  const dividerPoints = getTrimmedRoadPoints(points, 23);
-  addCenterDividerDashes(dividerPoints);
-
-  const routeLine = new THREE.Line(
-    new THREE.BufferGeometry().setFromPoints(points.map((point) => point.clone().setY(1.16))),
-    new THREE.LineBasicMaterial({
-      color: 0xb0b7c0,
-      transparent: true,
-      opacity: 0,
-    }),
-  );
-  routeRoot.add(routeLine);
-
-  return { objects: [routeRoot], root: routeRoot };
+  return { objects: [routeRoot], routes: routeEntries };
 }
 
 function createRigBoard(position, routeDirection, radius = 18) {
   const boardHeight = 2.4;
-  const approachDirection = routeDirection.clone().setY(0);
-  if (approachDirection.lengthSq() < 0.0001) {
-    approachDirection.set(0, 0, 1);
-  } else {
-    approachDirection.normalize();
-  }
-  const openingHalfAngle = Math.PI / 5.5;
-  const openingCenterAngle = Math.atan2(approachDirection.z, approachDirection.x);
-  const fenceStartAngle = openingCenterAngle + openingHalfAngle;
-  const fenceArcAngle = (Math.PI * 2) - (openingHalfAngle * 2);
+  const boardRotation = Math.atan2(routeDirection.x || 0, routeDirection.z || 1) + Math.PI;
+  const boardWidth = radius * 3.6;
+  const boardDepth = radius * 2.45;
   const board = new THREE.Mesh(
-    new THREE.CylinderGeometry(radius, radius, boardHeight, 48),
+    new THREE.BoxGeometry(boardWidth, boardHeight, boardDepth),
     new THREE.MeshStandardMaterial({
       color: 0x2d3339,
       emissive: 0x050608,
@@ -1118,86 +1056,175 @@ function createRigBoard(position, routeDirection, radius = 18) {
   );
   board.position.copy(position);
   board.position.y = boardHeight / 2;
+  board.rotation.y = boardRotation;
   board.receiveShadow = true;
 
-  const boardRing = new THREE.Mesh(
-    new THREE.RingGeometry(radius * 0.8, radius * 0.84, 64),
-    new THREE.MeshStandardMaterial({
-      color: 0x333940,
-      emissive: 0x06080a,
-      emissiveIntensity: 0.02,
-      metalness: 0.08,
-      roughness: 0.84,
-      transparent: true,
-      opacity: 0.32,
-      side: THREE.DoubleSide,
-      polygonOffset: true,
-      polygonOffsetFactor: -1,
-      polygonOffsetUnits: -2,
-    }),
-  );
-  boardRing.position.copy(position);
-  boardRing.position.y = boardHeight + 0.01;
-  boardRing.rotation.x = Math.PI / 2;
-
-  const fenceWall = new THREE.Mesh(
-    new THREE.CylinderGeometry(radius * 0.96, radius * 0.96, 1.4, 48, 1, true, fenceStartAngle, fenceArcAngle),
-    new THREE.MeshStandardMaterial({
-      color: 0x30363d,
-      emissive: 0x06080a,
-      emissiveIntensity: 0.02,
-      metalness: 0.12,
-      roughness: 0.82,
-      transparent: true,
-      opacity: 0.55,
-      side: THREE.DoubleSide,
-    }),
-  );
-  fenceWall.position.copy(position);
-  fenceWall.position.y = boardHeight + 0.7;
-
-  const fenceTopRing = new THREE.Mesh(
-    new THREE.TorusGeometry(radius * 0.96, 0.16, 16, 64, fenceArcAngle),
-    new THREE.MeshStandardMaterial({
-      color: 0x383f47,
-      emissive: 0x06080a,
-      emissiveIntensity: 0.02,
-      metalness: 0.14,
-      roughness: 0.8,
-    }),
-  );
-  fenceTopRing.position.copy(position);
-  fenceTopRing.position.y = boardHeight + 1.42;
-  fenceTopRing.rotation.x = Math.PI / 2;
-  fenceTopRing.rotation.z = fenceStartAngle;
+  const railMaterial = new THREE.MeshStandardMaterial({
+    color: 0x2d3339,
+    emissive: 0x050608,
+    emissiveIntensity: 0.03,
+    metalness: 0.12,
+    roughness: 0.78,
+  });
+  const railHeight = 1.4;
+  const railThickness = 0.34;
+  const sideRail = new THREE.BoxGeometry(railThickness, railHeight, boardDepth);
+  const endRail = new THREE.BoxGeometry(boardWidth, railHeight, railThickness);
+  const rotatedOffset = (x, y, z) => new THREE.Vector3(x, y, z).applyAxisAngle(new THREE.Vector3(0, 1, 0), boardRotation).add(position);
+  const leftRail = new THREE.Mesh(sideRail, railMaterial);
+  leftRail.position.copy(rotatedOffset(-(boardWidth * 0.5), boardHeight + 0.7, 0));
+  leftRail.rotation.y = boardRotation;
+  const rightRail = new THREE.Mesh(sideRail, railMaterial);
+  rightRail.position.copy(rotatedOffset(boardWidth * 0.5, boardHeight + 0.7, 0));
+  rightRail.rotation.y = boardRotation;
+  const frontRail = new THREE.Mesh(endRail, railMaterial);
+  frontRail.position.copy(rotatedOffset(0, boardHeight + 0.7, -(boardDepth * 0.5)));
+  frontRail.rotation.y = boardRotation;
+  const backRail = new THREE.Mesh(endRail, railMaterial);
+  backRail.position.copy(rotatedOffset(0, boardHeight + 0.7, boardDepth * 0.5));
+  backRail.rotation.y = boardRotation;
 
   const fencePosts = [];
-  const postCount = 12;
-  for (let index = 0; index < postCount; index += 1) {
-    const angle = (index / postCount) * Math.PI * 2;
-    const radialDirection = new THREE.Vector3(Math.cos(angle), 0, Math.sin(angle));
-    if (radialDirection.angleTo(approachDirection) < openingHalfAngle) {
-      continue;
-    }
+  const xOffsets = [-boardWidth * 0.5, boardWidth * 0.5];
+  const zOffsets = [-boardDepth * 0.5, boardDepth * 0.5];
+  xOffsets.forEach((xOffset) => {
+    zOffsets.forEach((zOffset) => {
     const post = new THREE.Mesh(
       new THREE.CylinderGeometry(0.16, 0.16, 1.4, 12),
       new THREE.MeshStandardMaterial({
-        color: 0x343b42,
-        emissive: 0x06080a,
-        emissiveIntensity: 0.02,
-        metalness: 0.14,
+        color: 0x2d3339,
+        emissive: 0x050608,
+        emissiveIntensity: 0.03,
+        metalness: 0.12,
         roughness: 0.78,
       }),
     );
-    post.position.set(
-      position.x + (Math.cos(angle) * radius * 0.96),
-      boardHeight + 0.7,
-      position.z + (Math.sin(angle) * radius * 0.96),
-    );
+    const localPosition = new THREE.Vector3(xOffset, boardHeight + 0.7, zOffset);
+    localPosition.applyAxisAngle(new THREE.Vector3(0, 1, 0), boardRotation);
+    post.position.copy(position.clone().add(localPosition));
     fencePosts.push(post);
+    });
+  });
+
+  return [board, leftRail, rightRail, frontRail, backRail, ...fencePosts];
+}
+
+function getRigBoardRotation(routeDirection) {
+  return Math.atan2(routeDirection.x || 0, routeDirection.z || 1) + Math.PI;
+}
+
+function getRigBoardParkingWorld(position, routeDirection, radius, truckId) {
+  const boardRotation = getRigBoardRotation(routeDirection);
+  const boardWidth = radius * 3.6;
+  const boardDepth = radius * 2.45;
+  const slotIndex = Math.max(0, truckId - 1);
+  const laneDepth = boardDepth * 0.74;
+  const rowSpacing = 10;
+  const rows = Math.max(1, Math.floor(laneDepth / rowSpacing));
+  const rowIndex = slotIndex % rows;
+  const columnIndex = Math.floor(slotIndex / rows);
+  const localX = Math.min(boardWidth * 0.42, (boardWidth * 0.22) + (columnIndex * 7.5));
+  const localZ = (-laneDepth * 0.5) + (rowIndex * rowSpacing) + ((laneDepth - ((rows - 1) * rowSpacing)) * 0.5);
+  const worldOffset = new THREE.Vector3(localX, 2.35, localZ)
+    .applyAxisAngle(new THREE.Vector3(0, 1, 0), boardRotation);
+
+  return {
+    position: position.clone().add(worldOffset),
+    heading: boardRotation - (Math.PI / 2),
+  };
+}
+
+function getRigBoardRigWorld(position, routeDirection, radius, height = 1.6) {
+  const boardRotation = getRigBoardRotation(routeDirection);
+  const boardWidth = radius * 3.6;
+  const worldOffset = new THREE.Vector3(-(boardWidth * 0.2), height, 0)
+    .applyAxisAngle(new THREE.Vector3(0, 1, 0), boardRotation);
+  return position.clone().add(worldOffset);
+}
+
+function addRigCornerLamps(parent, position, routeDirection, radius, siteLampTemplate, rigTargetWorld, modelYawOffset = 0) {
+  if (!parent || !siteLampTemplate) {
+    return;
   }
 
-  return [board, boardRing, fenceWall, fenceTopRing, ...fencePosts];
+  const boardRotation = getRigBoardRotation(routeDirection);
+  const boardWidth = radius * 3.6;
+  const boardDepth = radius * 2.45;
+  const lampHeight = 2.6;
+  const cornerOffsets = [
+    { offset: new THREE.Vector3(boardWidth * 0.40, lampHeight, boardDepth * 0.36), yawOffset: modelYawOffset },
+  ];
+
+  cornerOffsets.forEach(({ offset: cornerOffset, yawOffset }) => {
+    const lamp = centerAndScaleModel(
+      cloneModelWithUniqueMaterials(siteLampTemplate),
+      { targetWidth: 16, targetHeight: 42, lift: 0 },
+    );
+    tintModel(lamp, 0x6a7178);
+    const lampRoot = new THREE.Group();
+    const worldPosition = cornerOffset
+      .clone()
+      .applyAxisAngle(new THREE.Vector3(0, 1, 0), boardRotation)
+      .add(position);
+    lampRoot.position.copy(worldPosition);
+    const localRigTarget = rigTargetWorld.clone().sub(worldPosition);
+    lamp.rotation.y = Math.atan2(localRigTarget.x, localRigTarget.z) + yawOffset + THREE.MathUtils.degToRad(-100);
+    lampRoot.add(lamp);
+
+    const lampLight = new THREE.SpotLight(0xffe5b5, 150, 140, 0.8, 0.85, 1.02);
+    lampLight.position.set(0, 46, 0);
+    lampLight.castShadow = false;
+
+    const lampTarget = new THREE.Object3D();
+    lampTarget.position.set(localRigTarget.x, 0.4, localRigTarget.z);
+    lampRoot.add(lampTarget);
+    lampLight.target = lampTarget;
+
+    lampRoot.add(lampLight);
+    parent.add(lampRoot);
+  });
+}
+
+function addMedianLamps(parent, curvePoints, lampTemplate, lampCount = 4) {
+  if (!parent || !lampTemplate || !curvePoints || curvePoints.length < 2) {
+    return;
+  }
+
+  const pathMetrics = buildWorldPathMetrics(curvePoints);
+  const totalLength = pathMetrics.totalLength || 0;
+  if (totalLength <= 1 || lampCount <= 0) {
+    return;
+  }
+
+  const endClearance = Math.min(Math.max(24, totalLength * 0.17), totalLength * 0.28);
+  const usableLength = Math.max(totalLength - (endClearance * 2), 1);
+  for (let lampIndex = 0; lampIndex < lampCount; lampIndex += 1) {
+    const ratioAlongUsable = lampCount === 1 ? 0.5 : (lampIndex / (lampCount - 1));
+    const distance = endClearance + (usableLength * ratioAlongUsable);
+    const ratio = distance / totalLength;
+    const nextRatio = Math.min(1, (distance + 1.2) / totalLength);
+    const currentPoint = interpolateWorldPath(pathMetrics, ratio, 0);
+    const nextPoint = interpolateWorldPath(pathMetrics, nextRatio, 0);
+    const heading = Math.atan2(nextPoint.x - currentPoint.x, nextPoint.z - currentPoint.z);
+    const lamp = centerAndScaleModel(
+      cloneModelWithUniqueMaterials(lampTemplate),
+      { targetWidth: 3.2, targetHeight: 15, lift: 0 },
+    );
+    lamp.position.copy(currentPoint);
+    lamp.position.y = 0.18;
+    lamp.rotation.y = heading + (Math.PI / 2);
+
+    const lampGlow = new THREE.SpotLight(0xffe0a8, 8.5, 10, 1, 0.8, 0.5);
+    lampGlow.position.set(0, 2.5, 0);
+    lampGlow.castShadow = false;
+    const lampTarget = new THREE.Object3D();
+    lampTarget.position.set(0, 0.2, 0);
+    lamp.add(lampTarget);
+    lampGlow.target = lampTarget;
+    lamp.add(lampGlow);
+
+    parent.add(lamp);
+  }
 }
 
 function getLocationLabel(label, fallback) {
@@ -1462,16 +1489,19 @@ export function SimulationScene3D({
     };
   }
 
-  function buildRouteTooltip(routeInfo) {
-    const distanceKm = Number.isFinite(routeInfo.distanceKm) ? routeInfo.distanceKm : 0;
-    return {
-      title: "Move Route",
-      state: "State: Source to destination",
-      assigned: `Distance: ${distanceKm.toFixed(1)} km`,
-      progress: "Path: Active haul corridor",
-      moving: `Connection: ${routeInfo.startName || "Source"} to ${routeInfo.endName || "Destination"}`,
-    };
-  }
+function buildRouteTooltip(routeInfo) {
+  const distanceKm = Number.isFinite(routeInfo.distanceKm) ? routeInfo.distanceKm : 0;
+  const routeLabel = routeInfo.routeLabel || "Move Route";
+  const stateLabel = routeInfo.stateLabel || "Source to destination";
+  const pathLabel = routeInfo.pathLabel || "Active haul corridor";
+  return {
+    title: routeLabel,
+    state: `State: ${stateLabel}`,
+    assigned: `Distance: ${distanceKm.toFixed(1)} km`,
+    progress: `Path: ${pathLabel}`,
+    moving: `Connection: ${routeInfo.startName || "Source"} to ${routeInfo.endName || "Destination"}`,
+  };
+}
 
   function buildBoardTooltip(boardInfo) {
     const point = boardInfo.point || {};
@@ -1539,18 +1569,10 @@ export function SimulationScene3D({
     ];
     const projection = buildProjection(geoPoints);
     const measuredRouteMetrics = buildRouteMetrics(activeRoutePoints);
-    const stylizedProjectedRoute = buildStylizedRoutePoints(
-      activeRoutePoints.map((point) => projection.project(point, 1.2)),
-      measuredRouteMetrics,
-    );
-    const fixedStartWorld = new THREE.Vector3(82, 1.2, 14);
-    const fixedEndWorld = new THREE.Vector3(-82, 1.2, -14);
-    const projectedRoute = remapRouteToFixedAnchors(stylizedProjectedRoute, fixedStartWorld, fixedEndWorld);
-    const projectedRouteMetrics = buildWorldPathMetrics(projectedRoute);
-    const reversedProjectedRoute = [...projectedRoute].reverse();
-    const reversedProjectedRouteMetrics = buildWorldPathMetrics(reversedProjectedRoute);
-    const straightStartWorld = projectedRoute[0] || new THREE.Vector3(0, 1.2, 0);
-    const straightEndWorld = projectedRoute[projectedRoute.length - 1] || new THREE.Vector3(0, 1.2, 0);
+    const fixedStartWorld = new THREE.Vector3(98, 1.2, 16);
+    const fixedEndWorld = new THREE.Vector3(-86, 1.2, -6);
+    const straightStartWorld = fixedStartWorld.clone();
+    const straightEndWorld = fixedEndWorld.clone();
     const platformSize = Math.max(340, projection.extent * 0.32);
     const platformEdgeOffset = platformSize * 0.38;
     const routeDirectionWorld = new THREE.Vector3(
@@ -1563,45 +1585,81 @@ export function SimulationScene3D({
     } else {
       routeDirectionWorld.normalize();
     }
+    const roadStartWorld = straightStartWorld.clone().add(routeDirectionWorld.clone().multiplyScalar(22));
+    const roadEndWorld = straightEndWorld.clone().add(routeDirectionWorld.clone().multiplyScalar(-22));
+    const projectedRoute = [roadStartWorld, roadEndWorld];
+    const projectedRouteMetrics = buildWorldPathMetrics(projectedRoute);
+    const reversedProjectedRoute = [...projectedRoute].reverse();
+    const reversedProjectedRouteMetrics = buildWorldPathMetrics(reversedProjectedRoute);
     const routeSideWorld = new THREE.Vector3(-routeDirectionWorld.z, 0, routeDirectionWorld.x).normalize();
-    const directionLaneCenterOffset = 7.4;
-    const sameDirectionSubLaneSpacing = 2.6;
-    const parkedTruckHeading = Math.atan2(routeDirectionWorld.x, routeDirectionWorld.z);
-    const sourceParkingAnchor = straightStartWorld.clone()
-      .add(routeDirectionWorld.clone().multiplyScalar(-30));
-    const destinationParkingAnchor = straightEndWorld.clone()
-      .add(routeDirectionWorld.clone().multiplyScalar(30));
-
-    function getParkingWorld(anchor, truckId) {
+    const roadCenterOffset = 27;
+    const laneHalfGap = 3.2;
+    const roadTravelHeight = 0.255;
+    const outboundRoadSourceAnchor = roadStartWorld.clone().add(routeSideWorld.clone().multiplyScalar(roadCenterOffset));
+    const outboundRoadDestinationAnchor = roadEndWorld.clone().add(routeSideWorld.clone().multiplyScalar(roadCenterOffset));
+    const inboundRoadSourceAnchor = roadStartWorld.clone().add(routeSideWorld.clone().multiplyScalar(-roadCenterOffset));
+    const inboundRoadDestinationAnchor = roadEndWorld.clone().add(routeSideWorld.clone().multiplyScalar(-roadCenterOffset));
+    const outboundLanePointsA = [
+      outboundRoadSourceAnchor.clone().add(routeSideWorld.clone().multiplyScalar(-laneHalfGap)),
+      outboundRoadDestinationAnchor.clone().add(routeSideWorld.clone().multiplyScalar(-laneHalfGap)),
+    ];
+    const outboundLanePointsB = [
+      outboundRoadSourceAnchor.clone().add(routeSideWorld.clone().multiplyScalar(laneHalfGap)),
+      outboundRoadDestinationAnchor.clone().add(routeSideWorld.clone().multiplyScalar(laneHalfGap)),
+    ];
+    const inboundLanePointsA = [
+      inboundRoadDestinationAnchor.clone().add(routeSideWorld.clone().multiplyScalar(-laneHalfGap)),
+      inboundRoadSourceAnchor.clone().add(routeSideWorld.clone().multiplyScalar(-laneHalfGap)),
+    ];
+    const inboundLanePointsB = [
+      inboundRoadDestinationAnchor.clone().add(routeSideWorld.clone().multiplyScalar(laneHalfGap)),
+      inboundRoadSourceAnchor.clone().add(routeSideWorld.clone().multiplyScalar(laneHalfGap)),
+    ];
+    const outboundLaneMetricsA = buildWorldPathMetrics(outboundLanePointsA);
+    const outboundLaneMetricsB = buildWorldPathMetrics(outboundLanePointsB);
+    const inboundLaneMetricsA = buildWorldPathMetrics(inboundLanePointsA);
+    const inboundLaneMetricsB = buildWorldPathMetrics(inboundLanePointsB);
+    function getTravelLaneMetrics(truckId, direction) {
       const slotIndex = Math.max(0, truckId - 1);
-      const truckCount = Math.max(1, simulationRef.current?.truckCount || truckMeshes.size);
-      const centeredIndex = slotIndex - ((truckCount - 1) / 2);
-
-      return anchor.clone().add(routeSideWorld.clone().multiplyScalar(centeredIndex * 11));
+      const useFirstLane = slotIndex % 2 === 0;
+      if (direction === "outbound") {
+        return useFirstLane ? outboundLaneMetricsA : outboundLaneMetricsB;
+      }
+      return useFirstLane ? inboundLaneMetricsA : inboundLaneMetricsB;
     }
 
-    function getSourceParkingWorld(truckId) {
-      return getParkingWorld(sourceParkingAnchor, truckId);
+    function getLaneHeading(pathMetrics, fromStart = true) {
+      const points = pathMetrics?.points || [];
+      if (points.length < 2) {
+        return Math.atan2(routeDirectionWorld.x, routeDirectionWorld.z);
+      }
+      const current = fromStart ? points[0] : points[points.length - 1];
+      const neighbor = fromStart ? points[1] : points[points.length - 2];
+      const tangent = fromStart
+        ? neighbor.clone().sub(current)
+        : current.clone().sub(neighbor);
+      return Math.atan2(tangent.x, tangent.z);
     }
 
-    function getDestinationParkingWorld(truckId) {
-      return getParkingWorld(destinationParkingAnchor, truckId);
-    }
+    function getLaneParkingWorld(truckId, direction) {
+      const pathMetrics = getTravelLaneMetrics(truckId, direction);
+      const points = pathMetrics?.points || [];
+      if (points.length < 2) {
+        const fallbackHeading = Math.atan2(routeDirectionWorld.x, routeDirectionWorld.z);
+        const fallbackBase = direction === "outbound" ? roadStartWorld : roadEndWorld;
+        const fallbackMove = new THREE.Vector3(Math.sin(fallbackHeading), 0, Math.cos(fallbackHeading)).multiplyScalar(-30);
+        return {
+          position: fallbackBase.clone().add(fallbackMove),
+          heading: fallbackHeading,
+        };
+      }
 
-    function getAlternatingSubLaneOffset(truckId) {
-      const slotIndex = Math.max(0, truckId - 1);
-      const subLaneDirection = slotIndex % 2 === 0 ? -1 : 1;
-      return routeSideWorld.clone().multiplyScalar(subLaneDirection * sameDirectionSubLaneSpacing);
-    }
-
-    function getTravelLaneOffset(truckId, direction) {
-      const directionOffset = direction === "outbound"
-        ? directionLaneCenterOffset
-        : -directionLaneCenterOffset;
-      return routeSideWorld
-        .clone()
-        .multiplyScalar(directionOffset)
-        .add(getAlternatingSubLaneOffset(truckId));
+      const lanePoint = points[0];
+      const laneHeading = getLaneHeading(pathMetrics, true);
+      return {
+        position: lanePoint.clone(),
+        heading: laneHeading,
+      };
     }
 
     const scene = new THREE.Scene();
@@ -1706,7 +1764,22 @@ export function SimulationScene3D({
 
     const routeGroup = new THREE.Group();
     routeGroup.rotation.y = sceneSpin;
-    const routeObjects = createRouteObjects(projectedRoute);
+    const routeObjects = createRouteObjects([
+      {
+        key: "outbound",
+        start: outboundRoadSourceAnchor,
+        end: outboundRoadDestinationAnchor,
+        width: 10.8,
+        shoulderWidth: 12.6,
+      },
+      {
+        key: "inbound",
+        start: inboundRoadSourceAnchor,
+        end: inboundRoadDestinationAnchor,
+        width: 10.8,
+        shoulderWidth: 12.6,
+      },
+    ]);
     routeObjects.objects.forEach((object) => routeGroup.add(object));
     scene.add(routeGroup);
     const truckPoolCount = Math.max(24, simulation?.truckCount || 0, (simulation?.truckSetup?.length || 1) * 8);
@@ -1728,20 +1801,25 @@ export function SimulationScene3D({
     const routePickTargets = [];
     const highlightTargets = new Map();
 
-    if (routeObjects.root) {
-      routeObjects.root.userData = {
-        ...routeObjects.root.userData,
+    routeObjects.routes.forEach(({ key, root }) => {
+      const isOutbound = key === "outbound";
+      const highlightKey = `move-route-${key}`;
+      root.userData = {
+        ...root.userData,
         routeInfo: {
           distanceKm: measuredRouteMetrics.totalKm,
           startName: getLocationLabel(startLabel, "Source"),
           endName: getLocationLabel(endLabel, "Destination"),
+          routeLabel: isOutbound ? "Outbound Road" : "Inbound Road",
+          stateLabel: isOutbound ? "Source to destination" : "Destination to source",
+          pathLabel: isOutbound ? "Loaded haul lane" : "Return haul lane",
         },
-        highlightKey: "move-route",
+        highlightKey,
       };
-      routePickTargets.push(routeObjects.root);
-      highlightTargets.set("move-route", {
-        root: routeObjects.root,
-        capturedMaterials: captureHighlightMaterials(routeObjects.root),
+      routePickTargets.push(root);
+      highlightTargets.set(highlightKey, {
+        root,
+        capturedMaterials: captureHighlightMaterials(root),
         color: 0xfbbf24,
         kind: "route",
         intensityFactor: 0.52,
@@ -1750,9 +1828,9 @@ export function SimulationScene3D({
           surfaceMixScale: 0.3,
           emissiveMixScale: 0.22,
         },
-        baseScale: routeObjects.root.scale.clone(),
+        baseScale: root.scale.clone(),
       });
-    }
+    });
 
     function registerPulseTargets(root) {
       root.traverse((child) => {
@@ -1762,14 +1840,34 @@ export function SimulationScene3D({
       });
     }
 
+    function addTruckRoadLight(truckRoot) {
+      const lightRoot = new THREE.Group();
+      lightRoot.visible = false;
+
+      const roadLight = new THREE.SpotLight(0xffe7b8, 20, 34, 0.62, 0.88, 1.1);
+      roadLight.position.set(0, 3.2, 4.2);
+      roadLight.castShadow = false;
+
+      const lightTarget = new THREE.Object3D();
+      lightTarget.position.set(0, 0.2, 18);
+      lightRoot.add(lightTarget);
+      roadLight.target = lightTarget;
+
+      lightRoot.add(roadLight);
+      truckRoot.add(lightRoot);
+      return lightRoot;
+    }
+
     function createTruckInstance(truckId) {
       const truckRoot = new THREE.Group();
       const fallbackMesh = createTruckFallbackMesh(truckAccent);
       truckRoot.add(fallbackMesh);
+      const roadLight = addTruckRoadLight(truckRoot);
       truckRoot.visible = false;
       truckRoot.userData = {
         truckId,
         status: "",
+        roadLight,
         truckVariants: {
           fallback: fallbackMesh,
         },
@@ -1782,20 +1880,26 @@ export function SimulationScene3D({
       const truckTemplates = {};
       let rigTemplate = null;
       let terrainTemplate = null;
+      let lampTemplate = null;
+      let siteLampTemplate = null;
 
       try {
-        const [flatbedTruckTemplate, lowbedTruckTemplate, heavyHaulerTruckTemplate, nextRigTemplate, nextTerrainTemplate] = await Promise.all([
+        const [flatbedTruckTemplate, lowbedTruckTemplate, heavyHaulerTruckTemplate, nextRigTemplate, nextTerrainTemplate, nextLampTemplate, nextSiteLampTemplate] = await Promise.all([
           loadModelTemplate("flatbedTruck"),
           loadModelTemplate("lowbedTruck"),
           loadModelTemplate("heavyHaulerTruck"),
           loadModelTemplate("rig"),
           loadModelTemplate("terrain"),
+          loadModelTemplate("lamp"),
+          loadModelTemplate("siteLamp"),
         ]);
         truckTemplates.flatbedTruck = flatbedTruckTemplate;
         truckTemplates.lowbedTruck = lowbedTruckTemplate;
         truckTemplates.heavyHaulerTruck = heavyHaulerTruckTemplate;
         rigTemplate = nextRigTemplate;
         terrainTemplate = nextTerrainTemplate;
+        lampTemplate = nextLampTemplate;
+        siteLampTemplate = nextSiteLampTemplate;
       } catch (error) {
         console.warn("3D assets failed to load, using fallback geometry instead.", error);
       }
@@ -1807,9 +1911,10 @@ export function SimulationScene3D({
       if (terrainTemplate) {
         const terrainInset = platformSize * 0.31;
         const terrainPresets = [
-          { x: -terrainInset * 1.02, z: -terrainInset * 0.88, width: 156, height: 36, rotation: Math.PI * 0.5 },
+          { x: -terrainInset * 0.75, z: -terrainInset * 1.05, width: 175, height: 46, rotation: Math.PI * 0.5 },
           { x: terrainInset * 0.86, z: -terrainInset, width: 128, height: 29, rotation: -Math.PI * 0.5 },
           { x: terrainInset * 0.18, z: terrainInset, width: 124, height: 27, rotation: Math.PI * 0.5 },
+          { x: 0, z: 4, width: 60, height: 16, rotation: Math.PI * 0.465 },
         ];
 
         terrainPresets.forEach(({ x, z, width, height, rotation }) => {
@@ -1840,10 +1945,27 @@ export function SimulationScene3D({
           terrainAsset.rotation.y = rotation;
           floorGroup.add(terrainAsset);
         });
+      } else {
+        const centerIsland = new THREE.Mesh(
+          new THREE.ConeGeometry(14, 14, 12),
+          new THREE.MeshStandardMaterial({
+            color: 0x2b3138,
+            metalness: 0.04,
+            roughness: 0.96,
+          }),
+        );
+        centerIsland.position.set(0, 7, -2);
+        floorGroup.add(centerIsland);
+      }
+
+      if (lampTemplate) {
+        routeObjects.routes.forEach(({ points }) => {
+          addMedianLamps(routeGroup, points, lampTemplate, 6);
+        });
       }
 
       if (startPoint) {
-        const startBoardParts = createRigBoard(straightStartWorld.clone().setY(0), routeDirectionWorld, 18);
+        const startBoardParts = createRigBoard(straightStartWorld.clone().setY(0), routeDirectionWorld, 24);
         const startBoardGroup = new THREE.Group();
         startBoardGroup.userData = {
           boardInfo: {
@@ -1872,13 +1994,23 @@ export function SimulationScene3D({
           baseScale: startBoardGroup.scale.clone(),
         });
         padAssetsGroup.add(startBoardGroup);
+        if (siteLampTemplate) {
+          addRigCornerLamps(
+            padAssetsGroup,
+            straightStartWorld.clone().setY(0),
+            routeDirectionWorld,
+            24,
+            siteLampTemplate,
+            getRigBoardRigWorld(straightStartWorld.clone().setY(0), routeDirectionWorld, 24, 3.6),
+          );
+        }
         const startAsset = rigTemplate
-          ? centerAndScaleModel(cloneModelWithUniqueMaterials(rigTemplate), { targetWidth: 49, targetHeight: 27, lift: 0 })
+          ? centerAndScaleModel(cloneModelWithUniqueMaterials(rigTemplate), { targetWidth: 62, targetHeight: 34, lift: 0 })
           : createPadFallback(straightStartWorld.clone().setY(0), 0x1de9d5, -6);
         if (rigTemplate) {
           tintModel(startAsset, 0x596069);
           startAsset.rotation.y = Math.PI * 0.18;
-          startAsset.position.copy(straightStartWorld.clone().setY(1.6));
+          startAsset.position.copy(getRigBoardRigWorld(straightStartWorld.clone().setY(0), routeDirectionWorld, 24, 1.8));
           const statusMeshes = collectStatusMeshes(startAsset);
           statusMeshes.forEach((mesh, index) => {
             mesh.userData.rigComponent = {
@@ -1927,7 +2059,7 @@ export function SimulationScene3D({
       }
 
       if (endPoint) {
-        const endBoardParts = createRigBoard(straightEndWorld.clone().setY(0), routeDirectionWorld.clone().multiplyScalar(-1), 22);
+        const endBoardParts = createRigBoard(straightEndWorld.clone().setY(0), routeDirectionWorld.clone().multiplyScalar(-1), 28);
         const endBoardGroup = new THREE.Group();
         endBoardGroup.userData = {
           boardInfo: {
@@ -1956,13 +2088,24 @@ export function SimulationScene3D({
           baseScale: endBoardGroup.scale.clone(),
         });
         padAssetsGroup.add(endBoardGroup);
+        if (siteLampTemplate) {
+          addRigCornerLamps(
+            padAssetsGroup,
+            straightEndWorld.clone().setY(0),
+            routeDirectionWorld.clone().multiplyScalar(-1),
+            28,
+            siteLampTemplate,
+            getRigBoardRigWorld(straightEndWorld.clone().setY(0), routeDirectionWorld.clone().multiplyScalar(-1), 28, 3.6),
+            Math.PI,
+          );
+        }
         const endAsset = rigTemplate
-          ? centerAndScaleModel(cloneModelWithUniqueMaterials(rigTemplate), { targetWidth: 63, targetHeight: 36, lift: 0 })
+          ? centerAndScaleModel(cloneModelWithUniqueMaterials(rigTemplate), { targetWidth: 78, targetHeight: 44, lift: 0 })
           : createPadFallback(straightEndWorld.clone().setY(0), 0xc6ff00, 6);
         if (rigTemplate) {
           tintModel(endAsset, 0x596069);
           endAsset.rotation.y = -Math.PI * 0.12;
-          endAsset.position.copy(straightEndWorld.clone().setY(1.6));
+          endAsset.position.copy(getRigBoardRigWorld(straightEndWorld.clone().setY(0), routeDirectionWorld.clone().multiplyScalar(-1), 28, 1.8));
           const statusMeshes = collectStatusMeshes(endAsset);
           statusMeshes.forEach((mesh, index) => {
             mesh.userData.rigComponent = {
@@ -2342,8 +2485,6 @@ export function SimulationScene3D({
 
         const assignedTruckType = truckTypeAssignments[truckId - 1] || "LowBed";
         const truckBodyOffset = getTruckVariantRoadOffset(assignedTruckType);
-        const outboundLaneOffset = getTravelLaneOffset(truckId, "outbound");
-        const inboundLaneOffset = getTravelLaneOffset(truckId, "inbound");
         if (mesh.userData?.truckType !== assignedTruckType) {
           setTruckVariantVisible(mesh, assignedTruckType);
         }
@@ -2360,22 +2501,36 @@ export function SimulationScene3D({
           return minute >= trip.loadStart && minute <= tripEnd;
         });
         const deliveredTrip = [...truckTrips].reverse().find((trip) => minute > trip.arrivalAtDestination);
+        const sourceSiteParking = getRigBoardParkingWorld(
+          straightStartWorld.clone().setY(0),
+          routeDirectionWorld,
+          24,
+          truckId,
+        );
+        const destinationSiteParking = getRigBoardParkingWorld(
+          straightEndWorld.clone().setY(0),
+          routeDirectionWorld.clone().multiplyScalar(-1),
+          28,
+          truckId,
+        );
+        const sourceLaneParking = getLaneParkingWorld(truckId, "outbound");
+        const destinationLaneParking = getLaneParkingWorld(truckId, "inbound");
 
-        let currentWorld = straightStartWorld;
-        let nextWorld = straightStartWorld;
+        let currentWorld = roadStartWorld;
+        let nextWorld = roadStartWorld;
         let distanceKm = 0;
 
         if (!activeTrip) {
           if (deliveredTrip && !deliveredTrip.returnToSource) {
-            currentWorld = getDestinationParkingWorld(truckId);
+            currentWorld = destinationSiteParking.position.clone();
             nextWorld = currentWorld;
             distanceKm = routeDistanceKm;
           } else {
-            currentWorld = getSourceParkingWorld(truckId);
+            currentWorld = sourceSiteParking.position.clone();
             nextWorld = currentWorld;
           }
         } else if (minute < activeTrip.rigDownFinish) {
-          currentWorld = getSourceParkingWorld(truckId);
+          currentWorld = sourceSiteParking.position.clone();
           nextWorld = currentWorld;
           distanceKm = 0;
         } else if (minute < activeTrip.arrivalAtDestination) {
@@ -2383,13 +2538,12 @@ export function SimulationScene3D({
           const outboundRatio = (minute - activeTrip.rigDownFinish) / tripDuration;
           const forwardMinute = Math.min(minute + 0.6, activeTrip.arrivalAtDestination);
           const nextOutboundRatio = (forwardMinute - activeTrip.rigDownFinish) / tripDuration;
-          currentWorld = interpolateWorldPathWithEndpointOffset(projectedRouteMetrics, outboundRatio, truckBodyOffset, 1.5)
-            .add(outboundLaneOffset);
-          nextWorld = interpolateWorldPathWithEndpointOffset(projectedRouteMetrics, nextOutboundRatio, truckBodyOffset, 1.5)
-            .add(outboundLaneOffset);
+          const outboundLaneMetrics = getTravelLaneMetrics(truckId, "outbound");
+          currentWorld = interpolateWorldPathWithEndpointOffset(outboundLaneMetrics, outboundRatio, truckBodyOffset, roadTravelHeight);
+          nextWorld = interpolateWorldPathWithEndpointOffset(outboundLaneMetrics, nextOutboundRatio, truckBodyOffset, roadTravelHeight);
           distanceKm = routeDistanceKm * Math.max(0, Math.min(1, outboundRatio));
         } else if (minute < activeTrip.rigUpFinish) {
-          currentWorld = getDestinationParkingWorld(truckId);
+          currentWorld = destinationSiteParking.position.clone();
           nextWorld = currentWorld;
           distanceKm = routeDistanceKm;
         } else if (activeTrip.returnToSource && minute < activeTrip.returnToSource) {
@@ -2397,13 +2551,12 @@ export function SimulationScene3D({
           const inboundRatio = (minute - activeTrip.rigUpFinish) / tripDuration;
           const forwardMinute = Math.min(minute + 0.6, activeTrip.returnToSource);
           const nextInboundRatio = (forwardMinute - activeTrip.rigUpFinish) / tripDuration;
-          currentWorld = interpolateWorldPathWithEndpointOffset(reversedProjectedRouteMetrics, inboundRatio, truckBodyOffset, 1.5)
-            .add(inboundLaneOffset);
-          nextWorld = interpolateWorldPathWithEndpointOffset(reversedProjectedRouteMetrics, nextInboundRatio, truckBodyOffset, 1.5)
-            .add(inboundLaneOffset);
+          const inboundLaneMetrics = getTravelLaneMetrics(truckId, "inbound");
+          currentWorld = interpolateWorldPathWithEndpointOffset(inboundLaneMetrics, inboundRatio, truckBodyOffset, roadTravelHeight);
+          nextWorld = interpolateWorldPathWithEndpointOffset(inboundLaneMetrics, nextInboundRatio, truckBodyOffset, roadTravelHeight);
           distanceKm = routeDistanceKm * Math.max(0, 1 - Math.min(1, inboundRatio));
         } else {
-          currentWorld = getDestinationParkingWorld(truckId);
+          currentWorld = destinationSiteParking.position.clone();
           nextWorld = currentWorld;
           distanceKm = routeDistanceKm;
         }
@@ -2412,24 +2565,43 @@ export function SimulationScene3D({
         const deltaZ = nextWorld.z - currentWorld.z;
         const movementMagnitude = Math.hypot(deltaX, deltaZ);
         const lastHeading = truckHeadingRef.current.get(truckId) ?? 0;
+        const movingHeading = movementMagnitude > 0.02 ? Math.atan2(deltaX, deltaZ) : lastHeading;
         const isParked =
           (!activeTrip && !deliveredTrip) ||
           (!activeTrip && Boolean(deliveredTrip && !deliveredTrip.returnToSource)) ||
           (activeTrip && minute < activeTrip.rigDownFinish) ||
           (activeTrip && minute >= activeTrip.arrivalAtDestination && minute < activeTrip.rigUpFinish) ||
           (activeTrip && !activeTrip.returnToSource && minute >= activeTrip.rigUpFinish);
-        const heading =
-          isParked
-            ? parkedTruckHeading
-            : movementMagnitude > 0.02
-            ? Math.atan2(deltaX, deltaZ)
-            : lastHeading;
-        const bob = Math.sin(elapsedSeconds * 2.4 + truckId * 0.6) * 0.035;
-
+        let heading = lastHeading;
+        if (isParked) {
+          heading = getContinuousAngle(
+            activeTrip && minute >= activeTrip.arrivalAtDestination
+              ? destinationSiteParking.heading
+              : sourceSiteParking.heading,
+            lastHeading,
+          );
+        } else if (activeTrip && minute < activeTrip.arrivalAtDestination) {
+          const tripDuration = Math.max(activeTrip.arrivalAtDestination - activeTrip.rigDownFinish, 1);
+          const outboundRatio = Math.max(0, Math.min(1, (minute - activeTrip.rigDownFinish) / tripDuration));
+          heading = outboundRatio < 0
+            ? getContinuousAngle(sourceSiteParking.heading, lastHeading)
+            : getContinuousAngle(movingHeading, lastHeading);
+        } else if (activeTrip?.returnToSource && minute < activeTrip.returnToSource) {
+          const tripDuration = Math.max(activeTrip.returnToSource - activeTrip.rigUpFinish, 1);
+          const inboundRatio = Math.max(0, Math.min(1, (minute - activeTrip.rigUpFinish) / tripDuration));
+          heading = inboundRatio < 0.03
+            ? getContinuousAngle(destinationSiteParking.heading, lastHeading)
+            : getContinuousAngle(movingHeading, lastHeading);
+        } else {
+          heading = getContinuousAngle(movingHeading, lastHeading);
+        }
         mesh.visible = true;
         mesh.position.copy(currentWorld);
-        mesh.position.y += bob;
         mesh.rotation.y = heading;
+        const roadLight = mesh.userData?.roadLight;
+        if (roadLight) {
+          roadLight.visible = !isParked;
+        }
         truckHeadingRef.current.set(truckId, heading);
         mesh.userData.status = getTruckStatus(playback, minute, truckId);
         mesh.userData.loadId = activeTrip?.loadId ?? deliveredTrip?.loadId ?? null;

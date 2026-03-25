@@ -359,8 +359,7 @@ function App() {
         animationFrameRef.current = null;
         animationStartedAtRef.current = null;
         setIsPlaybackRunning(false);
-        setIsPlaybackPaused(false);
-        setSceneFocusResetKey((value) => value + 1);
+        setIsPlaybackPaused(true);
       }
     };
 
@@ -658,11 +657,9 @@ function App() {
       return;
     }
 
-    setIsPlaybackPaused(false);
     animationStartedAtRef.current = null;
-    window.requestAnimationFrame(() => {
-      setIsPlaybackRunning(true);
-    });
+    setIsPlaybackRunning(true);
+    setIsPlaybackPaused(false);
   }
 
   function handleEndPlayback() {
