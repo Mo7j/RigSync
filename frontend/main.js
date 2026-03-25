@@ -1,7 +1,6 @@
 import { React, createRoot, h } from "./lib/react.js";
 import { useHashRoute, navigateTo } from "./lib/router.js";
 import {
-  BASE_PLAYBACK_SECONDS,
   DEFAULT_MOVE_SETTINGS,
   DEFAULT_TRUCK_SETUP,
   HISTORY_STORAGE_KEY,
@@ -65,7 +64,7 @@ function App() {
   const [isSimulatingMove, setIsSimulatingMove] = useState(false);
   const [moveSimulationError, setMoveSimulationError] = useState("");
   const [currentMinute, setCurrentMinute] = useState(0);
-  const [playbackSpeed, setPlaybackSpeed] = useState(1);
+  const [playbackSpeed, setPlaybackSpeed] = useState(15000);
   const [isPlaybackRunning, setIsPlaybackRunning] = useState(false);
   const [isPlaybackPaused, setIsPlaybackPaused] = useState(false);
   const [sceneFocusResetKey, setSceneFocusResetKey] = useState(0);
@@ -316,7 +315,7 @@ function App() {
   }, [route.page, activeMove?.id, activeMove?.updatedAt, areSceneAssetsReady]);
 
   useEffect(() => {
-    if (route.page !== "move" || !activeTotalMinutes || !areSceneAssetsReady || !isScenePlaybackReady || isSimulatingMove || !isPlaybackRunning) {
+    if (route.page !== "move" || !activeTotalMinutes || !areSceneAssetsReady || isSimulatingMove || !isPlaybackRunning) {
       if (animationFrameRef.current !== null) {
         window.cancelAnimationFrame(animationFrameRef.current);
       }
@@ -340,11 +339,10 @@ function App() {
       }
 
       const elapsedSeconds = (timestamp - animationStartedAtRef.current) / 1000;
+      const effectivePlaybackSpeed = Number(playbackSpeed) || 1;
       const simulatedMinutes =
         startingMinute +
-        elapsedSeconds *
-          (activeTotalMinutes / BASE_PLAYBACK_SECONDS) *
-          playbackSpeed;
+        (elapsedSeconds / 60) * effectivePlaybackSpeed;
       const nextMinute = Math.min(activeTotalMinutes, simulatedMinutes);
 
       setCurrentMinute(nextMinute);
@@ -370,7 +368,7 @@ function App() {
       animationFrameRef.current = null;
       animationStartedAtRef.current = null;
     };
-  }, [activeMove?.id, activeMove?.updatedAt, route.page, playbackSpeed, activeTotalMinutes, areSceneAssetsReady, isScenePlaybackReady, isSimulatingMove, isPlaybackRunning]);
+  }, [activeMove?.id, activeMove?.updatedAt, route.page, playbackSpeed, activeTotalMinutes, areSceneAssetsReady, isSimulatingMove, isPlaybackRunning]);
 
   async function handleLogin({ email, password }) {
     if (email !== TEST_USER.email || password !== TEST_USER.password) {
@@ -416,7 +414,7 @@ function App() {
       const nextMoves = upsertMove(move);
       setMoves(nextMoves);
       setAreSceneAssetsReady(true);
-      setPlaybackSpeed(1);
+      setPlaybackSpeed(15000);
       setIsPlaybackRunning(false);
       setIsPlaybackPaused(false);
       navigateTo(`/move/${move.id}`);
@@ -431,7 +429,7 @@ function App() {
     const sanitizedTruckSetup = truckSetup
       .map((item) => ({
         ...item,
-        count: Math.max(0, Number.parseInt(item.count, 10) || 0),
+        count: Math.max(1, Number.parseInt(item.count, 10) || 1),
       }))
       .filter((item) => item.type.trim());
     const requestedTruckCount = sanitizedTruckSetup.reduce((sum, item) => sum + item.count, 0);
@@ -568,7 +566,7 @@ function App() {
       setAreSceneAssetsReady(true);
       setCurrentMinute(0);
       lastPersistedMinuteRef.current = 0;
-      setPlaybackSpeed(1);
+      setPlaybackSpeed(15000);
       setIsPlaybackRunning(false);
       setIsPlaybackPaused(false);
       return true;

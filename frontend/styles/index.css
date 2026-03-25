@@ -1730,6 +1730,120 @@ p {
   overflow: visible;
 }
 
+.scene-speed-dropdown {
+  position: absolute;
+  right: 24px;
+  bottom: 24px;
+  z-index: 6;
+  width: min(132px, calc(100vw - 48px));
+}
+
+.scene-speed-dropdown::after {
+  content: "";
+  position: absolute;
+  right: 14px;
+  top: 50%;
+  width: 9px;
+  height: 9px;
+  border-right: 2px solid rgba(255, 244, 214, 0.78);
+  border-bottom: 2px solid rgba(255, 244, 214, 0.78);
+  transform: translateY(-62%) rotate(45deg);
+  pointer-events: none;
+  transition: transform 180ms ease;
+}
+
+.scene-speed-dropdown.is-open::after {
+  transform: translateY(-38%) rotate(-135deg);
+}
+
+.scene-speed-select {
+  width: 100%;
+  height: 38px;
+  border: 0;
+  border-radius: 18px;
+  background: rgba(255, 255, 255, 0.02);
+  color: #f5f7fb;
+  font-size: 0.84rem;
+  font-weight: 500;
+  text-align: left;
+  padding: 0 34px 0 12px;
+  outline: none;
+  backdrop-filter: blur(18px);
+  box-shadow: none;
+}
+
+.scene-speed-select:focus {
+  box-shadow: 0 0 0 1px rgba(255, 216, 74, 0.18);
+}
+
+.scene-speed-menu {
+  position: absolute;
+  right: 0;
+  bottom: calc(100% + 8px);
+  width: 100%;
+  display: grid;
+  gap: 4px;
+  padding: 6px;
+  border-radius: 18px;
+  background: rgba(255, 255, 255, 0.02);
+  backdrop-filter: blur(18px);
+  box-shadow: none;
+}
+
+.scene-speed-option {
+  min-height: 34px;
+  border: 0;
+  border-radius: 14px;
+  background: transparent;
+  color: #f5f7fb;
+  font-size: 0.82rem;
+  font-weight: 500;
+  text-align: left;
+  padding: 0 12px;
+}
+
+.scene-speed-option:hover,
+.scene-speed-option.is-active {
+  background: rgba(255, 216, 74, 0.08);
+  color: #ffd84a;
+}
+
+.scene-move-info {
+  position: absolute;
+  left: 24px;
+  bottom: 24px;
+  z-index: 6;
+  width: min(350px, calc(100vw - 48px));
+  display: grid;
+  gap: 18px;
+}
+
+.scene-move-info-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px 22px;
+}
+
+.scene-move-info-grid .scene-dashboard-inline strong {
+  font-size: 0.75rem;
+  font-weight: 400;
+  color: rgba(245, 247, 251, 0.68);
+  text-shadow: none;
+}
+
+.scene-move-info-grid .scene-dashboard-label {
+  color: rgba(148, 163, 184, 0.72);
+  font-size: 0.62rem;
+}
+
+.scene-move-info-grid .scene-dashboard-inline {
+  gap: 8px;
+}
+
+.scene-move-info-row-full {
+  grid-column: 1 / -1;
+}
+
 .scene-panel-left-merged > * {
   width: 100%;
 }

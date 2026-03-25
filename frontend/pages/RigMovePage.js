@@ -10,14 +10,22 @@ import { buildScenarioPlans } from "../features/rigMoves/simulation.js";
 
 const { useDeferredValue, useEffect, useMemo, useRef, useState } = React;
 
+function normalizeTruckTypeLabel(type) {
+  const normalized = String(type || "").trim().toLowerCase();
+  if (normalized === "support") {
+    return "Low bed";
+  }
+  return type || "Truck";
+}
+
 function normalizeTruckSetup(move) {
   const source = move?.truckSetup?.length ? move.truckSetup : move?.simulation?.truckSetup || [];
 
   if (source.length) {
     return source.map((item, index) => ({
       id: item.id || `truck-${index + 1}`,
-      type: item.type || "Truck",
-      count: String(item.count ?? 0),
+      type: normalizeTruckTypeLabel(item.type),
+      count: String(Math.max(1, Number.parseInt(item.count, 10) || 1)),
     }));
   }
 
@@ -47,7 +55,7 @@ function TruckSetupEditor({ truckSetup, onChange, onAddRow, onRemoveRow }) {
           { label: index === 0 ? "Count" : "" },
           h(TextInput, {
             type: "number",
-            min: "0",
+            min: "1",
             value: truck.count,
             onChange: (event) => onChange(truck.id, "count", event.target.value),
           }),
@@ -169,20 +177,16 @@ function getPlanDashboardStats(scenario, move) {
   };
 }
 
-function getMinimumTruckCount(scenarios) {
-  return Math.max(1, Math.min(...scenarios.map((scenario) => Number.parseInt(scenario.truckCount, 10) || 1)));
-}
-
-function getSliderMaxCount(currentCount, minimumCount) {
-  return Math.max(minimumCount + 6, currentCount + 4);
+function getSliderMaxCount(currentCount) {
+  return Math.max(7, currentCount + 4);
 }
 
 function buildDisplayedTruckCounts(truckSetup, targetTotal) {
   const normalized = (truckSetup || [])
     .map((truck, index) => ({
       id: truck.id || `truck-${index + 1}`,
-      type: truck.type || "Truck",
-      count: Math.max(0, Number.parseInt(truck.count, 10) || 0),
+      type: normalizeTruckTypeLabel(truck.type),
+      count: Math.max(1, Number.parseInt(truck.count, 10) || 1),
     }))
     .filter((truck) => truck.type.trim());
 
@@ -196,7 +200,7 @@ function buildDisplayedTruckCounts(truckSetup, targetTotal) {
   if (currentTotal <= 0) {
     return normalized.map((truck, index) => ({
       ...truck,
-      count: index === 0 ? safeTotal : 0,
+      count: index === 0 ? safeTotal : 1,
     }));
   }
 
@@ -450,12 +454,14 @@ export function RigMovePage({
   currentMinute,
   sceneAssetsReady,
   onScenePlaybackReadyChange,
+  playbackSpeed = 1,
   isSimulating,
   isPlaybackRunning,
   isPlaybackPaused,
   sceneFocusResetKey,
   logicalLoads,
   simulationError,
+  onPlaybackSpeedChange,
   onSelectPlan,
   onRunPlayback,
   onRunCustomPlan,
@@ -466,13 +472,40 @@ export function RigMovePage({
   currentUser,
 }) {
   const previousMoveIdRef = useRef(move?.id || null);
+  const speedDropdownRef = useRef(null);
+  const [hasSceneInitialized, setHasSceneInitialized] = useState(Boolean(sceneAssetsReady));
   const [truckSetup, setTruckSetup] = useState(() => normalizeTruckSetup(move));
   const [activeScenarioName, setActiveScenarioName] = useState(move?.simulation?.preferredScenarioName || "");
   const [activePlanKey, setActivePlanKey] = useState(move?.simulation?.preferredScenarioName || "");
   const [activeView, setActiveView] = useState("map");
   const [focusedRigSide, setFocusedRigSide] = useState(null);
+  const [isSpeedDropdownOpen, setIsSpeedDropdownOpen] = useState(false);
 
   useEffect(() => {
+    if (sceneAssetsReady) {
+      setHasSceneInitialized(true);
+    }
+  }, [sceneAssetsReady]);
+
+  useEffect(() => {
+    if (!isSpeedDropdownOpen) {
+      return undefined;
+    }
+
+    const handlePointerDown = (event) => {
+      if (!speedDropdownRef.current?.contains(event.target)) {
+        setIsSpeedDropdownOpen(false);
+      }
+    };
+
+    window.addEventListener("pointerdown", handlePointerDown);
+    return () => {
+      window.removeEventListener("pointerdown", handlePointerDown);
+    };
+  }, [isSpeedDropdownOpen]);
+
+  useEffect(() => {
+    setHasSceneInitialized(Boolean(sceneAssetsReady));
     setTruckSetup(normalizeTruckSetup(move));
     setActiveScenarioName(move?.simulation?.preferredScenarioName || "");
     setActivePlanKey((current) => {
@@ -485,6 +518,7 @@ export function RigMovePage({
     });
     setActiveView("map");
     setFocusedRigSide(null);
+    setIsSpeedDropdownOpen(false);
   }, [move?.id, move?.updatedAt]);
 
   if (isLoadingMove) {
@@ -540,7 +574,6 @@ export function RigMovePage({
     scenarioPlans.find((scenario) => scenario.name === activeScenarioName) ||
     scenarioPlans[0];
   const totalTrucks = truckSetup.reduce((sum, item) => sum + (Number.parseInt(item.count, 10) || 0), 0);
-  const minimumTruckCount = getMinimumTruckCount(scenarioPlans);
   const isCustomizeActive = activePlanKey === "customize";
   const deferredTruckSetup = useDeferredValue(truckSetup);
   const deferredTotalTrucks = deferredTruckSetup.reduce((sum, item) => sum + (Number.parseInt(item.count, 10) || 0), 0);
@@ -568,14 +601,15 @@ export function RigMovePage({
   const displaySimulation = useMemo(
     () => ({
       ...move.simulation,
-      workerCount: activeScenario.workerCount,
-      truckCount: activeScenario.truckCount,
-      bestPlan: activeScenario.bestVariant,
-      bestScenario: activeScenario,
-      routeGeometry: activeScenario.routeGeometry,
-      routeMinutes: activeScenario.routeMinutes,
+      workerCount: selectedScenario.workerCount,
+      truckCount: selectedScenario.truckCount,
+      bestPlan: selectedScenario.bestVariant,
+      bestScenario: selectedScenario,
+      routeGeometry: selectedScenario.routeGeometry,
+      routeMinutes: selectedScenario.routeMinutes,
+      truckSetup: deferredTruckSetup,
     }),
-    [move.simulation, activeScenario],
+    [move.simulation, selectedScenario, deferredTruckSetup],
   );
 
   const totalMinutes = displaySimulation.bestPlan.totalMinutes;
@@ -603,22 +637,16 @@ export function RigMovePage({
   );
 
   function updateTruckCount(truckId, nextCountValue) {
-    const parsedCount = Math.max(0, Number.parseInt(nextCountValue, 10) || 0);
-    const currentTotalWithoutTarget = truckSetup.reduce(
-      (sum, item) => sum + (item.id === truckId ? 0 : Number.parseInt(item.count, 10) || 0),
-      0,
-    );
-    const minimumAllowedForTarget = Math.max(0, minimumTruckCount - currentTotalWithoutTarget);
-    const finalCount = Math.max(parsedCount, minimumAllowedForTarget);
+    const parsedCount = Math.max(1, Number.parseInt(nextCountValue, 10) || 1);
 
     setTruckSetup((current) =>
       current.map((item) =>
-        item.id === truckId ? { ...item, count: String(finalCount) } : item,
+        item.id === truckId ? { ...item, count: String(parsedCount) } : item,
       ),
     );
   }
 
-  if (!sceneAssetsReady) {
+  if (!sceneAssetsReady && !hasSceneInitialized) {
     return h(
       AppLayout,
       {
@@ -637,6 +665,15 @@ export function RigMovePage({
     );
   }
 
+  const playbackSpeedOptions = [
+    { value: "1", label: "Normal" },
+    { value: "15000", label: "Medium" },
+    { value: "50000", label: "Fast" },
+  ];
+  const activePlaybackSpeedOption =
+    playbackSpeedOptions.find((option) => option.value === String(playbackSpeed)) ||
+    playbackSpeedOptions[0];
+
   return activeView === "map"
     ? h(
         "main",
@@ -651,6 +688,8 @@ export function RigMovePage({
         h(SimulationScene3D, {
           startPoint: move.startPoint,
           endPoint: move.endPoint,
+          startLabel: move.startLabel,
+          endLabel: move.endLabel,
           simulation: displaySimulation,
           currentMinute: visibleMinute,
           sceneFocusResetKey,
@@ -659,6 +698,59 @@ export function RigMovePage({
           onReadyStateChange: onScenePlaybackReadyChange,
           onRigFocusChange: setFocusedRigSide,
         }),
+        h(
+          "div",
+          { className: "scene-move-info" },
+          h(
+            "div",
+            { className: "scene-move-info-grid" },
+            h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item scene-move-info-row-full" }, h("span", { className: "scene-dashboard-label" }, "From"), h("strong", null, move.startLabel || "Source")),
+            h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item scene-move-info-row-full" }, h("span", { className: "scene-dashboard-label" }, "To"), h("strong", null, move.endLabel || "Destination")),
+            h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Distance"), h("strong", null, `${move.routeKm || 0} km`)),
+            h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Travel"), h("strong", null, move.routeTime || formatMinutes(move.simulation?.routeMinutes || 0))),
+          ),
+        ),
+        isPlaybackRunning || isPlaybackPaused
+          ? h(
+              "div",
+              {
+                ref: speedDropdownRef,
+                className: `scene-speed-dropdown${isSpeedDropdownOpen ? " is-open" : ""}`,
+              },
+              h(
+                "button",
+                {
+                  type: "button",
+                  className: "scene-speed-select",
+                  onClick: () => setIsSpeedDropdownOpen((current) => !current),
+                  "aria-haspopup": "listbox",
+                  "aria-expanded": isSpeedDropdownOpen ? "true" : "false",
+                },
+                h("span", null, activePlaybackSpeedOption.label),
+              ),
+              isSpeedDropdownOpen
+                ? h(
+                    "div",
+                    { className: "scene-speed-menu", role: "listbox", "aria-label": "Playback speed" },
+                    playbackSpeedOptions.map((option) =>
+                      h(
+                        "button",
+                        {
+                          key: `speed-${option.value}`,
+                          type: "button",
+                          className: `scene-speed-option${String(playbackSpeed) === option.value ? " is-active" : ""}`,
+                          onClick: () => {
+                            onPlaybackSpeedChange?.(option.value === "1" ? 1 : option.value);
+                            setIsSpeedDropdownOpen(false);
+                          },
+                        },
+                        option.label,
+                      ),
+                    ),
+                  )
+                : null,
+            )
+          : null,
         h(
           "aside",
           { className: "scene-panel scene-panel-left scene-panel-left-merged" },
@@ -686,12 +778,11 @@ export function RigMovePage({
                           h("input", {
                             className: "truck-slider-input",
                             type: "range",
-                            min: "0",
-                            max: String(getSliderMaxCount(Number.parseInt(truck.count, 10) || 0, minimumTruckCount)),
+                            min: "1",
+                            max: String(getSliderMaxCount(Number.parseInt(truck.count, 10) || 0)),
                             step: "1",
                             value: truck.count,
                             onInput: (event) => updateTruckCount(truck.id, event.target.value),
-                            onChange: (event) => updateTruckCount(truck.id, event.target.value),
                           }),
                         ),
                       )

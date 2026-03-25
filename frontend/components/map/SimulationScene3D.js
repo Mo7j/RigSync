@@ -7,16 +7,21 @@ import { getTruckStatus, haversineKilometers } from "../../features/rigMoves/sim
 const { useEffect, useRef } = React;
 const assetLoader = new GLTFLoader();
 const assetTemplateCache = new Map();
+let platformEdgeFadeTexture = null;
 
 const MODEL_PATHS = {
-  truck: "/assets/models/heavy_truck.glb",
+  flatbedTruck: "/assets/models/FlatBed.glb",
+  lowbedTruck: "/assets/models/LowBed.glb",
+  heavyHaulerTruck: "/assets/models/HeavyHauler.glb",
   rig: "/assets/models/1.glb",
   terrain: "/assets/models/m.glb",
 };
 
 export function preloadSimulationSceneAssets() {
   return Promise.all([
-    loadModelTemplate("truck"),
+    loadModelTemplate("flatbedTruck"),
+    loadModelTemplate("lowbedTruck"),
+    loadModelTemplate("heavyHaulerTruck"),
     loadModelTemplate("rig"),
     loadModelTemplate("terrain"),
   ]);
@@ -48,6 +53,105 @@ function hashString(value) {
     hash |= 0;
   }
   return Math.abs(hash);
+}
+
+function getPlatformEdgeFadeTexture() {
+  if (platformEdgeFadeTexture) {
+    return platformEdgeFadeTexture;
+  }
+
+  const size = 256;
+  const inset = size * 0.18;
+  const canvas = document.createElement("canvas");
+  canvas.width = size;
+  canvas.height = size;
+  const context = canvas.getContext("2d");
+
+  if (!context) {
+    return null;
+  }
+
+  context.clearRect(0, 0, size, size);
+  const gradient = context.createRadialGradient(
+    size / 2,
+    size / 2,
+    size * 0.16,
+    size / 2,
+    size / 2,
+    size * 0.62,
+  );
+  gradient.addColorStop(0, "rgba(255,255,255,0)");
+  gradient.addColorStop(0.62, "rgba(255,255,255,0.06)");
+  gradient.addColorStop(0.82, "rgba(255,255,255,0.55)");
+  gradient.addColorStop(1, "rgba(255,255,255,1)");
+  context.fillStyle = gradient;
+  context.fillRect(0, 0, size, size);
+
+  context.globalCompositeOperation = "destination-out";
+  context.fillStyle = "rgba(0,0,0,1)";
+  context.fillRect(inset, inset, size - (inset * 2), size - (inset * 2));
+
+  platformEdgeFadeTexture = new THREE.CanvasTexture(canvas);
+  platformEdgeFadeTexture.needsUpdate = true;
+  return platformEdgeFadeTexture;
+}
+
+function normalizeTruckType(value) {
+  return String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[\s_-]+/g, "");
+}
+
+function getTruckModelKey(type) {
+  const normalized = normalizeTruckType(type);
+  if (normalized.includes("flatbed")) {
+    return "flatbedTruck";
+  }
+  if (normalized.includes("lowbed")) {
+    return "lowbedTruck";
+  }
+  if (normalized.includes("heavyhauler") || normalized.includes("heavyhaul")) {
+    return "heavyHaulerTruck";
+  }
+  return "lowbedTruck";
+}
+
+function buildTruckTypeAssignments(truckSetup, truckCount) {
+  const expanded = (truckSetup || [])
+    .flatMap((item) => {
+      const count = Math.max(0, Number.parseInt(item?.count, 10) || 0);
+      return Array.from({ length: count }, () => item?.type || "LowBed");
+    })
+    .slice(0, truckCount);
+
+  while (expanded.length < truckCount) {
+    expanded.push("LowBed");
+  }
+
+  return expanded;
+}
+
+function setTruckVariantVisible(truckRoot, truckType) {
+  const variantKey = getTruckModelKey(truckType);
+  const variants = truckRoot.userData?.truckVariants || {};
+  let didShowVariant = false;
+
+  Object.entries(variants).forEach(([key, variant]) => {
+    if (!variant) {
+      return;
+    }
+    const isVisible = key === variantKey;
+    variant.visible = isVisible;
+    didShowVariant ||= isVisible;
+  });
+
+  if (!didShowVariant && variants.fallback) {
+    variants.fallback.visible = true;
+  }
+
+  truckRoot.userData.truckType = truckType;
+  truckRoot.userData.activeTruckVariantKey = didShowVariant ? variantKey : "fallback";
 }
 
 function tintModel(root, color) {
@@ -176,17 +280,23 @@ function captureHighlightMaterials(root) {
 
 function applyHighlightState(capturedMaterials, color, strength = 0, options = {}) {
   const targetColor = new THREE.Color(color);
+  const hoverBaseColor = new THREE.Color(options.hoverBaseColor ?? 0x6a6553);
   const maxLineMix = options.maxLineMix ?? 0.7;
   const maxSurfaceMix = options.maxSurfaceMix ?? 0.42;
   const lineMixScale = options.lineMixScale ?? 0.58;
   const surfaceMixScale = options.surfaceMixScale ?? 0.5;
   const emissiveMixScale = options.emissiveMixScale ?? 0.5;
+  const baseMixScale = options.baseMixScale ?? 0.28;
   capturedMaterials.forEach(({ mesh, materials, isLine }) => {
     const materialList = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
     materialList.forEach((material, index) => {
       const original = materials[index];
       if (material.color && original?.color) {
-        material.color.copy(original.color).lerp(
+        material.color.copy(original.color);
+        if (!isLine) {
+          material.color.lerp(hoverBaseColor, Math.min(0.24, strength * baseMixScale));
+        }
+        material.color.lerp(
           targetColor,
           isLine
             ? Math.min(maxLineMix, strength * lineMixScale)
@@ -216,6 +326,7 @@ function applyRigComponentHoverState(capturedMaterials, color, strength = 0) {
     lineMixScale: 0.58,
     surfaceMixScale: 0.5,
     emissiveMixScale: 0.42,
+    baseMixScale: 0.28,
   });
 }
 
@@ -584,12 +695,12 @@ function createPadFallback(position, color, labelOffsetX) {
 
 function createRouteObjects(points) {
   if (points.length < 2) {
-    return { objects: [] };
+    return { objects: [], root: null };
   }
 
   const routeSegments = new THREE.Group();
   const routeMaterial = new THREE.MeshStandardMaterial({
-    color: 0x2d3339,
+    color: 0x31383f,
     emissive: 0x07090b,
     emissiveIntensity: 0.03,
     metalness: 0.12,
@@ -623,7 +734,7 @@ function createRouteObjects(points) {
   );
   routeLine.position.y = 1.16;
 
-  return { objects: [routeSegments, routeLine] };
+  return { objects: [routeSegments, routeLine], root: routeSegments };
 }
 
 function createRigBoard(position, routeDirection, radius = 18) {
@@ -734,12 +845,21 @@ function createRigBoard(position, routeDirection, radius = 18) {
   return [board, boardRing, fenceWall, fenceTopRing, ...fencePosts];
 }
 
+function getLocationLabel(label, fallback) {
+  if (!label || typeof label !== "string") {
+    return fallback;
+  }
+
+  const primary = label.split(",")[0]?.trim();
+  return primary || label.trim() || fallback;
+}
+
 function createFloor(extent) {
   const group = new THREE.Group();
   const size = Math.max(340, extent * 0.32);
 
   const base = new THREE.Mesh(
-    new THREE.PlaneGeometry(size, size),
+    new THREE.PlaneGeometry(size * 0.94, size * 0.94),
     new THREE.MeshBasicMaterial({
       color: 0x252a30,
     }),
@@ -759,12 +879,31 @@ function createFloor(extent) {
   innerPlate.position.y = 0.04;
   group.add(innerPlate);
 
+  const edgeFadeTexture = getPlatformEdgeFadeTexture();
+  if (edgeFadeTexture) {
+    const edgeFade = new THREE.Mesh(
+      new THREE.PlaneGeometry(size * 1.12, size * 1.12),
+      new THREE.MeshBasicMaterial({
+        color: 0x252a30,
+        alphaMap: edgeFadeTexture,
+        transparent: true,
+        opacity: 0.9,
+        depthWrite: false,
+      }),
+    );
+    edgeFade.rotation.x = -Math.PI / 2;
+    edgeFade.position.y = 0.01;
+    group.add(edgeFade);
+  }
+
   return group;
 }
 
 export function SimulationScene3D({
   startPoint,
   endPoint,
+  startLabel = "",
+  endLabel = "",
   simulation,
   currentMinute = 0,
   sceneFocusResetKey = 0,
@@ -878,14 +1017,13 @@ export function SimulationScene3D({
 
     const nextMaterials = Array.isArray(nextMesh.material) ? nextMesh.material : [nextMesh.material];
     const targetColor = new THREE.Color(0xfbbf24);
+    const hoverBaseColor = new THREE.Color(0x6a6553);
     nextMaterials.forEach((material, index) => {
       const original = nextMesh.userData.hoverOriginalMaterials?.[index];
       if (material.color) {
-        material.color.lerpColors(
-          original?.color || material.color,
-          targetColor,
-          Math.min(0.42, strength * 0.5),
-        );
+        material.color.copy(original?.color || material.color);
+        material.color.lerp(hoverBaseColor, Math.min(0.24, strength * 0.28));
+        material.color.lerp(targetColor, Math.min(0.42, strength * 0.5));
       }
       if ("emissive" in material && material.emissive) {
         const sourceEmissive = original?.emissive || material.emissive;
@@ -968,6 +1106,28 @@ export function SimulationScene3D({
     };
   }
 
+  function buildRouteTooltip(routeInfo) {
+    const distanceKm = Number.isFinite(routeInfo.distanceKm) ? routeInfo.distanceKm : 0;
+    return {
+      title: "Move Route",
+      state: "State: Source to destination",
+      assigned: `Distance: ${distanceKm.toFixed(1)} km`,
+      progress: "Path: Active haul corridor",
+      moving: `Connection: ${routeInfo.startName || "Source"} to ${routeInfo.endName || "Destination"}`,
+    };
+  }
+
+  function buildBoardTooltip(boardInfo) {
+    const point = boardInfo.point || {};
+    return {
+      title: boardInfo.locationName || `${boardInfo.side === "source" ? "Source" : "Destination"} Location`,
+      state: `State: ${boardInfo.side === "source" ? "Source location" : "Destination location"}`,
+      assigned: `Site: ${boardInfo.fullLabel || boardInfo.locationName || "Unknown location"}`,
+      progress: `Coordinates: ${Number(point.lat || 0).toFixed(4)}, ${Number(point.lng || 0).toFixed(4)}`,
+      moving: `Role: ${boardInfo.side === "source" ? "Origin rig pad" : "Destination rig pad"}`,
+    };
+  }
+
   useEffect(() => {
     sceneFocusResetKeyRef.current = sceneFocusResetKey;
   }, [sceneFocusResetKey]);
@@ -1046,7 +1206,7 @@ export function SimulationScene3D({
 
     function getParkingWorld(anchor, truckId) {
       const slotIndex = Math.max(0, truckId - 1);
-      const truckCount = Math.max(1, truckMeshes.size);
+      const truckCount = Math.max(1, simulationRef.current?.truckCount || truckMeshes.size);
       const centeredIndex = slotIndex - ((truckCount - 1) / 2);
 
       return anchor.clone().add(routeSideWorld.clone().multiplyScalar(centeredIndex * 11));
@@ -1155,6 +1315,7 @@ export function SimulationScene3D({
     const routeObjects = createRouteObjects(projectedRoute);
     routeObjects.objects.forEach((object) => routeGroup.add(object));
     scene.add(routeGroup);
+    const truckPoolCount = Math.max(24, simulation?.truckCount || 0, (simulation?.truckSetup?.length || 1) * 8);
 
     const truckAccent = 0x647587;
     const padAssetsGroup = new THREE.Group();
@@ -1167,7 +1328,35 @@ export function SimulationScene3D({
     const pulseTargets = [];
     const rigPickTargets = [];
     const truckPickTargets = [];
+    const boardPickTargets = [];
+    const routePickTargets = [];
     const highlightTargets = new Map();
+
+    if (routeObjects.root) {
+      routeObjects.root.userData = {
+        ...routeObjects.root.userData,
+        routeInfo: {
+          distanceKm: measuredRouteMetrics.totalKm,
+          startName: getLocationLabel(startLabel, "Source"),
+          endName: getLocationLabel(endLabel, "Destination"),
+        },
+        highlightKey: "move-route",
+      };
+      routePickTargets.push(routeObjects.root);
+      highlightTargets.set("move-route", {
+        root: routeObjects.root,
+        capturedMaterials: captureHighlightMaterials(routeObjects.root),
+        color: 0xfbbf24,
+        kind: "route",
+        intensityFactor: 0.52,
+        highlightOptions: {
+          maxSurfaceMix: 0.24,
+          surfaceMixScale: 0.3,
+          emissiveMixScale: 0.22,
+        },
+        baseScale: routeObjects.root.scale.clone(),
+      });
+    }
 
     function registerPulseTargets(root) {
       root.traverse((child) => {
@@ -1178,23 +1367,39 @@ export function SimulationScene3D({
     }
 
     function createTruckInstance(truckId) {
-      const truckMesh = createTruckFallbackMesh(truckAccent);
-      truckMesh.visible = false;
-      truckMesh.userData = { truckId, status: "" };
-      return truckMesh;
+      const truckRoot = new THREE.Group();
+      const fallbackMesh = createTruckFallbackMesh(truckAccent);
+      truckRoot.add(fallbackMesh);
+      truckRoot.visible = false;
+      truckRoot.userData = {
+        truckId,
+        status: "",
+        truckVariants: {
+          fallback: fallbackMesh,
+        },
+        activeTruckVariantKey: "fallback",
+      };
+      return truckRoot;
     }
 
     async function buildAssets() {
-      let truckTemplate = null;
+      const truckTemplates = {};
       let rigTemplate = null;
       let terrainTemplate = null;
 
       try {
-        [truckTemplate, rigTemplate, terrainTemplate] = await Promise.all([
-          loadModelTemplate("truck"),
+        const [flatbedTruckTemplate, lowbedTruckTemplate, heavyHaulerTruckTemplate, nextRigTemplate, nextTerrainTemplate] = await Promise.all([
+          loadModelTemplate("flatbedTruck"),
+          loadModelTemplate("lowbedTruck"),
+          loadModelTemplate("heavyHaulerTruck"),
           loadModelTemplate("rig"),
           loadModelTemplate("terrain"),
         ]);
+        truckTemplates.flatbedTruck = flatbedTruckTemplate;
+        truckTemplates.lowbedTruck = lowbedTruckTemplate;
+        truckTemplates.heavyHaulerTruck = heavyHaulerTruckTemplate;
+        rigTemplate = nextRigTemplate;
+        terrainTemplate = nextTerrainTemplate;
       } catch (error) {
         console.warn("3D assets failed to load, using fallback geometry instead.", error);
       }
@@ -1242,7 +1447,35 @@ export function SimulationScene3D({
       }
 
       if (startPoint) {
-        createRigBoard(projection.project(startPoint, 0), routeDirectionWorld, 18).forEach((part) => padAssetsGroup.add(part));
+        const startBoardParts = createRigBoard(projection.project(startPoint, 0), routeDirectionWorld, 18);
+        const startBoardGroup = new THREE.Group();
+        startBoardGroup.userData = {
+          boardInfo: {
+            side: "source",
+            locationName: getLocationLabel(startLabel, "Source"),
+            fullLabel: startLabel,
+            point: startPoint,
+          },
+          highlightKey: "rig-board-source",
+        };
+        startBoardParts.forEach((part) => {
+          startBoardGroup.add(part);
+        });
+        boardPickTargets.push(startBoardGroup);
+        highlightTargets.set("rig-board-source", {
+          root: startBoardGroup,
+          capturedMaterials: captureHighlightMaterials(startBoardGroup),
+          color: 0xfbbf24,
+          kind: "board",
+          intensityFactor: 0.46,
+          highlightOptions: {
+            maxSurfaceMix: 0.34,
+            surfaceMixScale: 0.42,
+            emissiveMixScale: 0.38,
+          },
+          baseScale: startBoardGroup.scale.clone(),
+        });
+        padAssetsGroup.add(startBoardGroup);
         const startAsset = rigTemplate
           ? centerAndScaleModel(cloneModelWithUniqueMaterials(rigTemplate), { targetWidth: 49, targetHeight: 27, lift: 0 })
           : createPadFallback(projection.project(startPoint, 0), 0x1de9d5, -6);
@@ -1298,7 +1531,35 @@ export function SimulationScene3D({
       }
 
       if (endPoint) {
-        createRigBoard(projection.project(endPoint, 0), routeDirectionWorld.clone().multiplyScalar(-1), 22).forEach((part) => padAssetsGroup.add(part));
+        const endBoardParts = createRigBoard(projection.project(endPoint, 0), routeDirectionWorld.clone().multiplyScalar(-1), 22);
+        const endBoardGroup = new THREE.Group();
+        endBoardGroup.userData = {
+          boardInfo: {
+            side: "destination",
+            locationName: getLocationLabel(endLabel, "Destination"),
+            fullLabel: endLabel,
+            point: endPoint,
+          },
+          highlightKey: "rig-board-destination",
+        };
+        endBoardParts.forEach((part) => {
+          endBoardGroup.add(part);
+        });
+        boardPickTargets.push(endBoardGroup);
+        highlightTargets.set("rig-board-destination", {
+          root: endBoardGroup,
+          capturedMaterials: captureHighlightMaterials(endBoardGroup),
+          color: 0xfbbf24,
+          kind: "board",
+          intensityFactor: 0.46,
+          highlightOptions: {
+            maxSurfaceMix: 0.34,
+            surfaceMixScale: 0.42,
+            emissiveMixScale: 0.38,
+          },
+          baseScale: endBoardGroup.scale.clone(),
+        });
+        padAssetsGroup.add(endBoardGroup);
         const endAsset = rigTemplate
           ? centerAndScaleModel(cloneModelWithUniqueMaterials(rigTemplate), { targetWidth: 63, targetHeight: 36, lift: 0 })
           : createPadFallback(projection.project(endPoint, 0), 0xc6ff00, 6);
@@ -1353,26 +1614,47 @@ export function SimulationScene3D({
         registerPulseTargets(endAsset);
       }
 
-      for (let truckId = 1; truckId <= (simulation?.truckCount || 0); truckId += 1) {
-        const truckMesh = truckTemplate
-          ? cloneModelWithUniqueMaterials(truckTemplate)
-          : createTruckInstance(truckId);
-        if (truckTemplate) {
-          tintModel(truckMesh, truckAccent);
-          centerAndScaleModel(truckMesh, { targetWidth: 16.2, targetHeight: 9.2, lift: 0 });
-        }
-        truckMesh.visible = false;
-        truckMesh.userData = { truckId, status: "", highlightKey: `truck-${truckId}` };
-        trucksGroup.add(truckMesh);
-        truckMeshes.set(truckId, truckMesh);
-        truckPickTargets.push(truckMesh);
+      const initialTruckTypeAssignments = buildTruckTypeAssignments(simulationRef.current?.truckSetup, simulationRef.current?.truckCount || 0);
+      for (let truckId = 1; truckId <= truckPoolCount; truckId += 1) {
+        const truckRoot = createTruckInstance(truckId);
+        const truckVariants = {};
+
+        ["flatbedTruck", "lowbedTruck", "heavyHaulerTruck"].forEach((variantKey) => {
+          const variantTemplate = truckTemplates[variantKey];
+          if (!variantTemplate) {
+            return;
+          }
+
+          const variantMesh = cloneModelWithUniqueMaterials(variantTemplate);
+          tintModel(variantMesh, truckAccent);
+          centerAndScaleModel(variantMesh, { targetWidth: 16.2, targetHeight: 9.2, lift: 0 });
+          variantMesh.visible = false;
+          truckRoot.add(variantMesh);
+          truckVariants[variantKey] = variantMesh;
+        });
+
+        truckRoot.visible = false;
+        truckRoot.userData = {
+          ...truckRoot.userData,
+          truckId,
+          status: "",
+          highlightKey: `truck-${truckId}`,
+          truckVariants: {
+            ...truckVariants,
+            fallback: truckRoot.userData.truckVariants?.fallback || null,
+          },
+        };
+        setTruckVariantVisible(truckRoot, initialTruckTypeAssignments[truckId - 1] || "LowBed");
+        trucksGroup.add(truckRoot);
+        truckMeshes.set(truckId, truckRoot);
+        truckPickTargets.push(truckRoot);
         highlightTargets.set(`truck-${truckId}`, {
-          root: truckMesh,
-          capturedMaterials: captureHighlightMaterials(truckMesh),
+          root: truckRoot,
+          capturedMaterials: captureHighlightMaterials(truckRoot),
           color: 0xfbbf24,
           kind: "truck",
           intensityFactor: 1,
-          baseScale: truckMesh.scale.clone(),
+          baseScale: truckRoot.scale.clone(),
         });
       }
 
@@ -1495,10 +1777,36 @@ export function SimulationScene3D({
         return;
       }
 
+      const boardIntersections = raycaster.intersectObjects(boardPickTargets, true);
+      const boardHit = boardIntersections.find((entry) => findAncestorWithUserData(entry.object, "boardInfo"));
+      const routeIntersections = raycaster.intersectObjects(routePickTargets, true);
+      const routeHit = routeIntersections.find((entry) => findAncestorWithUserData(entry.object, "routeInfo"));
       const intersections = raycaster.intersectObjects(rigPickTargets, true);
       const hit = intersections.find((entry) => findAncestorWithUserData(entry.object, "rigComponent"));
 
       if (!hit) {
+        if (boardHit) {
+          setRigComponentDirectHover(null);
+          const boardRoot = findAncestorWithUserData(boardHit.object, "boardInfo");
+          hoveredObjectRef.current = boardRoot?.userData?.highlightKey || null;
+          renderer.domElement.style.cursor = "pointer";
+          setTooltipState(buildBoardTooltip(boardRoot?.userData?.boardInfo || {}), {
+            x: event.clientX + 18,
+            y: event.clientY + 18,
+          });
+          return;
+        }
+        if (routeHit) {
+          setRigComponentDirectHover(null);
+          const routeRoot = findAncestorWithUserData(routeHit.object, "routeInfo");
+          hoveredObjectRef.current = routeRoot?.userData?.highlightKey || null;
+          renderer.domElement.style.cursor = "pointer";
+          setTooltipState(buildRouteTooltip(routeRoot?.userData?.routeInfo || {}), {
+            x: event.clientX + 18,
+            y: event.clientY + 18,
+          });
+          return;
+        }
         setRigComponentDirectHover(null);
         hoveredObjectRef.current = null;
         renderer.domElement.style.cursor = "grab";
@@ -1547,6 +1855,8 @@ export function SimulationScene3D({
       const playback = nextSimulation?.bestPlan?.playback;
       const minute = currentMinuteRef.current;
       const routeDistanceKm = Math.max(measuredRouteMetrics.totalKm, 0.001);
+      const activeTruckCount = Math.max(1, nextSimulation?.truckCount || 0);
+      const truckTypeAssignments = buildTruckTypeAssignments(nextSimulation?.truckSetup, activeTruckCount);
       const totalTrips = Math.max(playback?.trips?.length || 0, 1);
 
       if (!assetsReadyRef.current) {
@@ -1620,6 +1930,16 @@ export function SimulationScene3D({
       }
 
       truckMeshes.forEach((mesh, truckId) => {
+        if (truckId > activeTruckCount) {
+          mesh.visible = false;
+          return;
+        }
+
+        const assignedTruckType = truckTypeAssignments[truckId - 1] || "LowBed";
+        if (mesh.userData?.truckType !== assignedTruckType) {
+          setTruckVariantVisible(mesh, assignedTruckType);
+        }
+
         const truckTrips = playback?.trips?.filter((trip) => trip.truckId === truckId) || [];
         if (!truckTrips.length) {
           mesh.visible = false;
@@ -1827,7 +2147,7 @@ export function SimulationScene3D({
       });
       host.innerHTML = "";
     };
-  }, [startPoint, endPoint, simulation]);
+  }, [startPoint, endPoint, startLabel, endLabel]);
 
   return h(
     "div",
