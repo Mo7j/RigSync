@@ -11,12 +11,14 @@ const assetTemplateCache = new Map();
 const MODEL_PATHS = {
   truck: "/assets/models/heavy_truck.glb",
   rig: "/assets/models/1.glb",
+  terrain: "/assets/models/m.glb",
 };
 
 export function preloadSimulationSceneAssets() {
   return Promise.all([
     loadModelTemplate("truck"),
     loadModelTemplate("rig"),
+    loadModelTemplate("terrain"),
   ]);
 }
 
@@ -56,27 +58,38 @@ function tintModel(root, color) {
     }
 
     const partSeed = hashString(`${child.name || "mesh"}-${child.uuid}`).toString();
-    const toneOffset = (hashString(partSeed) % 7) / 100;
-    const shadeBase = 0.24 + toneOffset;
-    const detailTone = new THREE.Color().setRGB(shadeBase, shadeBase + 0.015, shadeBase + 0.03);
-    const accentMix = 0.05 + ((hashString(`${partSeed}-accent`) % 4) / 100);
+    const toneOffset = (hashString(partSeed) % 11) / 100;
+    const shadowTone = tint.clone().lerp(new THREE.Color(0x050608), 0.3 + toneOffset);
+    const midShadowTone = tint.clone().lerp(new THREE.Color(0x1f252c), 0.18 + toneOffset);
+    const steelTone = tint.clone().lerp(new THREE.Color(0x66707a), 0.1 + ((hashString(`${partSeed}-steel`) % 5) / 100));
+    const coolLiftTone = tint.clone().lerp(new THREE.Color(0x7e8994), 0.14 + ((hashString(`${partSeed}-cool`) % 6) / 100));
+    const warmDustTone = tint.clone().lerp(new THREE.Color(0x6b6359), 0.08 + ((hashString(`${partSeed}-dust`) % 4) / 100));
+    const shadowMix = 0.16 + ((hashString(`${partSeed}-shadow`) % 8) / 100);
+    const midShadowMix = 0.1 + ((hashString(`${partSeed}-mid`) % 6) / 100);
+    const steelMix = 0.07 + ((hashString(`${partSeed}-accent`) % 5) / 100);
+    const coolLiftMix = 0.05 + ((hashString(`${partSeed}-highlight`) % 4) / 100);
+    const warmDustMix = 0.03 + ((hashString(`${partSeed}-dustmix`) % 3) / 100);
     const materials = Array.isArray(child.material) ? child.material : [child.material];
     materials.forEach((material) => {
       if (material.color) {
-        material.color.lerp(detailTone, 0.88);
-        material.color.lerp(tint, accentMix);
+        material.color.copy(tint);
+        material.color.lerp(shadowTone, shadowMix);
+        material.color.lerp(midShadowTone, midShadowMix);
+        material.color.lerp(steelTone, steelMix);
+        material.color.lerp(coolLiftTone, coolLiftMix);
+        material.color.lerp(warmDustTone, warmDustMix);
       }
       if ("metalness" in material) {
         const metalnessOffset = (hashString(`${partSeed}-metal`) % 14) / 100;
-        material.metalness = Math.min(Math.max((material.metalness ?? 0.24) * 0.72, 0.12), 0.22 + metalnessOffset);
+        material.metalness = Math.min(Math.max((material.metalness ?? 0.24) * 0.82, 0.14), 0.26 + metalnessOffset);
       }
       if ("roughness" in material) {
         const roughnessOffset = (hashString(`${partSeed}-rough`) % 10) / 100;
-        material.roughness = Math.min(Math.max((material.roughness ?? 0.76) * 0.92, 0.48), 0.82 + roughnessOffset);
+        material.roughness = Math.min(Math.max((material.roughness ?? 0.76) * 0.9, 0.42), 0.78 + roughnessOffset);
       }
       if ("emissive" in material && material.emissive) {
-        material.emissive.copy(tint).multiplyScalar(0.03 + accentMix);
-        material.emissiveIntensity = 0.02;
+        material.emissive.copy(shadowTone).lerp(steelTone, 0.35).multiplyScalar(0.026);
+        material.emissiveIntensity = 0.026;
       }
     });
   });
@@ -102,6 +115,43 @@ function addAccentLines(root, color, opacity = 0.72) {
   });
 }
 
+function applyTerrainVertexColors(mesh, baseColor, topShadow, topHighlight) {
+  if (!mesh.geometry?.attributes?.position) {
+    mesh.material = new THREE.MeshBasicMaterial({ color: baseColor });
+    return;
+  }
+
+  const geometry = mesh.geometry.clone();
+  const position = geometry.attributes.position;
+  geometry.computeVertexNormals();
+  const normals = geometry.attributes.normal;
+  const colorValues = new Float32Array(position.count * 3);
+  geometry.computeBoundingBox();
+  const minY = geometry.boundingBox?.min.y ?? 0;
+  const maxY = geometry.boundingBox?.max.y ?? 1;
+  const height = Math.max(maxY - minY, 0.001);
+
+  for (let index = 0; index < position.count; index += 1) {
+    const y = position.getY(index);
+    const heightRatio = Math.max(0, Math.min(1, (y - minY) / height));
+    const normalY = normals ? normals.getY(index) : 1;
+    const slopeStrength = 1 - Math.max(0, Math.min(1, normalY));
+    const topBlend = Math.max(0, (heightRatio - 0.1) / 0.9);
+    const layeredColor = baseColor.clone();
+
+    layeredColor.lerp(topShadow, topBlend * (0.84 + (slopeStrength * 0.62)));
+    layeredColor.lerp(topHighlight, topBlend * 0.28 * Math.max(0.15, 1 - (slopeStrength * 0.9)));
+
+    colorValues[(index * 3)] = layeredColor.r;
+    colorValues[(index * 3) + 1] = layeredColor.g;
+    colorValues[(index * 3) + 2] = layeredColor.b;
+  }
+
+  geometry.setAttribute("color", new THREE.BufferAttribute(colorValues, 3));
+  mesh.geometry = geometry;
+  mesh.material = new THREE.MeshBasicMaterial({ vertexColors: true });
+}
+
 function captureHighlightMaterials(root) {
   const materials = [];
   root.traverse((child) => {
@@ -124,17 +174,27 @@ function captureHighlightMaterials(root) {
   return materials;
 }
 
-function applyHighlightState(capturedMaterials, color, strength = 0) {
+function applyHighlightState(capturedMaterials, color, strength = 0, options = {}) {
   const targetColor = new THREE.Color(color);
+  const maxLineMix = options.maxLineMix ?? 0.7;
+  const maxSurfaceMix = options.maxSurfaceMix ?? 0.42;
+  const lineMixScale = options.lineMixScale ?? 0.58;
+  const surfaceMixScale = options.surfaceMixScale ?? 0.5;
+  const emissiveMixScale = options.emissiveMixScale ?? 0.5;
   capturedMaterials.forEach(({ mesh, materials, isLine }) => {
     const materialList = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
     materialList.forEach((material, index) => {
       const original = materials[index];
       if (material.color && original?.color) {
-        material.color.copy(original.color).lerp(targetColor, isLine ? Math.min(0.7, strength * 0.58) : Math.min(0.42, strength * 0.5));
+        material.color.copy(original.color).lerp(
+          targetColor,
+          isLine
+            ? Math.min(maxLineMix, strength * lineMixScale)
+            : Math.min(maxSurfaceMix, strength * surfaceMixScale),
+        );
       }
       if ("emissive" in material && material.emissive && original?.emissive) {
-        material.emissive.copy(original.emissive).lerp(targetColor, Math.min(0.48, strength * 0.5));
+        material.emissive.copy(original.emissive).lerp(targetColor, Math.min(0.48, strength * emissiveMixScale));
         material.emissiveIntensity = original.emissiveIntensity + (strength * 0.18);
       }
       if ("opacity" in material && material.transparent && original) {
@@ -146,6 +206,16 @@ function applyHighlightState(capturedMaterials, color, strength = 0) {
         material.transparent = true;
       }
     });
+  });
+}
+
+function applyRigComponentHoverState(capturedMaterials, color, strength = 0) {
+  applyHighlightState(capturedMaterials, color, strength, {
+    maxLineMix: 0.7,
+    maxSurfaceMix: 0.42,
+    lineMixScale: 0.58,
+    surfaceMixScale: 0.5,
+    emissiveMixScale: 0.42,
   });
 }
 
@@ -519,11 +589,11 @@ function createRouteObjects(points) {
 
   const routeSegments = new THREE.Group();
   const routeMaterial = new THREE.MeshStandardMaterial({
-    color: 0x6f7782,
-    emissive: 0x2f353d,
-    emissiveIntensity: 0.16,
-    metalness: 0.18,
-    roughness: 0.56,
+    color: 0x2d3339,
+    emissive: 0x07090b,
+    emissiveIntensity: 0.03,
+    metalness: 0.12,
+    roughness: 0.78,
     transparent: true,
     opacity: 0.94,
   });
@@ -548,12 +618,120 @@ function createRouteObjects(points) {
     new THREE.LineBasicMaterial({
       color: 0xb0b7c0,
       transparent: true,
-      opacity: 0.52,
+      opacity: 0,
     }),
   );
   routeLine.position.y = 1.16;
 
   return { objects: [routeSegments, routeLine] };
+}
+
+function createRigBoard(position, routeDirection, radius = 18) {
+  const boardHeight = 2.4;
+  const approachDirection = routeDirection.clone().setY(0);
+  if (approachDirection.lengthSq() < 0.0001) {
+    approachDirection.set(0, 0, 1);
+  } else {
+    approachDirection.normalize();
+  }
+  const openingHalfAngle = Math.PI / 5.5;
+  const openingCenterAngle = Math.atan2(approachDirection.z, approachDirection.x);
+  const fenceStartAngle = openingCenterAngle + openingHalfAngle;
+  const fenceArcAngle = (Math.PI * 2) - (openingHalfAngle * 2);
+  const board = new THREE.Mesh(
+    new THREE.CylinderGeometry(radius, radius, boardHeight, 48),
+    new THREE.MeshStandardMaterial({
+      color: 0x2d3339,
+      emissive: 0x050608,
+      emissiveIntensity: 0.03,
+      metalness: 0.12,
+      roughness: 0.78,
+      transparent: true,
+      opacity: 0.94,
+    }),
+  );
+  board.position.copy(position);
+  board.position.y = boardHeight / 2;
+  board.receiveShadow = true;
+
+  const boardRing = new THREE.Mesh(
+    new THREE.RingGeometry(radius * 0.8, radius * 0.84, 64),
+    new THREE.MeshStandardMaterial({
+      color: 0x333940,
+      emissive: 0x06080a,
+      emissiveIntensity: 0.02,
+      metalness: 0.08,
+      roughness: 0.84,
+      transparent: true,
+      opacity: 0.32,
+      side: THREE.DoubleSide,
+      polygonOffset: true,
+      polygonOffsetFactor: -1,
+      polygonOffsetUnits: -2,
+    }),
+  );
+  boardRing.position.copy(position);
+  boardRing.position.y = boardHeight + 0.01;
+  boardRing.rotation.x = Math.PI / 2;
+
+  const fenceWall = new THREE.Mesh(
+    new THREE.CylinderGeometry(radius * 0.96, radius * 0.96, 1.4, 48, 1, true, fenceStartAngle, fenceArcAngle),
+    new THREE.MeshStandardMaterial({
+      color: 0x30363d,
+      emissive: 0x06080a,
+      emissiveIntensity: 0.02,
+      metalness: 0.12,
+      roughness: 0.82,
+      transparent: true,
+      opacity: 0.55,
+      side: THREE.DoubleSide,
+    }),
+  );
+  fenceWall.position.copy(position);
+  fenceWall.position.y = boardHeight + 0.7;
+
+  const fenceTopRing = new THREE.Mesh(
+    new THREE.TorusGeometry(radius * 0.96, 0.16, 16, 64, fenceArcAngle),
+    new THREE.MeshStandardMaterial({
+      color: 0x383f47,
+      emissive: 0x06080a,
+      emissiveIntensity: 0.02,
+      metalness: 0.14,
+      roughness: 0.8,
+    }),
+  );
+  fenceTopRing.position.copy(position);
+  fenceTopRing.position.y = boardHeight + 1.42;
+  fenceTopRing.rotation.x = Math.PI / 2;
+  fenceTopRing.rotation.z = fenceStartAngle;
+
+  const fencePosts = [];
+  const postCount = 12;
+  for (let index = 0; index < postCount; index += 1) {
+    const angle = (index / postCount) * Math.PI * 2;
+    const radialDirection = new THREE.Vector3(Math.cos(angle), 0, Math.sin(angle));
+    if (radialDirection.angleTo(approachDirection) < openingHalfAngle) {
+      continue;
+    }
+    const post = new THREE.Mesh(
+      new THREE.CylinderGeometry(0.16, 0.16, 1.4, 12),
+      new THREE.MeshStandardMaterial({
+        color: 0x343b42,
+        emissive: 0x06080a,
+        emissiveIntensity: 0.02,
+        metalness: 0.14,
+        roughness: 0.78,
+      }),
+    );
+    post.position.set(
+      position.x + (Math.cos(angle) * radius * 0.96),
+      boardHeight + 0.7,
+      position.z + (Math.sin(angle) * radius * 0.96),
+    );
+    fencePosts.push(post);
+  }
+
+  return [board, boardRing, fenceWall, fenceTopRing, ...fencePosts];
 }
 
 function createFloor(extent) {
@@ -562,10 +740,8 @@ function createFloor(extent) {
 
   const base = new THREE.Mesh(
     new THREE.PlaneGeometry(size, size),
-    new THREE.MeshStandardMaterial({
-      color: 0x21252a,
-      metalness: 0.12,
-      roughness: 0.96,
+    new THREE.MeshBasicMaterial({
+      color: 0x252a30,
     }),
   );
   base.rotation.x = -Math.PI / 2;
@@ -573,43 +749,15 @@ function createFloor(extent) {
 
   const innerPlate = new THREE.Mesh(
     new THREE.PlaneGeometry(size * 0.9, size * 0.9),
-    new THREE.MeshStandardMaterial({
-      color: 0x2b3036,
-      metalness: 0.16,
-      roughness: 0.88,
+    new THREE.MeshBasicMaterial({
+      color: 0x252a30,
+      transparent: true,
+      opacity: 0.92,
     }),
   );
   innerPlate.rotation.x = -Math.PI / 2;
   innerPlate.position.y = 0.04;
   group.add(innerPlate);
-
-  const panelField = new THREE.Mesh(
-    new THREE.PlaneGeometry(size * 0.86, size * 0.86, 14, 14),
-    new THREE.MeshStandardMaterial({
-      color: 0x30353c,
-      metalness: 0.18,
-      roughness: 0.84,
-      wireframe: true,
-      transparent: true,
-      opacity: 0.1,
-    }),
-  );
-  panelField.rotation.x = -Math.PI / 2;
-  panelField.position.y = 0.06;
-  group.add(panelField);
-
-  const grid = new THREE.GridHelper(size, 12, 0x4b535c, 0x343a42);
-  grid.position.y = 0.08;
-  grid.material.transparent = true;
-  grid.material.opacity = 0.24;
-  group.add(grid);
-
-  const diagonalGrid = new THREE.GridHelper(size * 0.82, 8, 0x3f464f, 0x2d3339);
-  diagonalGrid.rotation.y = Math.PI / 4;
-  diagonalGrid.position.y = 0.1;
-  diagonalGrid.material.transparent = true;
-  diagonalGrid.material.opacity = 0.12;
-  group.add(diagonalGrid);
 
   return group;
 }
@@ -619,6 +767,7 @@ export function SimulationScene3D({
   endPoint,
   simulation,
   currentMinute = 0,
+  sceneFocusResetKey = 0,
   heightClass = "map-frame",
   showOverlay = true,
   onReadyStateChange = null,
@@ -628,6 +777,8 @@ export function SimulationScene3D({
   const overlayRef = useRef(null);
   const tooltipRef = useRef(null);
   const currentMinuteRef = useRef(currentMinute);
+  const sceneFocusResetKeyRef = useRef(sceneFocusResetKey);
+  const handledSceneFocusResetKeyRef = useRef(sceneFocusResetKey);
   const simulationRef = useRef(simulation);
   const assetsReadyRef = useRef(false);
   const truckHeadingRef = useRef(new Map());
@@ -642,6 +793,9 @@ export function SimulationScene3D({
     movingCount: 0,
   });
   const focusedRigSideRef = useRef(null);
+  const focusedTruckIdRef = useRef(null);
+  const focusedTruckOffsetRef = useRef(null);
+  const hoveredRigComponentRef = useRef(null);
   const cameraTransitioningRef = useRef(false);
   const hoveredObjectRef = useRef(null);
 
@@ -671,13 +825,75 @@ export function SimulationScene3D({
     }
 
     tooltip.dataset.visible = "true";
-    tooltip.style.left = `${position.x}px`;
-    tooltip.style.top = `${position.y}px`;
     tooltip.querySelector("[data-tooltip-title]").textContent = content.title;
     tooltip.querySelector("[data-tooltip-line='state']").textContent = content.state;
     tooltip.querySelector("[data-tooltip-line='assigned']").textContent = content.assigned;
     tooltip.querySelector("[data-tooltip-line='progress']").textContent = content.progress;
     tooltip.querySelector("[data-tooltip-line='moving']").textContent = content.moving;
+
+    const padding = 16;
+    const tooltipRect = tooltip.getBoundingClientRect();
+    const maxLeft = Math.max(padding, window.innerWidth - tooltipRect.width - padding);
+    const maxTop = Math.max(padding, window.innerHeight - tooltipRect.height - padding);
+    const clampedLeft = Math.min(Math.max(position.x, padding), maxLeft);
+    const clampedTop = Math.min(Math.max(position.y, padding), maxTop);
+
+    tooltip.style.left = `${clampedLeft}px`;
+    tooltip.style.top = `${clampedTop}px`;
+  }
+
+  function setRigComponentDirectHover(nextMesh, strength = 0.58) {
+    const previousMesh = hoveredRigComponentRef.current;
+    if (previousMesh && previousMesh !== nextMesh) {
+      const previousMaterials = Array.isArray(previousMesh.material) ? previousMesh.material : [previousMesh.material];
+      const previousOriginals = previousMesh.userData?.hoverOriginalMaterials || [];
+      previousMaterials.forEach((material, index) => {
+        const original = previousOriginals[index];
+        if (!original) {
+          return;
+        }
+        if (material.color && original.color) {
+          material.color.copy(original.color);
+        }
+        if ("emissive" in material && material.emissive && original.emissive) {
+          material.emissive.copy(original.emissive);
+          material.emissiveIntensity = original.emissiveIntensity;
+        }
+      });
+      hoveredRigComponentRef.current = null;
+    }
+
+    if (!nextMesh) {
+      return;
+    }
+
+    if (!nextMesh.userData.hoverOriginalMaterials) {
+      const materials = Array.isArray(nextMesh.material) ? nextMesh.material : [nextMesh.material];
+      nextMesh.userData.hoverOriginalMaterials = materials.map((material) => ({
+        color: material.color ? material.color.clone() : null,
+        emissive: "emissive" in material && material.emissive ? material.emissive.clone() : null,
+        emissiveIntensity: material.emissiveIntensity || 0,
+      }));
+    }
+
+    const nextMaterials = Array.isArray(nextMesh.material) ? nextMesh.material : [nextMesh.material];
+    const targetColor = new THREE.Color(0xfbbf24);
+    nextMaterials.forEach((material, index) => {
+      const original = nextMesh.userData.hoverOriginalMaterials?.[index];
+      if (material.color) {
+        material.color.lerpColors(
+          original?.color || material.color,
+          targetColor,
+          Math.min(0.42, strength * 0.5),
+        );
+      }
+      if ("emissive" in material && material.emissive) {
+        const sourceEmissive = original?.emissive || material.emissive;
+        material.emissive.lerpColors(sourceEmissive, targetColor, Math.min(0.48, strength * 0.5));
+        material.emissiveIntensity = (original?.emissiveIntensity || 0) + (strength * 0.18);
+      }
+    });
+    hoveredRigComponentRef.current = nextMesh;
   }
 
   function buildComponentTooltip(componentInfo) {
@@ -753,6 +969,10 @@ export function SimulationScene3D({
   }
 
   useEffect(() => {
+    sceneFocusResetKeyRef.current = sceneFocusResetKey;
+  }, [sceneFocusResetKey]);
+
+  useEffect(() => {
     if (!assetsReadyRef.current) {
       currentMinuteRef.current = 0;
       return;
@@ -776,6 +996,9 @@ export function SimulationScene3D({
     currentMinuteRef.current = 0;
     truckHeadingRef.current = new Map();
     focusedRigSideRef.current = null;
+    focusedTruckIdRef.current = null;
+    focusedTruckOffsetRef.current = null;
+    hoveredRigComponentRef.current = null;
     cameraTransitioningRef.current = false;
     hoveredObjectRef.current = null;
     rigVisualStateRef.current = {
@@ -802,16 +1025,50 @@ export function SimulationScene3D({
     const projectedRoute = straightRoutePoints.map((point) => projection.project(point, 1.2));
     const straightStartWorld = projectedRoute[0] || new THREE.Vector3(0, 1.2, 0);
     const straightEndWorld = projectedRoute[projectedRoute.length - 1] || new THREE.Vector3(0, 1.2, 0);
+    const platformSize = Math.max(340, projection.extent * 0.32);
+    const platformEdgeOffset = platformSize * 0.38;
+    const routeDirectionWorld = new THREE.Vector3(
+      straightEndWorld.x - straightStartWorld.x,
+      0,
+      straightEndWorld.z - straightStartWorld.z,
+    );
+    if (routeDirectionWorld.lengthSq() < 0.0001) {
+      routeDirectionWorld.set(1, 0, 0);
+    } else {
+      routeDirectionWorld.normalize();
+    }
+    const routeSideWorld = new THREE.Vector3(-routeDirectionWorld.z, 0, routeDirectionWorld.x).normalize();
+    const parkedTruckHeading = Math.atan2(routeDirectionWorld.x, routeDirectionWorld.z);
+    const sourceParkingAnchor = straightStartWorld.clone()
+      .add(routeDirectionWorld.clone().multiplyScalar(-30));
+    const destinationParkingAnchor = straightEndWorld.clone()
+      .add(routeDirectionWorld.clone().multiplyScalar(30));
+
+    function getParkingWorld(anchor, truckId) {
+      const slotIndex = Math.max(0, truckId - 1);
+      const truckCount = Math.max(1, truckMeshes.size);
+      const centeredIndex = slotIndex - ((truckCount - 1) / 2);
+
+      return anchor.clone().add(routeSideWorld.clone().multiplyScalar(centeredIndex * 11));
+    }
+
+    function getSourceParkingWorld(truckId) {
+      return getParkingWorld(sourceParkingAnchor, truckId);
+    }
+
+    function getDestinationParkingWorld(truckId) {
+      return getParkingWorld(destinationParkingAnchor, truckId);
+    }
 
     const scene = new THREE.Scene();
-    scene.background = new THREE.Color(0x1e2126);
+    scene.background = null;
     scene.fog = new THREE.FogExp2(0x25292f, 0.0018);
 
     const camera = new THREE.PerspectiveCamera(44, 1, 0.1, 1200);
     const cameraDistance = Math.max(120, Math.min(220, projection.extent * 0.12));
-    camera.position.set(cameraDistance, cameraDistance * 0.72, cameraDistance * 0.95);
+    camera.position.set(cameraDistance, cameraDistance * 0.56, cameraDistance * 1.02);
     const defaultCameraPosition = camera.position.clone();
-    const defaultTarget = new THREE.Vector3(0, 10, 0);
+    const defaultTarget = new THREE.Vector3(0, 7, 0);
     const zoomState = {
       currentTarget: defaultTarget.clone(),
       desiredTarget: defaultTarget.clone(),
@@ -842,10 +1099,19 @@ export function SimulationScene3D({
     controls.target.copy(defaultTarget);
     controls.minDistance = 16;
     controls.maxDistance = cameraDistance * 1.45;
-    controls.maxPolarAngle = Math.PI * 0.44;
-    controls.minPolarAngle = Math.PI * 0.24;
+    controls.maxPolarAngle = Math.PI * 0.4;
+    controls.minPolarAngle = Math.PI * 0.2;
+    const handleControlsStart = () => {
+      cameraTransitioningRef.current = false;
+      zoomState.currentTarget.copy(controls.target);
+      zoomState.desiredTarget.copy(controls.target);
+      zoomState.currentPosition.copy(camera.position);
+      zoomState.desiredPosition.copy(camera.position);
+    };
+    controls.addEventListener("start", handleControlsStart);
 
-    scene.add(createFloor(projection.extent));
+    const floorGroup = createFloor(projection.extent);
+    scene.add(floorGroup);
 
     const ambientLight = new THREE.AmbientLight(0xe2e5e9, 0.72);
     scene.add(ambientLight);
@@ -885,24 +1151,12 @@ export function SimulationScene3D({
     backGlow.position.set(0, 22, -48);
     scene.add(backGlow);
 
-    const groundShadow = new THREE.Mesh(
-      new THREE.CircleGeometry(78, 48),
-        new THREE.MeshBasicMaterial({
-          color: 0x161a1f,
-          transparent: true,
-          opacity: 0.22,
-        }),
-      );
-    groundShadow.rotation.x = -Math.PI / 2;
-    groundShadow.position.y = 0.12;
-    scene.add(groundShadow);
-
     const routeGroup = new THREE.Group();
     const routeObjects = createRouteObjects(projectedRoute);
     routeObjects.objects.forEach((object) => routeGroup.add(object));
     scene.add(routeGroup);
 
-    const truckAccent = 0x4d5560;
+    const truckAccent = 0x647587;
     const padAssetsGroup = new THREE.Group();
     scene.add(padAssetsGroup);
 
@@ -933,11 +1187,13 @@ export function SimulationScene3D({
     async function buildAssets() {
       let truckTemplate = null;
       let rigTemplate = null;
+      let terrainTemplate = null;
 
       try {
-        [truckTemplate, rigTemplate] = await Promise.all([
+        [truckTemplate, rigTemplate, terrainTemplate] = await Promise.all([
           loadModelTemplate("truck"),
           loadModelTemplate("rig"),
+          loadModelTemplate("terrain"),
         ]);
       } catch (error) {
         console.warn("3D assets failed to load, using fallback geometry instead.", error);
@@ -947,13 +1203,51 @@ export function SimulationScene3D({
         return;
       }
 
+      if (terrainTemplate) {
+        const terrainInset = platformSize * 0.31;
+        const terrainPresets = [
+          { x: -terrainInset * 0.82, z: -terrainInset * 0.64, width: 156, height: 36, rotation: Math.PI * 0.5 },
+          { x: terrainInset * 0.86, z: -terrainInset, width: 128, height: 29, rotation: -Math.PI * 0.5 },
+          { x: terrainInset * 0.18, z: terrainInset, width: 124, height: 27, rotation: Math.PI * 0.5 },
+        ];
+
+        terrainPresets.forEach(({ x, z, width, height, rotation }) => {
+          const terrainAsset = centerAndScaleModel(
+            cloneModelWithUniqueMaterials(terrainTemplate),
+            {
+              targetWidth: width,
+              targetHeight: height,
+              lift: 0,
+            },
+          );
+          const terrainBounds = new THREE.Box3().setFromObject(terrainAsset);
+          const terrainMinY = terrainBounds.min.y;
+          const terrainHeight = Math.max(terrainBounds.max.y - terrainMinY, 0.001);
+          const terrainBaseColor = new THREE.Color(0x252a30);
+          const terrainTopShadow = new THREE.Color(0x14181c);
+          const terrainTopHighlight = new THREE.Color(0x323941);
+          terrainAsset.traverse((child) => {
+            if (!child.isMesh || !child.material) {
+              return;
+            }
+
+            child.castShadow = false;
+            child.receiveShadow = false;
+            applyTerrainVertexColors(child, terrainBaseColor, terrainTopShadow, terrainTopHighlight);
+          });
+          terrainAsset.position.set(x, 0.18, z);
+          terrainAsset.rotation.y = rotation;
+          floorGroup.add(terrainAsset);
+        });
+      }
+
       if (startPoint) {
+        createRigBoard(projection.project(startPoint, 0), routeDirectionWorld, 18).forEach((part) => padAssetsGroup.add(part));
         const startAsset = rigTemplate
           ? centerAndScaleModel(cloneModelWithUniqueMaterials(rigTemplate), { targetWidth: 49, targetHeight: 27, lift: 0 })
           : createPadFallback(projection.project(startPoint, 0), 0x1de9d5, -6);
         if (rigTemplate) {
-          tintModel(startAsset, 0x6b7280);
-          addAccentLines(startAsset, 0x9ca3af, 0.42);
+          tintModel(startAsset, 0x596069);
           startAsset.rotation.y = Math.PI * 0.18;
           startAsset.position.copy(projection.project(startPoint, 1.6));
           const statusMeshes = collectStatusMeshes(startAsset);
@@ -968,8 +1262,14 @@ export function SimulationScene3D({
             highlightTargets.set(mesh.userData.highlightKey, {
               root: mesh,
               capturedMaterials: captureHighlightMaterials(mesh),
-              color: 0xe5e7eb,
+              color: 0xfbbf24,
               kind: "rig-component",
+              intensityFactor: 0.58,
+              highlightOptions: {
+                maxSurfaceMix: 0.42,
+                surfaceMixScale: 0.5,
+                emissiveMixScale: 0.5,
+              },
               baseScale: mesh.scale.clone(),
             });
           });
@@ -987,8 +1287,9 @@ export function SimulationScene3D({
         highlightTargets.set("rig-source", {
           root: startAsset,
           capturedMaterials: captureHighlightMaterials(startAsset),
-          color: 0x9ca3af,
+          color: 0xfbbf24,
           kind: "rig",
+          intensityFactor: 0.58,
           baseScale: startAsset.scale.clone(),
         });
         rigPickTargets.push(startAsset);
@@ -997,12 +1298,12 @@ export function SimulationScene3D({
       }
 
       if (endPoint) {
+        createRigBoard(projection.project(endPoint, 0), routeDirectionWorld.clone().multiplyScalar(-1), 22).forEach((part) => padAssetsGroup.add(part));
         const endAsset = rigTemplate
           ? centerAndScaleModel(cloneModelWithUniqueMaterials(rigTemplate), { targetWidth: 63, targetHeight: 36, lift: 0 })
           : createPadFallback(projection.project(endPoint, 0), 0xc6ff00, 6);
         if (rigTemplate) {
-          tintModel(endAsset, 0x6b7280);
-          addAccentLines(endAsset, 0x9ca3af, 0.42);
+          tintModel(endAsset, 0x596069);
           endAsset.rotation.y = -Math.PI * 0.12;
           endAsset.position.copy(projection.project(endPoint, 1.6));
           const statusMeshes = collectStatusMeshes(endAsset);
@@ -1017,8 +1318,14 @@ export function SimulationScene3D({
             highlightTargets.set(mesh.userData.highlightKey, {
               root: mesh,
               capturedMaterials: captureHighlightMaterials(mesh),
-              color: 0xe5e7eb,
+              color: 0xfbbf24,
               kind: "rig-component",
+              intensityFactor: 0.58,
+              highlightOptions: {
+                maxSurfaceMix: 0.42,
+                surfaceMixScale: 0.5,
+                emissiveMixScale: 0.5,
+              },
               baseScale: mesh.scale.clone(),
             });
           });
@@ -1036,8 +1343,9 @@ export function SimulationScene3D({
         highlightTargets.set("rig-destination", {
           root: endAsset,
           capturedMaterials: captureHighlightMaterials(endAsset),
-          color: 0x9ca3af,
+          color: 0xfbbf24,
           kind: "rig",
+          intensityFactor: 0.58,
           baseScale: endAsset.scale.clone(),
         });
         rigPickTargets.push(endAsset);
@@ -1063,6 +1371,7 @@ export function SimulationScene3D({
           capturedMaterials: captureHighlightMaterials(truckMesh),
           color: 0xfbbf24,
           kind: "truck",
+          intensityFactor: 1,
           baseScale: truckMesh.scale.clone(),
         });
       }
@@ -1094,13 +1403,32 @@ export function SimulationScene3D({
       const center = bounds.getCenter(new THREE.Vector3());
       const size = bounds.getSize(new THREE.Vector3());
       const focusDistance = Math.max(size.x, size.y, size.z, 18);
-      const direction = new THREE.Vector3(0.95, 0.62, 0.88).normalize();
+      const direction = new THREE.Vector3(0.98, 0.38, 0.94).normalize();
 
       zoomState.desiredTarget.copy(center);
-      zoomState.desiredTarget.y = Math.max(center.y, 6);
+      zoomState.desiredTarget.y = Math.max(center.y, 4.6);
       zoomState.desiredPosition.copy(center).add(direction.multiplyScalar(focusDistance * 1.8));
       focusedRigSideRef.current = targetObject.userData?.rigInfo?.side || null;
+      focusedTruckIdRef.current = null;
+      focusedTruckOffsetRef.current = null;
       onRigFocusChange?.(focusedRigSideRef.current);
+      cameraTransitioningRef.current = true;
+    }
+
+    function focusOnTruck(targetObject) {
+      const bounds = new THREE.Box3().setFromObject(targetObject);
+      const center = bounds.getCenter(new THREE.Vector3());
+      const size = bounds.getSize(new THREE.Vector3());
+      const focusDistance = Math.max(size.x, size.y, size.z, 10);
+      const direction = new THREE.Vector3(0.94, 0.3, 0.86).normalize();
+
+      zoomState.desiredTarget.copy(center);
+      zoomState.desiredTarget.y = Math.max(center.y, 2.8);
+      zoomState.desiredPosition.copy(center).add(direction.multiplyScalar(focusDistance * 2.4));
+      focusedRigSideRef.current = null;
+      focusedTruckIdRef.current = targetObject.userData?.truckId ?? null;
+      focusedTruckOffsetRef.current = zoomState.desiredPosition.clone().sub(zoomState.desiredTarget);
+      onRigFocusChange?.(null);
       cameraTransitioningRef.current = true;
     }
 
@@ -1108,6 +1436,8 @@ export function SimulationScene3D({
       zoomState.desiredTarget.copy(defaultTarget);
       zoomState.desiredPosition.copy(defaultCameraPosition);
       focusedRigSideRef.current = null;
+      focusedTruckIdRef.current = null;
+      focusedTruckOffsetRef.current = null;
       onRigFocusChange?.(null);
       cameraTransitioningRef.current = true;
     }
@@ -1121,6 +1451,17 @@ export function SimulationScene3D({
       pointer.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
       pointer.y = -(((event.clientY - rect.top) / rect.height) * 2 - 1);
       raycaster.setFromCamera(pointer, camera);
+      const truckIntersections = raycaster.intersectObjects(truckPickTargets, true);
+      const truckHit = truckIntersections.find((entry) => findAncestorWithUserData(entry.object, "truckId"));
+
+      if (truckHit) {
+        const truckRoot = findAncestorWithUserData(truckHit.object, "truckId");
+        if (truckRoot) {
+          focusOnTruck(truckRoot);
+          return;
+        }
+      }
+
       const intersections = raycaster.intersectObjects(rigPickTargets, true);
 
       if (!intersections.length) {
@@ -1143,6 +1484,7 @@ export function SimulationScene3D({
       const truckHit = truckIntersections.find((entry) => findAncestorWithUserData(entry.object, "truckId"));
 
       if (truckHit) {
+        setRigComponentDirectHover(null);
         const truckRoot = findAncestorWithUserData(truckHit.object, "truckId");
         hoveredObjectRef.current = truckRoot?.userData?.highlightKey || null;
         renderer.domElement.style.cursor = "pointer";
@@ -1157,6 +1499,7 @@ export function SimulationScene3D({
       const hit = intersections.find((entry) => findAncestorWithUserData(entry.object, "rigComponent"));
 
       if (!hit) {
+        setRigComponentDirectHover(null);
         hoveredObjectRef.current = null;
         renderer.domElement.style.cursor = "grab";
         setTooltipState();
@@ -1176,6 +1519,8 @@ export function SimulationScene3D({
           ? buildComponentTooltip(componentInfo)
           : buildRigTooltip(rigRoot?.userData?.rigInfo || { side: componentInfo.side, name: "Rig" });
 
+      setRigComponentDirectHover(showComponentDetail ? componentObject : null);
+
       setTooltipState(tooltipContent, {
         x: event.clientX + 18,
         y: event.clientY + 18,
@@ -1183,6 +1528,7 @@ export function SimulationScene3D({
     }
 
     function handlePointerLeave() {
+      setRigComponentDirectHover(null);
       hoveredObjectRef.current = null;
       renderer.domElement.style.cursor = "grab";
       setTooltipState();
@@ -1233,21 +1579,21 @@ export function SimulationScene3D({
       if (sourceState?.capturedMaterials?.length) {
         applyStatusPalette(sourceState.capturedMaterials, shiftedCount / totalTrips, {
           active: {
-            color: 0x22c55e,
-            emissive: 0x34d399,
-            mix: 0.94,
-            emissiveMix: 0.62,
-            emissiveIntensity: 0.38,
+            color: 0x3a4047,
+            emissive: 0x1a1f24,
+            mix: 0.82,
+            emissiveMix: 0.18,
+            emissiveIntensity: 0.08,
           },
           idle: {
-            color: 0x272f39,
-            emissive: 0x0b1015,
-            mix: 0.18,
-            emissiveMix: 0.06,
-            emissiveIntensity: 0.06,
+            color: 0x23282e,
+            emissive: 0x080b0e,
+            mix: 0.14,
+            emissiveMix: 0.04,
+            emissiveIntensity: 0.03,
           },
-          gradientStops: [0xef4444, 0xf59e0b, 0x22c55e],
-          emissiveStops: [0xb91c1c, 0xea580c, 0x10b981],
+          gradientStops: [0x23282e, 0x2b3138, 0x3a4047],
+          emissiveStops: [0x080b0e, 0x11161b, 0x1a1f24],
         });
       }
 
@@ -1255,21 +1601,21 @@ export function SimulationScene3D({
       if (destinationState?.capturedMaterials?.length) {
         applyStatusPalette(destinationState.capturedMaterials, riggedCount / totalTrips, {
           active: {
-            color: 0x22c55e,
-            emissive: 0x34d399,
-            mix: 0.94,
-            emissiveMix: 0.62,
-            emissiveIntensity: 0.38,
+            color: 0x3a4047,
+            emissive: 0x1a1f24,
+            mix: 0.82,
+            emissiveMix: 0.18,
+            emissiveIntensity: 0.08,
           },
           idle: {
-            color: 0x272f39,
-            emissive: 0x0b1015,
-            mix: 0.18,
-            emissiveMix: 0.06,
-            emissiveIntensity: 0.06,
+            color: 0x23282e,
+            emissive: 0x080b0e,
+            mix: 0.14,
+            emissiveMix: 0.04,
+            emissiveIntensity: 0.03,
           },
-          gradientStops: [0xef4444, 0xf59e0b, 0x22c55e],
-          emissiveStops: [0xb91c1c, 0xea580c, 0x10b981],
+          gradientStops: [0x23282e, 0x2b3138, 0x3a4047],
+          emissiveStops: [0x080b0e, 0x11161b, 0x1a1f24],
         });
       }
 
@@ -1292,13 +1638,16 @@ export function SimulationScene3D({
 
         if (!activeTrip) {
           if (deliveredTrip && !deliveredTrip.returnToSource) {
-            currentWorld = straightEndWorld;
-            nextWorld = straightEndWorld;
+            currentWorld = getDestinationParkingWorld(truckId);
+            nextWorld = currentWorld;
             distanceKm = routeDistanceKm;
+          } else {
+            currentWorld = getSourceParkingWorld(truckId);
+            nextWorld = currentWorld;
           }
         } else if (minute < activeTrip.rigDownFinish) {
-          currentWorld = straightStartWorld;
-          nextWorld = straightStartWorld;
+          currentWorld = getSourceParkingWorld(truckId);
+          nextWorld = currentWorld;
           distanceKm = 0;
         } else if (minute < activeTrip.arrivalAtDestination) {
           const tripDuration = Math.max(activeTrip.arrivalAtDestination - activeTrip.rigDownFinish, 1);
@@ -1310,8 +1659,8 @@ export function SimulationScene3D({
           nextWorld = interpolateWorldPosition(straightStartWorld, straightEndWorld, nextOutboundRatio, 3.3);
           distanceKm = routeDistanceKm * Math.max(0, Math.min(1, outboundRatio));
         } else if (minute < activeTrip.rigUpFinish) {
-          currentWorld = straightEndWorld;
-          nextWorld = straightEndWorld;
+          currentWorld = getDestinationParkingWorld(truckId);
+          nextWorld = currentWorld;
           distanceKm = routeDistanceKm;
         } else if (activeTrip.returnToSource && minute < activeTrip.returnToSource) {
           const tripDuration = Math.max(activeTrip.returnToSource - activeTrip.rigUpFinish, 1);
@@ -1323,8 +1672,8 @@ export function SimulationScene3D({
           nextWorld = interpolateWorldPosition(straightEndWorld, straightStartWorld, nextInboundRatio, 3.3);
           distanceKm = routeDistanceKm * Math.max(0, 1 - Math.min(1, inboundRatio));
         } else {
-          currentWorld = straightEndWorld;
-          nextWorld = straightEndWorld;
+          currentWorld = getDestinationParkingWorld(truckId);
+          nextWorld = currentWorld;
           distanceKm = routeDistanceKm;
         }
 
@@ -1332,8 +1681,16 @@ export function SimulationScene3D({
         const deltaZ = nextWorld.z - currentWorld.z;
         const movementMagnitude = Math.hypot(deltaX, deltaZ);
         const lastHeading = truckHeadingRef.current.get(truckId) ?? 0;
+        const isParked =
+          (!activeTrip && !deliveredTrip) ||
+          (!activeTrip && Boolean(deliveredTrip && !deliveredTrip.returnToSource)) ||
+          (activeTrip && minute < activeTrip.rigDownFinish) ||
+          (activeTrip && minute >= activeTrip.arrivalAtDestination && minute < activeTrip.rigUpFinish) ||
+          (activeTrip && !activeTrip.returnToSource && minute >= activeTrip.rigUpFinish);
         const heading =
-          movementMagnitude > 0.02
+          isParked
+            ? parkedTruckHeading
+            : movementMagnitude > 0.02
             ? Math.atan2(deltaX, deltaZ)
             : lastHeading;
         const bob = Math.sin(elapsedSeconds * 2.4 + truckId * 0.6) * 0.08;
@@ -1366,6 +1723,11 @@ export function SimulationScene3D({
       rightGlow.intensity = 11 + (Math.cos(elapsedSeconds * 0.68) * 1.2);
       backGlow.intensity = 9 + (Math.sin(elapsedSeconds * 0.52 + 0.8) * 0.9);
 
+      if (sceneFocusResetKeyRef.current !== handledSceneFocusResetKeyRef.current) {
+        handledSceneFocusResetKeyRef.current = sceneFocusResetKeyRef.current;
+        resetFocus();
+      }
+
       if (cameraTransitioningRef.current) {
         zoomState.currentTarget.lerp(zoomState.desiredTarget, 0.08);
         zoomState.currentPosition.lerp(zoomState.desiredPosition, 0.08);
@@ -1389,17 +1751,49 @@ export function SimulationScene3D({
       }
 
       updateTrucks(elapsedSeconds);
+      const playback = simulationRef.current?.bestPlan?.playback;
+      if (
+        focusedTruckIdRef.current != null &&
+        playback?.totalMinutes != null &&
+        currentMinuteRef.current >= playback.totalMinutes
+      ) {
+        resetFocus();
+      }
+      if (focusedTruckIdRef.current != null) {
+        const focusedTruck = truckMeshes.get(focusedTruckIdRef.current);
+        const cameraOffset = focusedTruckOffsetRef.current;
+        if (focusedTruck?.visible && cameraOffset) {
+          const nextTarget = focusedTruck.position.clone();
+          nextTarget.y = Math.max(nextTarget.y, 3.4);
+          zoomState.desiredTarget.copy(nextTarget);
+          zoomState.desiredPosition.copy(nextTarget).add(cameraOffset);
+          cameraTransitioningRef.current = true;
+        }
+      }
       highlightTargets.forEach((target, key) => {
         const isActive = hoveredObjectRef.current === key;
-        const highlightStrength = isActive ? 0.44 + ((Math.sin(elapsedSeconds * 5.8) + 1) * 0.14) : 0;
-        applyHighlightState(target.capturedMaterials, target.color, highlightStrength);
+        const highlightStrength = isActive
+          ? (0.44 + ((Math.sin(elapsedSeconds * 5.8) + 1) * 0.14)) * (target.intensityFactor ?? 1)
+          : 0;
+        if (target.kind === "rig-component" && isActive) {
+          applyRigComponentHoverState(target.capturedMaterials, target.color, highlightStrength);
+        } else {
+          applyHighlightState(target.capturedMaterials, target.color, highlightStrength, target.highlightOptions);
+        }
         if (target.kind === "rig-component") {
-          const scaleMultiplier = isActive ? 1 + (Math.sin(elapsedSeconds * 5.8) * 0.008) : 1;
-          target.root.scale.copy(target.baseScale).multiplyScalar(scaleMultiplier);
+          target.root.scale.copy(target.baseScale);
         } else {
           target.root.scale.copy(target.baseScale);
         }
       });
+      if (hoveredRigComponentRef.current) {
+        const hoveredTarget = highlightTargets.get(hoveredObjectRef.current);
+        const hoverStrength =
+          hoveredTarget?.kind === "rig-component" && hoveredObjectRef.current
+            ? (0.44 + ((Math.sin(elapsedSeconds * 5.8) + 1) * 0.14)) * (hoveredTarget.intensityFactor ?? 1)
+            : 0.58;
+        setRigComponentDirectHover(hoveredRigComponentRef.current, hoverStrength);
+      }
       controls.update();
       renderer.render(scene, camera);
     }
@@ -1417,6 +1811,7 @@ export function SimulationScene3D({
       renderer.domElement.removeEventListener("pointermove", handlePointerMove);
       renderer.domElement.removeEventListener("pointerleave", handlePointerLeave);
       renderer.domElement.removeEventListener("dblclick", resetFocus);
+      controls.removeEventListener("start", handleControlsStart);
       controls.dispose();
       renderer.dispose();
       scene.traverse((object) => {

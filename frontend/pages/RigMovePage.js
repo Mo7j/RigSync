@@ -446,12 +446,14 @@ function PlaybackActionButton({ isRunning, isBusy, isPaused, onRun, onEnd, onPau
 
 export function RigMovePage({
   move,
+  isLoadingMove = false,
   currentMinute,
   sceneAssetsReady,
   onScenePlaybackReadyChange,
   isSimulating,
   isPlaybackRunning,
   isPlaybackPaused,
+  sceneFocusResetKey,
   logicalLoads,
   simulationError,
   onSelectPlan,
@@ -484,6 +486,20 @@ export function RigMovePage({
     setActiveView("map");
     setFocusedRigSide(null);
   }, [move?.id, move?.updatedAt]);
+
+  if (isLoadingMove) {
+    return h(
+      AppLayout,
+      {
+        title: "Loading rig move",
+        subtitle: "Restoring the saved move from local storage.",
+        currentUser,
+        onLogout,
+        onBack,
+      },
+      h(Card, { className: "empty-state" }, h("h2", null, "Loading move"), h("p", { className: "muted-copy" }, "Rebuilding the scene after refresh.")),
+    );
+  }
 
   if (!move) {
     return h(
@@ -610,12 +626,11 @@ export function RigMovePage({
         subtitle: `${move.startLabel} -> ${move.endLabel}`,
         currentUser,
         onLogout,
-        onBack,
         fullBleed: true,
       },
       h(
         Card,
-        { className: "empty-state" },
+        { className: "empty-state scene-loading-card" },
         h("h2", null, "Loading 3D simulation assets"),
         h("p", { className: "muted-copy" }, "The page will open after the truck and rig models finish loading."),
       ),
@@ -638,6 +653,7 @@ export function RigMovePage({
           endPoint: move.endPoint,
           simulation: displaySimulation,
           currentMinute: visibleMinute,
+          sceneFocusResetKey,
           heightClass: "scene-only-canvas",
           showOverlay: false,
           onReadyStateChange: onScenePlaybackReadyChange,

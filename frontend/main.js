@@ -47,13 +47,19 @@ function hasMultiTruckPlans(move) {
   return scenarioPlans.length >= 3 && distinctTruckCounts.size >= 3;
 }
 
+function loadStoredMoves() {
+  migrateLegacyHistory(HISTORY_STORAGE_KEY);
+  return readMoves();
+}
+
 function App() {
   const route = useHashRoute();
   const [session, setSession] = useState(getSession);
   const [loads, setLoads] = useState([]);
   const [isLoadingLoads, setIsLoadingLoads] = useState(true);
   const [loadsError, setLoadsError] = useState("");
-  const [moves, setMoves] = useState([]);
+  const [moves, setMoves] = useState(loadStoredMoves);
+  const [areMovesHydrated, setAreMovesHydrated] = useState(true);
   const [createError, setCreateError] = useState("");
   const [isCreatingMove, setIsCreatingMove] = useState(false);
   const [isSimulatingMove, setIsSimulatingMove] = useState(false);
@@ -62,6 +68,7 @@ function App() {
   const [playbackSpeed, setPlaybackSpeed] = useState(1);
   const [isPlaybackRunning, setIsPlaybackRunning] = useState(false);
   const [isPlaybackPaused, setIsPlaybackPaused] = useState(false);
+  const [sceneFocusResetKey, setSceneFocusResetKey] = useState(0);
   const [areSceneAssetsReady, setAreSceneAssetsReady] = useState(false);
   const [isScenePlaybackReady, setIsScenePlaybackReady] = useState(false);
   const animationFrameRef = useRef(null);
@@ -77,11 +84,6 @@ function App() {
       };
     }
     return undefined;
-  }, []);
-
-  useEffect(() => {
-    migrateLegacyHistory(HISTORY_STORAGE_KEY);
-    setMoves(readMoves());
   }, []);
 
   useEffect(() => {
@@ -230,7 +232,10 @@ function App() {
   }, [route.page]);
 
   const logicalLoads = buildLogicalLoads(loads);
-  const activeMove = route.page === "move" ? moves.find((move) => move.id === route.moveId) || null : null;
+  const activeMove =
+    route.page === "move"
+      ? moves.find((move) => String(move.id) === String(route.moveId)) || null
+      : null;
   const activeScenario = getActiveScenario(activeMove);
   const activeTotalMinutes = activeScenario?.bestVariant?.totalMinutes || 0;
 
@@ -347,6 +352,12 @@ function App() {
 
       if (nextMinute < activeTotalMinutes) {
         animationFrameRef.current = window.requestAnimationFrame(animate);
+      } else {
+        animationFrameRef.current = null;
+        animationStartedAtRef.current = null;
+        setIsPlaybackRunning(false);
+        setIsPlaybackPaused(false);
+        setSceneFocusResetKey((value) => value + 1);
       }
     };
 
@@ -576,13 +587,12 @@ function App() {
     setIsPlaybackRunning(false);
     setCurrentMinute(0);
     setIsPlaybackPaused(false);
+    navigateTo(`/move/${moveId}`);
     try {
       await preloadSimulationSceneAssets();
       setAreSceneAssetsReady(true);
-      navigateTo(`/move/${moveId}`);
     } catch {
       setAreSceneAssetsReady(true);
-      navigateTo(`/move/${moveId}`);
     }
   }
 
@@ -660,6 +670,7 @@ function App() {
     setCurrentMinute(0);
     setIsPlaybackRunning(false);
     setIsPlaybackPaused(false);
+    setSceneFocusResetKey((value) => value + 1);
   }
 
   if (route.page === "login") {
@@ -688,6 +699,7 @@ function App() {
   if (route.page === "move" && session) {
     return h(RigMovePage, {
       move: activeMove,
+      isLoadingMove: !areMovesHydrated,
       currentMinute,
       sceneAssetsReady: areSceneAssetsReady,
       onScenePlaybackReadyChange: setIsScenePlaybackReady,
@@ -695,6 +707,7 @@ function App() {
       isSimulating: isSimulatingMove,
       isPlaybackRunning,
       isPlaybackPaused,
+      sceneFocusResetKey,
       logicalLoads,
       simulationError: moveSimulationError,
       onPlaybackSpeedChange: setPlaybackSpeed,

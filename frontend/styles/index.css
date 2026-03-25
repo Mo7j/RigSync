@@ -1578,7 +1578,77 @@ p {
   width: 100vw;
   height: 100vh;
   overflow: hidden;
-  background: #04070c;
+  background:
+    radial-gradient(circle at top left, rgba(198, 255, 0, 0.08), transparent 26%),
+    radial-gradient(circle at 80% 20%, rgba(255, 255, 255, 0.03), transparent 18%),
+    linear-gradient(180deg, #06080c 0%, #090d11 100%);
+}
+
+.scene-only-shell::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  background:
+    repeating-linear-gradient(
+      90deg,
+      transparent 0 18px,
+      rgba(255, 216, 74, 0.05) 18px 20px,
+      transparent 20px 47px,
+      rgba(255, 216, 74, 0.028) 47px 48px,
+      transparent 48px 83px,
+      rgba(255, 216, 74, 0.02) 83px 84px,
+      transparent 84px 132px
+    ),
+    repeating-linear-gradient(
+      90deg,
+      transparent 0 29px,
+      rgba(255, 216, 74, 0.038) 29px 30px,
+      transparent 30px 63px,
+      rgba(255, 216, 74, 0.024) 63px 65px,
+      transparent 65px 118px,
+      rgba(255, 216, 74, 0.018) 118px 119px,
+      transparent 119px 176px
+    ),
+    repeating-linear-gradient(
+      180deg,
+      transparent 0 22px,
+      rgba(255, 216, 74, 0.04) 22px 24px,
+      transparent 24px 58px,
+      rgba(255, 216, 74, 0.024) 58px 59px,
+      transparent 59px 101px,
+      rgba(255, 216, 74, 0.016) 101px 102px,
+      transparent 102px 149px
+    ),
+    repeating-linear-gradient(
+      180deg,
+      transparent 0 41px,
+      rgba(255, 216, 74, 0.03) 41px 42px,
+      transparent 42px 79px,
+      rgba(255, 216, 74, 0.02) 79px 81px,
+      transparent 81px 137px,
+      rgba(255, 216, 74, 0.014) 137px 138px,
+      transparent 138px 191px
+    ),
+    radial-gradient(circle at 18% 22%, rgba(255, 216, 74, 0.08), transparent 22%),
+    radial-gradient(circle at 74% 36%, rgba(255, 216, 74, 0.05), transparent 18%);
+  background-size:
+    173px 100%,
+    229px 100%,
+    100% 167px,
+    100% 211px,
+    100% 100%,
+    100% 100%;
+  background-position:
+    0 0,
+    37px 0,
+    0 0,
+    0 53px,
+    0 0,
+    0 0;
+  mask-image: linear-gradient(180deg, rgba(0, 0, 0, 0.85), transparent 100%);
+  opacity: 0.95;
 }
 
 .scene-back-button {
@@ -1599,10 +1669,22 @@ p {
   min-height: 100vh;
   border: 0;
   border-radius: 0;
+  background: transparent;
   box-shadow: none;
 }
 
 .scene-only-canvas::before {
+  display: none;
+}
+
+.scene-only-shell .scene-3d-shell {
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+}
+
+.scene-only-shell .scene-3d-shell::before {
   display: none;
 }
 
@@ -2401,14 +2483,14 @@ p {
   min-width: 180px;
   max-width: 240px;
   display: grid;
-  gap: 0.28rem;
-  padding: 0.85rem 0.95rem;
-  border: 1px solid rgba(110, 231, 255, 0.2);
-  border-radius: 16px;
-  background: rgba(8, 15, 24, 0.86);
-  box-shadow: 0 18px 48px rgba(0, 0, 0, 0.34);
-  backdrop-filter: blur(16px);
-  color: rgba(232, 244, 255, 0.96);
+  gap: 0.38rem;
+  padding: 14px 16px;
+  border: 0;
+  border-radius: 18px;
+  background: rgba(255, 255, 255, 0.02);
+  box-shadow: none;
+  backdrop-filter: blur(18px);
+  color: var(--muted-strong);
   pointer-events: none;
   opacity: 0;
   transform: translate3d(0, 10px, 0);
@@ -2421,14 +2503,15 @@ p {
 }
 
 .scene-3d-tooltip-title {
-  font-size: 0.88rem;
+  font-size: 1rem;
   font-weight: 700;
   letter-spacing: 0.01em;
+  text-shadow: 0 8px 24px rgba(0, 0, 0, 0.48);
 }
 
 .scene-3d-tooltip-line {
-  font-size: 0.76rem;
-  color: rgba(199, 214, 229, 0.88);
+  font-size: 0.88rem;
+  color: var(--muted);
 }
 
 .move-scene-top-card,
@@ -2994,6 +3077,13 @@ p {
   gap: var(--space-2);
   min-height: 180px;
   align-content: center;
+}
+
+.scene-loading-card {
+  border: 1px solid var(--line);
+  background: transparent;
+  backdrop-filter: blur(4px);
+  box-shadow: var(--shadow);
 }
 
 @media (max-width: 1180px) {
