@@ -494,15 +494,15 @@ export function RigMovePage({
       return undefined;
     }
 
-    const handlePointerDown = (event) => {
-      if (!speedDropdownRef.current?.contains(event.target)) {
+    const handleKeyDown = (event) => {
+      if (event.key === "Escape") {
         setIsSpeedDropdownOpen(false);
       }
     };
 
-    window.addEventListener("pointerdown", handlePointerDown);
+    window.addEventListener("keydown", handleKeyDown);
     return () => {
-      window.removeEventListener("pointerdown", handlePointerDown);
+      window.removeEventListener("keydown", handleKeyDown);
     };
   }, [isSpeedDropdownOpen]);
 
@@ -510,7 +510,9 @@ export function RigMovePage({
     const isNewMove = previousMoveIdRef.current !== move?.id;
 
     setHasSceneInitialized(Boolean(sceneAssetsReady));
-    setTruckSetup(normalizeTruckSetup(move));
+    if (isNewMove) {
+      setTruckSetup(normalizeTruckSetup(move));
+    }
     setActiveScenarioName(move?.simulation?.preferredScenarioName || "");
     setActivePlanKey((current) => {
       if (isNewMove) {
@@ -523,9 +525,9 @@ export function RigMovePage({
     setActiveView("map");
     if (isNewMove) {
       setSceneMode("3d");
+      setIsSpeedDropdownOpen(false);
     }
     setFocusedRigSide(null);
-    setIsSpeedDropdownOpen(false);
   }, [move?.id, move?.updatedAt]);
 
   if (isLoadingMove) {
@@ -673,7 +675,7 @@ export function RigMovePage({
   }
 
   const playbackSpeedOptions = [
-    { value: "1", label: "Normal" },
+    { value: "500", label: "Normal" },
     { value: "15000", label: "Medium" },
     { value: "50000", label: "Fast" },
   ];
@@ -733,6 +735,8 @@ export function RigMovePage({
             {
               ref: speedDropdownRef,
               className: `scene-speed-dropdown${isSpeedDropdownOpen ? " is-open" : ""}`,
+              onPointerDown: (event) => event.stopPropagation(),
+              onPointerMove: (event) => event.stopPropagation(),
             },
             h(
               "button",
@@ -748,7 +752,13 @@ export function RigMovePage({
             isSpeedDropdownOpen
               ? h(
                   "div",
-                  { className: "scene-speed-menu", role: "listbox", "aria-label": "Playback speed" },
+                  {
+                    className: "scene-speed-menu",
+                    role: "listbox",
+                    "aria-label": "Playback speed",
+                    onPointerDown: (event) => event.stopPropagation(),
+                    onPointerMove: (event) => event.stopPropagation(),
+                  },
                   playbackSpeedOptions.map((option) =>
                     h(
                       "button",
@@ -757,7 +767,7 @@ export function RigMovePage({
                         type: "button",
                         className: `scene-speed-option${String(playbackSpeed) === option.value ? " is-active" : ""}`,
                         onClick: () => {
-                          onPlaybackSpeedChange?.(option.value === "1" ? 1 : option.value);
+                          onPlaybackSpeedChange?.(Number(option.value));
                           setIsSpeedDropdownOpen(false);
                         },
                       },

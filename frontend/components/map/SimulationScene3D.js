@@ -154,6 +154,37 @@ function setTruckVariantVisible(truckRoot, truckType) {
   truckRoot.userData.activeTruckVariantKey = didShowVariant ? variantKey : "fallback";
 }
 
+function getTruckVariantDimensions(variantKey) {
+  if (variantKey === "heavyHaulerTruck") {
+    return { targetWidth: 23.8, targetHeight: 11.1 };
+  }
+  if (variantKey === "lowbedTruck") {
+    return { targetWidth: 21.8, targetHeight: 10.4 };
+  }
+  return { targetWidth: 16.2, targetHeight: 9.2 };
+}
+
+function getTruckVariantWidthStretch(variantKey) {
+  if (variantKey === "heavyHaulerTruck") {
+    return 1.28;
+  }
+  if (variantKey === "lowbedTruck") {
+    return 1.3;
+  }
+  return 1;
+}
+
+function getTruckVariantRoadOffset(truckType) {
+  const variantKey = getTruckModelKey(truckType);
+  if (variantKey === "heavyHaulerTruck") {
+    return 30;
+  }
+  if (variantKey === "lowbedTruck") {
+    return 30;
+  }
+  return 27;
+}
+
 function tintModel(root, color) {
   const tint = new THREE.Color(color);
   root.traverse((child) => {
@@ -562,6 +593,169 @@ function interpolateWorldPosition(startWorld, endWorld, ratio, y = 0) {
   );
 }
 
+function buildStylizedRoutePoints(points, routeMetrics) {
+  if (!points?.length) {
+    return [];
+  }
+
+  if (points.length < 3) {
+    return points.map((point) => point.clone());
+  }
+
+  const start = points[0].clone();
+  const end = points[points.length - 1].clone();
+  const axis = new THREE.Vector3().subVectors(end, start);
+  const totalLength = Math.max(axis.length(), 0.001);
+  axis.normalize();
+  const side = new THREE.Vector3(-axis.z, 0, axis.x).normalize();
+  const totalKm = Math.max(routeMetrics?.totalKm || 0, 0.001);
+  const normalizedOffsets = points.map((point, index) => {
+    const routeProgress = routeMetrics?.cumulativeKm?.[index] != null
+      ? routeMetrics.cumulativeKm[index] / totalKm
+      : index / Math.max(points.length - 1, 1);
+    const idealPoint = start.clone().lerp(end, routeProgress);
+    const offsetVector = new THREE.Vector3().subVectors(point, idealPoint);
+    return side.dot(offsetVector);
+  });
+
+  const smoothedOffsets = normalizedOffsets.map((_, index) => {
+    let weightedSum = 0;
+    let weightTotal = 0;
+
+    for (let step = -2; step <= 2; step += 1) {
+      const sampleIndex = Math.max(0, Math.min(normalizedOffsets.length - 1, index + step));
+      const weight = step === 0 ? 0.4 : Math.abs(step) === 1 ? 0.22 : 0.08;
+      weightedSum += normalizedOffsets[sampleIndex] * weight;
+      weightTotal += weight;
+    }
+
+    return (weightedSum / Math.max(weightTotal, 0.001)) * 0.18;
+  });
+
+  return points.map((_, index) => {
+    const routeProgress = routeMetrics?.cumulativeKm?.[index] != null
+      ? routeMetrics.cumulativeKm[index] / totalKm
+      : index / Math.max(points.length - 1, 1);
+    const idealPoint = start.clone().lerp(end, routeProgress);
+    const sCurve =
+      Math.sin(routeProgress * Math.PI * 2) *
+      Math.sin(routeProgress * Math.PI) *
+      25;
+    return idealPoint.add(side.clone().multiplyScalar(smoothedOffsets[index] + sCurve));
+  });
+}
+
+function buildWorldPathMetrics(points) {
+  if (!points?.length) {
+    return {
+      points: [],
+      segmentLengths: [],
+      totalLength: 0,
+    };
+  }
+
+  const segmentLengths = [];
+  let totalLength = 0;
+
+  for (let index = 1; index < points.length; index += 1) {
+    const segmentLength = points[index].distanceTo(points[index - 1]);
+    segmentLengths.push(segmentLength);
+    totalLength += segmentLength;
+  }
+
+  return {
+    points,
+    segmentLengths,
+    totalLength,
+  };
+}
+
+function interpolateWorldPath(pathMetrics, ratio, y = 0) {
+  const points = pathMetrics?.points || [];
+
+  if (!points.length) {
+    return new THREE.Vector3(0, y, 0);
+  }
+
+  if (points.length === 1) {
+    return points[0].clone().setY(y);
+  }
+
+  const clampedRatio = Math.max(0, Math.min(1, ratio));
+  const segmentLengths = pathMetrics.segmentLengths || [];
+  const totalLength = pathMetrics.totalLength || 0;
+
+  if (totalLength <= 0.0001) {
+    return points[0].clone().setY(y);
+  }
+
+  const targetLength = totalLength * clampedRatio;
+  let traversed = 0;
+
+  for (let index = 0; index < segmentLengths.length; index += 1) {
+    const segmentLength = segmentLengths[index];
+    if (traversed + segmentLength >= targetLength) {
+      const localRatio = (targetLength - traversed) / Math.max(segmentLength, 0.0001);
+      return points[index].clone().lerp(points[index + 1], localRatio).setY(y);
+    }
+    traversed += segmentLength;
+  }
+
+  return points[points.length - 1].clone().setY(y);
+}
+
+function interpolateWorldPathWithEndpointOffset(pathMetrics, ratio, endpointOffset = 0, y = 0) {
+  const totalLength = pathMetrics?.totalLength || 0;
+  if (totalLength <= 0.0001) {
+    return interpolateWorldPath(pathMetrics, ratio, y);
+  }
+
+  const normalizedOffset = Math.max(0, Math.min(0.45, endpointOffset / totalLength));
+  const adjustedRatio = normalizedOffset + ((1 - (normalizedOffset * 2)) * Math.max(0, Math.min(1, ratio)));
+  return interpolateWorldPath(pathMetrics, adjustedRatio, y);
+}
+
+function remapRouteToFixedAnchors(points, startAnchor, endAnchor) {
+  if (!points?.length) {
+    return [];
+  }
+
+  if (points.length === 1) {
+    return [startAnchor.clone()];
+  }
+
+  const sourceStart = points[0].clone();
+  const sourceEnd = points[points.length - 1].clone();
+  const sourceAxis = new THREE.Vector3().subVectors(sourceEnd, sourceStart);
+  const targetAxis = new THREE.Vector3().subVectors(endAnchor, startAnchor);
+  const sourceLength = Math.max(sourceAxis.length(), 0.001);
+  const targetLength = Math.max(targetAxis.length(), 0.001);
+  sourceAxis.normalize();
+  targetAxis.normalize();
+  const sourceSide = new THREE.Vector3(-sourceAxis.z, 0, sourceAxis.x).normalize();
+  const targetSide = new THREE.Vector3(-targetAxis.z, 0, targetAxis.x).normalize();
+
+  const cumulative = [0];
+  let totalLength = 0;
+  for (let index = 1; index < points.length; index += 1) {
+    totalLength += points[index].distanceTo(points[index - 1]);
+    cumulative.push(totalLength);
+  }
+  totalLength = Math.max(totalLength, 0.001);
+
+  return points.map((point, index) => {
+    const progress = cumulative[index] / totalLength;
+    const sourceBase = sourceStart.clone().lerp(sourceEnd, progress);
+    const sourceOffset = new THREE.Vector3().subVectors(point, sourceBase);
+    const lateralOffset = sourceSide.dot(sourceOffset) * 0.28;
+    const verticalOffset = point.y - sourceBase.y;
+    const targetBase = startAnchor.clone().lerp(endAnchor, progress);
+    return targetBase
+      .add(targetSide.clone().multiplyScalar(lateralOffset))
+      .setY(targetBase.y + verticalOffset);
+  });
+}
+
 function createTruckFallbackMesh(accentColor) {
   const truck = new THREE.Group();
 
@@ -698,7 +892,7 @@ function createRouteObjects(points) {
     return { objects: [], root: null };
   }
 
-  const routeSegments = new THREE.Group();
+  const routeRoot = new THREE.Group();
   const routeMaterial = new THREE.MeshStandardMaterial({
     color: 0x31383f,
     emissive: 0x07090b,
@@ -708,33 +902,48 @@ function createRouteObjects(points) {
     transparent: true,
     opacity: 0.94,
   });
+  const shoulderMaterial = new THREE.MeshStandardMaterial({
+    color: 0x252b31,
+    transparent: true,
+    opacity: 0.42,
+    metalness: 0.06,
+    roughness: 0.92,
+  });
 
-  for (let index = 0; index < points.length - 1; index += 1) {
-    const start = points[index];
-    const end = points[index + 1];
-    const segmentVector = new THREE.Vector3().subVectors(end, start);
-    const segmentLength = Math.max(segmentVector.length(), 0.001);
-    const segment = new THREE.Mesh(
-      new THREE.BoxGeometry(7.2, 0.95, segmentLength + 0.8),
-      routeMaterial,
+  function addRoadCurve(curvePoints, width = 4.4, shoulderWidth = 5.2, sampleMultiplier = 8) {
+    if (curvePoints.length < 2) {
+      return;
+    }
+    const routeCurve = new THREE.CatmullRomCurve3(curvePoints.map((point) => point.clone().setY(0.72)), false, "centripetal", 0.08);
+    const tubularSegments = Math.max(40, curvePoints.length * sampleMultiplier);
+    const routeGeometry = new THREE.TubeGeometry(routeCurve, tubularSegments, width, 12, false);
+    const routeSurface = new THREE.Mesh(routeGeometry, routeMaterial);
+    routeSurface.scale.y = 0.13;
+    routeSurface.position.y = 0.12;
+    routeRoot.add(routeSurface);
+
+    const routeShoulder = new THREE.Mesh(
+      new THREE.TubeGeometry(routeCurve, tubularSegments, shoulderWidth, 10, false),
+      shoulderMaterial,
     );
-    segment.position.copy(start).lerp(end, 0.5);
-    segment.position.y = 0.72;
-    segment.lookAt(end.x, segment.position.y, end.z);
-    routeSegments.add(segment);
+    routeShoulder.scale.y = 0.08;
+    routeShoulder.position.y = 0.04;
+    routeRoot.add(routeShoulder);
   }
 
+  addRoadCurve(points, 4.4, 5.2, 8);
+
   const routeLine = new THREE.Line(
-    new THREE.BufferGeometry().setFromPoints(points),
+    new THREE.BufferGeometry().setFromPoints(points.map((point) => point.clone().setY(1.16))),
     new THREE.LineBasicMaterial({
       color: 0xb0b7c0,
       transparent: true,
       opacity: 0,
     }),
   );
-  routeLine.position.y = 1.16;
+  routeRoot.add(routeLine);
 
-  return { objects: [routeSegments, routeLine], root: routeSegments };
+  return { objects: [routeRoot], root: routeRoot };
 }
 
 function createRigBoard(position, routeDirection, radius = 18) {
@@ -934,6 +1143,7 @@ export function SimulationScene3D({
   const focusedRigSideRef = useRef(null);
   const focusedTruckIdRef = useRef(null);
   const focusedTruckOffsetRef = useRef(null);
+  const focusedTruckLastTargetRef = useRef(null);
   const hoveredRigComponentRef = useRef(null);
   const cameraTransitioningRef = useRef(false);
   const hoveredObjectRef = useRef(null);
@@ -1158,6 +1368,7 @@ export function SimulationScene3D({
     focusedRigSideRef.current = null;
     focusedTruckIdRef.current = null;
     focusedTruckOffsetRef.current = null;
+    focusedTruckLastTargetRef.current = null;
     hoveredRigComponentRef.current = null;
     cameraTransitioningRef.current = false;
     hoveredObjectRef.current = null;
@@ -1182,7 +1393,16 @@ export function SimulationScene3D({
     ];
     const projection = buildProjection(geoPoints);
     const measuredRouteMetrics = buildRouteMetrics(activeRoutePoints);
-    const projectedRoute = activeRoutePoints.map((point) => projection.project(point, 1.2));
+    const stylizedProjectedRoute = buildStylizedRoutePoints(
+      activeRoutePoints.map((point) => projection.project(point, 1.2)),
+      measuredRouteMetrics,
+    );
+    const fixedStartWorld = new THREE.Vector3(82, 1.2, 14);
+    const fixedEndWorld = new THREE.Vector3(-82, 1.2, -14);
+    const projectedRoute = remapRouteToFixedAnchors(stylizedProjectedRoute, fixedStartWorld, fixedEndWorld);
+    const projectedRouteMetrics = buildWorldPathMetrics(projectedRoute);
+    const reversedProjectedRoute = [...projectedRoute].reverse();
+    const reversedProjectedRouteMetrics = buildWorldPathMetrics(reversedProjectedRoute);
     const straightStartWorld = projectedRoute[0] || new THREE.Vector3(0, 1.2, 0);
     const straightEndWorld = projectedRoute[projectedRoute.length - 1] || new THREE.Vector3(0, 1.2, 0);
     const platformSize = Math.max(340, projection.extent * 0.32);
@@ -1225,10 +1445,11 @@ export function SimulationScene3D({
     scene.fog = new THREE.FogExp2(0x25292f, 0.0018);
 
     const camera = new THREE.PerspectiveCamera(44, 1, 0.1, 1200);
-    const cameraDistance = Math.max(120, Math.min(220, projection.extent * 0.12));
-    camera.position.set(cameraDistance, cameraDistance * 0.56, cameraDistance * 1.02);
+    const layoutSpan = fixedStartWorld.distanceTo(fixedEndWorld);
+    const cameraDistance = Math.max(162, Math.min(248, layoutSpan * 1.12));
+    camera.position.set(cameraDistance * 0.32, cameraDistance * 0.4, cameraDistance * 1.02);
     const defaultCameraPosition = camera.position.clone();
-    const defaultTarget = new THREE.Vector3(0, 7, 0);
+    const defaultTarget = new THREE.Vector3(-8, 5.4, -1);
     const zoomState = {
       currentTarget: defaultTarget.clone(),
       desiredTarget: defaultTarget.clone(),
@@ -1258,7 +1479,7 @@ export function SimulationScene3D({
     controls.enablePan = true;
     controls.target.copy(defaultTarget);
     controls.minDistance = 16;
-    controls.maxDistance = cameraDistance * 1.45;
+    controls.maxDistance = cameraDistance * 1.55;
     controls.maxPolarAngle = Math.PI * 0.4;
     controls.minPolarAngle = Math.PI * 0.2;
     const handleControlsStart = () => {
@@ -1269,8 +1490,16 @@ export function SimulationScene3D({
       zoomState.desiredPosition.copy(camera.position);
     };
     controls.addEventListener("start", handleControlsStart);
+    const handleControlsChange = () => {
+      if (focusedTruckIdRef.current != null && !cameraTransitioningRef.current) {
+        focusedTruckOffsetRef.current = camera.position.clone().sub(controls.target);
+      }
+    };
+    controls.addEventListener("change", handleControlsChange);
 
     const floorGroup = createFloor(projection.extent);
+    const sceneSpin = -Math.PI * 0.05;
+    floorGroup.rotation.y = sceneSpin;
     scene.add(floorGroup);
 
     const ambientLight = new THREE.AmbientLight(0xe2e5e9, 0.72);
@@ -1312,6 +1541,7 @@ export function SimulationScene3D({
     scene.add(backGlow);
 
     const routeGroup = new THREE.Group();
+    routeGroup.rotation.y = sceneSpin;
     const routeObjects = createRouteObjects(projectedRoute);
     routeObjects.objects.forEach((object) => routeGroup.add(object));
     scene.add(routeGroup);
@@ -1319,9 +1549,11 @@ export function SimulationScene3D({
 
     const truckAccent = 0x647587;
     const padAssetsGroup = new THREE.Group();
+    padAssetsGroup.rotation.y = sceneSpin;
     scene.add(padAssetsGroup);
 
     const trucksGroup = new THREE.Group();
+    trucksGroup.rotation.y = sceneSpin;
     scene.add(trucksGroup);
 
     const truckMeshes = new Map();
@@ -1411,7 +1643,7 @@ export function SimulationScene3D({
       if (terrainTemplate) {
         const terrainInset = platformSize * 0.31;
         const terrainPresets = [
-          { x: -terrainInset * 0.82, z: -terrainInset * 0.64, width: 156, height: 36, rotation: Math.PI * 0.5 },
+          { x: -terrainInset * 1.02, z: -terrainInset * 0.88, width: 156, height: 36, rotation: Math.PI * 0.5 },
           { x: terrainInset * 0.86, z: -terrainInset, width: 128, height: 29, rotation: -Math.PI * 0.5 },
           { x: terrainInset * 0.18, z: terrainInset, width: 124, height: 27, rotation: Math.PI * 0.5 },
         ];
@@ -1447,7 +1679,7 @@ export function SimulationScene3D({
       }
 
       if (startPoint) {
-        const startBoardParts = createRigBoard(projection.project(startPoint, 0), routeDirectionWorld, 18);
+        const startBoardParts = createRigBoard(straightStartWorld.clone().setY(0), routeDirectionWorld, 18);
         const startBoardGroup = new THREE.Group();
         startBoardGroup.userData = {
           boardInfo: {
@@ -1478,11 +1710,11 @@ export function SimulationScene3D({
         padAssetsGroup.add(startBoardGroup);
         const startAsset = rigTemplate
           ? centerAndScaleModel(cloneModelWithUniqueMaterials(rigTemplate), { targetWidth: 49, targetHeight: 27, lift: 0 })
-          : createPadFallback(projection.project(startPoint, 0), 0x1de9d5, -6);
+          : createPadFallback(straightStartWorld.clone().setY(0), 0x1de9d5, -6);
         if (rigTemplate) {
           tintModel(startAsset, 0x596069);
           startAsset.rotation.y = Math.PI * 0.18;
-          startAsset.position.copy(projection.project(startPoint, 1.6));
+          startAsset.position.copy(straightStartWorld.clone().setY(1.6));
           const statusMeshes = collectStatusMeshes(startAsset);
           statusMeshes.forEach((mesh, index) => {
             mesh.userData.rigComponent = {
@@ -1531,7 +1763,7 @@ export function SimulationScene3D({
       }
 
       if (endPoint) {
-        const endBoardParts = createRigBoard(projection.project(endPoint, 0), routeDirectionWorld.clone().multiplyScalar(-1), 22);
+        const endBoardParts = createRigBoard(straightEndWorld.clone().setY(0), routeDirectionWorld.clone().multiplyScalar(-1), 22);
         const endBoardGroup = new THREE.Group();
         endBoardGroup.userData = {
           boardInfo: {
@@ -1562,11 +1794,11 @@ export function SimulationScene3D({
         padAssetsGroup.add(endBoardGroup);
         const endAsset = rigTemplate
           ? centerAndScaleModel(cloneModelWithUniqueMaterials(rigTemplate), { targetWidth: 63, targetHeight: 36, lift: 0 })
-          : createPadFallback(projection.project(endPoint, 0), 0xc6ff00, 6);
+          : createPadFallback(straightEndWorld.clone().setY(0), 0xc6ff00, 6);
         if (rigTemplate) {
           tintModel(endAsset, 0x596069);
           endAsset.rotation.y = -Math.PI * 0.12;
-          endAsset.position.copy(projection.project(endPoint, 1.6));
+          endAsset.position.copy(straightEndWorld.clone().setY(1.6));
           const statusMeshes = collectStatusMeshes(endAsset);
           statusMeshes.forEach((mesh, index) => {
             mesh.userData.rigComponent = {
@@ -1627,7 +1859,11 @@ export function SimulationScene3D({
 
           const variantMesh = cloneModelWithUniqueMaterials(variantTemplate);
           tintModel(variantMesh, truckAccent);
-          centerAndScaleModel(variantMesh, { targetWidth: 16.2, targetHeight: 9.2, lift: 0 });
+          centerAndScaleModel(variantMesh, {
+            ...getTruckVariantDimensions(variantKey),
+            lift: 0,
+          });
+          variantMesh.scale.x *= getTruckVariantWidthStretch(variantKey);
           variantMesh.visible = false;
           truckRoot.add(variantMesh);
           truckVariants[variantKey] = variantMesh;
@@ -1702,7 +1938,7 @@ export function SimulationScene3D({
       const center = bounds.getCenter(new THREE.Vector3());
       const size = bounds.getSize(new THREE.Vector3());
       const focusDistance = Math.max(size.x, size.y, size.z, 10);
-      const direction = new THREE.Vector3(0.94, 0.3, 0.86).normalize();
+      const direction = new THREE.Vector3(0, 0.34, 1).normalize();
 
       zoomState.desiredTarget.copy(center);
       zoomState.desiredTarget.y = Math.max(center.y, 2.8);
@@ -1710,6 +1946,7 @@ export function SimulationScene3D({
       focusedRigSideRef.current = null;
       focusedTruckIdRef.current = targetObject.userData?.truckId ?? null;
       focusedTruckOffsetRef.current = zoomState.desiredPosition.clone().sub(zoomState.desiredTarget);
+      focusedTruckLastTargetRef.current = zoomState.desiredTarget.clone();
       onRigFocusChange?.(null);
       cameraTransitioningRef.current = true;
     }
@@ -1720,6 +1957,7 @@ export function SimulationScene3D({
       focusedRigSideRef.current = null;
       focusedTruckIdRef.current = null;
       focusedTruckOffsetRef.current = null;
+      focusedTruckLastTargetRef.current = null;
       onRigFocusChange?.(null);
       cameraTransitioningRef.current = true;
     }
@@ -1936,6 +2174,7 @@ export function SimulationScene3D({
         }
 
         const assignedTruckType = truckTypeAssignments[truckId - 1] || "LowBed";
+        const truckBodyOffset = getTruckVariantRoadOffset(assignedTruckType);
         if (mesh.userData?.truckType !== assignedTruckType) {
           setTruckVariantVisible(mesh, assignedTruckType);
         }
@@ -1974,9 +2213,8 @@ export function SimulationScene3D({
           const outboundRatio = (minute - activeTrip.rigDownFinish) / tripDuration;
           const forwardMinute = Math.min(minute + 0.6, activeTrip.arrivalAtDestination);
           const nextOutboundRatio = (forwardMinute - activeTrip.rigDownFinish) / tripDuration;
-
-          currentWorld = interpolateWorldPosition(straightStartWorld, straightEndWorld, outboundRatio, 3.3);
-          nextWorld = interpolateWorldPosition(straightStartWorld, straightEndWorld, nextOutboundRatio, 3.3);
+          currentWorld = interpolateWorldPathWithEndpointOffset(projectedRouteMetrics, outboundRatio, truckBodyOffset, 1.5);
+          nextWorld = interpolateWorldPathWithEndpointOffset(projectedRouteMetrics, nextOutboundRatio, truckBodyOffset, 1.5);
           distanceKm = routeDistanceKm * Math.max(0, Math.min(1, outboundRatio));
         } else if (minute < activeTrip.rigUpFinish) {
           currentWorld = getDestinationParkingWorld(truckId);
@@ -1987,9 +2225,8 @@ export function SimulationScene3D({
           const inboundRatio = (minute - activeTrip.rigUpFinish) / tripDuration;
           const forwardMinute = Math.min(minute + 0.6, activeTrip.returnToSource);
           const nextInboundRatio = (forwardMinute - activeTrip.rigUpFinish) / tripDuration;
-
-          currentWorld = interpolateWorldPosition(straightEndWorld, straightStartWorld, inboundRatio, 3.3);
-          nextWorld = interpolateWorldPosition(straightEndWorld, straightStartWorld, nextInboundRatio, 3.3);
+          currentWorld = interpolateWorldPathWithEndpointOffset(reversedProjectedRouteMetrics, inboundRatio, truckBodyOffset, 1.5);
+          nextWorld = interpolateWorldPathWithEndpointOffset(reversedProjectedRouteMetrics, nextInboundRatio, truckBodyOffset, 1.5);
           distanceKm = routeDistanceKm * Math.max(0, 1 - Math.min(1, inboundRatio));
         } else {
           currentWorld = getDestinationParkingWorld(truckId);
@@ -2013,7 +2250,7 @@ export function SimulationScene3D({
             : movementMagnitude > 0.02
             ? Math.atan2(deltaX, deltaZ)
             : lastHeading;
-        const bob = Math.sin(elapsedSeconds * 2.4 + truckId * 0.6) * 0.08;
+        const bob = Math.sin(elapsedSeconds * 2.4 + truckId * 0.6) * 0.035;
 
         mesh.visible = true;
         mesh.position.copy(currentWorld);
@@ -2081,13 +2318,25 @@ export function SimulationScene3D({
       }
       if (focusedTruckIdRef.current != null) {
         const focusedTruck = truckMeshes.get(focusedTruckIdRef.current);
-        const cameraOffset = focusedTruckOffsetRef.current;
-        if (focusedTruck?.visible && cameraOffset) {
+        if (focusedTruck?.visible) {
           const nextTarget = focusedTruck.position.clone();
           nextTarget.y = Math.max(nextTarget.y, 3.4);
-          zoomState.desiredTarget.copy(nextTarget);
-          zoomState.desiredPosition.copy(nextTarget).add(cameraOffset);
-          cameraTransitioningRef.current = true;
+          const previousTarget = focusedTruckLastTargetRef.current;
+
+          if (!previousTarget) {
+            focusedTruckLastTargetRef.current = nextTarget.clone();
+          } else if (!cameraTransitioningRef.current) {
+            const delta = nextTarget.clone().sub(previousTarget);
+            controls.target.add(delta);
+            camera.position.add(delta);
+            zoomState.currentTarget.copy(controls.target);
+            zoomState.desiredTarget.copy(controls.target);
+            zoomState.currentPosition.copy(camera.position);
+            zoomState.desiredPosition.copy(camera.position);
+            focusedTruckLastTargetRef.current.copy(nextTarget);
+          } else {
+            focusedTruckLastTargetRef.current = nextTarget.clone();
+          }
         }
       }
       highlightTargets.forEach((target, key) => {
@@ -2125,6 +2374,7 @@ export function SimulationScene3D({
       onReadyStateChange?.(false);
       onRigFocusChange?.(null);
       assetsReadyRef.current = false;
+      focusedTruckLastTargetRef.current = null;
       window.cancelAnimationFrame(animationFrameId);
       resizeObserver.disconnect();
       renderer.domElement.removeEventListener("pointerdown", handlePointerDown);
@@ -2132,6 +2382,7 @@ export function SimulationScene3D({
       renderer.domElement.removeEventListener("pointerleave", handlePointerLeave);
       renderer.domElement.removeEventListener("dblclick", resetFocus);
       controls.removeEventListener("start", handleControlsStart);
+      controls.removeEventListener("change", handleControlsChange);
       controls.dispose();
       renderer.dispose();
       scene.traverse((object) => {

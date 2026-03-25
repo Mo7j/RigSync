@@ -1762,6 +1762,8 @@ p {
 .scene-speed-dropdown {
   position: relative;
   width: 132px;
+  z-index: 2;
+  pointer-events: auto;
 }
 
 .scene-speed-dropdown::after {
@@ -1807,6 +1809,7 @@ p {
   right: 0;
   bottom: calc(100% + 8px);
   width: 100%;
+  z-index: 3;
   display: grid;
   gap: 4px;
   padding: 6px;
@@ -1814,6 +1817,7 @@ p {
   background: rgba(255, 255, 255, 0.02);
   backdrop-filter: blur(18px);
   box-shadow: none;
+  pointer-events: auto;
 }
 
 .scene-speed-option {
@@ -1826,6 +1830,7 @@ p {
   font-weight: 500;
   text-align: left;
   padding: 0 12px;
+  pointer-events: auto;
 }
 
 .scene-speed-option:hover,
