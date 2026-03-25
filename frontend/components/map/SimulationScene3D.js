@@ -132,6 +132,27 @@ function buildTruckTypeAssignments(truckSetup, truckCount) {
   return expanded;
 }
 
+function getConfiguredTruckCount(simulation, playback) {
+  const configuredCount = (simulation?.truckSetup || []).reduce(
+    (sum, item) => sum + Math.max(0, Number.parseInt(item?.count, 10) || 0),
+    0,
+  );
+  if (configuredCount > 0) {
+    return configuredCount;
+  }
+
+  const scenarioTruckCount = Number.parseInt(simulation?.truckCount, 10) || 0;
+  if (scenarioTruckCount > 0) {
+    return scenarioTruckCount;
+  }
+
+  const playbackCount = Math.max(
+    0,
+    ...(playback?.trips?.map((trip) => Number.parseInt(trip?.truckId, 10) || 0) || []),
+  );
+  return playbackCount;
+}
+
 function setTruckVariantVisible(truckRoot, truckType) {
   const variantKey = getTruckModelKey(truckType);
   const variants = truckRoot.userData?.truckVariants || {};
@@ -156,12 +177,12 @@ function setTruckVariantVisible(truckRoot, truckType) {
 
 function getTruckVariantDimensions(variantKey) {
   if (variantKey === "heavyHaulerTruck") {
-    return { targetWidth: 23.8, targetHeight: 11.1 };
+    return { targetWidth: 17.2, targetHeight: 8.3 };
   }
   if (variantKey === "lowbedTruck") {
-    return { targetWidth: 21.8, targetHeight: 10.4 };
+    return { targetWidth: 15.9, targetHeight: 8.1 };
   }
-  return { targetWidth: 16.2, targetHeight: 9.2 };
+  return { targetWidth: 12.2, targetHeight: 7.2 };
 }
 
 function getTruckVariantWidthStretch(variantKey) {
@@ -931,7 +952,132 @@ function createRouteObjects(points) {
     routeRoot.add(routeShoulder);
   }
 
-  addRoadCurve(points, 4.4, 5.2, 8);
+  function getTrimmedRoadPoints(curvePoints, trimDistance = 23) {
+    if (curvePoints.length < 2) {
+      return curvePoints;
+    }
+    const metrics = buildWorldPathMetrics(curvePoints);
+    const totalLength = metrics.totalLength || 0;
+    if (totalLength <= trimDistance * 2) {
+      return curvePoints;
+    }
+    const startRatio = trimDistance / totalLength;
+    const endRatio = (totalLength - trimDistance) / totalLength;
+    const trimmed = [interpolateWorldPath(metrics, startRatio, curvePoints[0]?.y ?? 0)];
+    let traversed = 0;
+    for (let index = 1; index < curvePoints.length - 1; index += 1) {
+      traversed += metrics.segmentLengths[index - 1] || 0;
+      if (traversed <= trimDistance || traversed >= totalLength - trimDistance) {
+        continue;
+      }
+      trimmed.push(curvePoints[index].clone());
+    }
+
+    trimmed.push(interpolateWorldPath(metrics, endRatio, curvePoints[curvePoints.length - 1]?.y ?? 0));
+    return trimmed;
+  }
+
+  function addCenterDividerDashes(curvePoints) {
+    if (curvePoints.length < 2) {
+      return;
+    }
+
+    const dividerCurve = new THREE.CatmullRomCurve3(
+      curvePoints.map((point) => point.clone().setY(1.18)),
+      false,
+      "centripetal",
+      0.08,
+    );
+    const dividerLength = Math.max(dividerCurve.getLength(), 0.001);
+    const dashLength = 4.8;
+    const gapLength = 2.8;
+    const dashThickness = 0.32;
+    const dashStep = dashLength + gapLength;
+    const dashCount = Math.max(1, Math.floor(dividerLength / dashStep));
+    const dashMaterial = new THREE.MeshBasicMaterial({
+      color: 0xaab1b9,
+      transparent: false,
+      opacity: 1,
+      depthTest: true,
+      depthWrite: false,
+      side: THREE.DoubleSide,
+      fog: false,
+      toneMapped: false,
+      polygonOffset: true,
+      polygonOffsetFactor: -6,
+      polygonOffsetUnits: -12,
+    });
+
+    function createDashRibbon(pointsAlongDash, thickness) {
+      if (pointsAlongDash.length < 2) {
+        return null;
+      }
+
+      const positions = [];
+      const indices = [];
+
+      for (let pointIndex = 0; pointIndex < pointsAlongDash.length; pointIndex += 1) {
+        const current = pointsAlongDash[pointIndex];
+        const previous = pointsAlongDash[Math.max(0, pointIndex - 1)];
+        const next = pointsAlongDash[Math.min(pointsAlongDash.length - 1, pointIndex + 1)];
+        const tangent = next.clone().sub(previous).setY(0);
+        if (tangent.lengthSq() < 0.0001) {
+          tangent.set(1, 0, 0);
+        } else {
+          tangent.normalize();
+        }
+        const side = new THREE.Vector3(-tangent.z, 0, tangent.x).multiplyScalar(thickness * 0.5);
+        const left = current.clone().sub(side);
+        const right = current.clone().add(side);
+        positions.push(left.x, left.y, left.z, right.x, right.y, right.z);
+
+        if (pointIndex < pointsAlongDash.length - 1) {
+          const baseIndex = pointIndex * 2;
+          indices.push(
+            baseIndex,
+            baseIndex + 1,
+            baseIndex + 2,
+            baseIndex + 1,
+            baseIndex + 3,
+            baseIndex + 2,
+          );
+        }
+      }
+
+      const geometry = new THREE.BufferGeometry();
+      geometry.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3));
+      geometry.setIndex(indices);
+      geometry.computeVertexNormals();
+      return geometry;
+    }
+
+    for (let index = 0; index < dashCount; index += 1) {
+      const startDistance = index * dashStep;
+      const endDistance = Math.min(startDistance + dashLength, dividerLength);
+      const segmentLength = Math.max(0.1, endDistance - startDistance);
+      const sampleCount = Math.max(3, Math.ceil(segmentLength / 0.9));
+      const dashPoints = [];
+
+      for (let sampleIndex = 0; sampleIndex <= sampleCount; sampleIndex += 1) {
+        const sampleDistance = startDistance + ((segmentLength * sampleIndex) / sampleCount);
+        const sampleRatio = Math.max(0, Math.min(1, sampleDistance / dividerLength));
+        dashPoints.push(dividerCurve.getPointAt(sampleRatio));
+      }
+
+      const dashGeometry = createDashRibbon(dashPoints, dashThickness);
+      if (!dashGeometry) {
+        continue;
+      }
+      const dashMesh = new THREE.Mesh(dashGeometry, dashMaterial);
+      dashMesh.position.y += 0.36;
+      dashMesh.renderOrder = 4;
+      routeRoot.add(dashMesh);
+    }
+  }
+
+  addRoadCurve(points, 11.2, 13.1, 8);
+  const dividerPoints = getTrimmedRoadPoints(points, 23);
+  addCenterDividerDashes(dividerPoints);
 
   const routeLine = new THREE.Line(
     new THREE.BufferGeometry().setFromPoints(points.map((point) => point.clone().setY(1.16))),
@@ -1418,6 +1564,8 @@ export function SimulationScene3D({
       routeDirectionWorld.normalize();
     }
     const routeSideWorld = new THREE.Vector3(-routeDirectionWorld.z, 0, routeDirectionWorld.x).normalize();
+    const directionLaneCenterOffset = 7.4;
+    const sameDirectionSubLaneSpacing = 2.6;
     const parkedTruckHeading = Math.atan2(routeDirectionWorld.x, routeDirectionWorld.z);
     const sourceParkingAnchor = straightStartWorld.clone()
       .add(routeDirectionWorld.clone().multiplyScalar(-30));
@@ -1438,6 +1586,22 @@ export function SimulationScene3D({
 
     function getDestinationParkingWorld(truckId) {
       return getParkingWorld(destinationParkingAnchor, truckId);
+    }
+
+    function getAlternatingSubLaneOffset(truckId) {
+      const slotIndex = Math.max(0, truckId - 1);
+      const subLaneDirection = slotIndex % 2 === 0 ? -1 : 1;
+      return routeSideWorld.clone().multiplyScalar(subLaneDirection * sameDirectionSubLaneSpacing);
+    }
+
+    function getTravelLaneOffset(truckId, direction) {
+      const directionOffset = direction === "outbound"
+        ? directionLaneCenterOffset
+        : -directionLaneCenterOffset;
+      return routeSideWorld
+        .clone()
+        .multiplyScalar(directionOffset)
+        .add(getAlternatingSubLaneOffset(truckId));
     }
 
     const scene = new THREE.Scene();
@@ -2093,13 +2257,14 @@ export function SimulationScene3D({
       const playback = nextSimulation?.bestPlan?.playback;
       const minute = currentMinuteRef.current;
       const routeDistanceKm = Math.max(measuredRouteMetrics.totalKm, 0.001);
-      const activeTruckCount = Math.max(1, nextSimulation?.truckCount || 0);
+      const activeTruckCount = getConfiguredTruckCount(nextSimulation, playback);
       const truckTypeAssignments = buildTruckTypeAssignments(nextSimulation?.truckSetup, activeTruckCount);
       const totalTrips = Math.max(playback?.trips?.length || 0, 1);
 
       if (!assetsReadyRef.current) {
         truckMeshes.forEach((mesh) => {
           mesh.visible = false;
+          mesh.position.set(0, -1000, 0);
         });
         return;
       }
@@ -2107,6 +2272,7 @@ export function SimulationScene3D({
       if (!playback?.trips?.length) {
         truckMeshes.forEach((mesh) => {
           mesh.visible = false;
+          mesh.position.set(0, -1000, 0);
         });
         return;
       }
@@ -2170,11 +2336,14 @@ export function SimulationScene3D({
       truckMeshes.forEach((mesh, truckId) => {
         if (truckId > activeTruckCount) {
           mesh.visible = false;
+          mesh.position.set(0, -1000, 0);
           return;
         }
 
         const assignedTruckType = truckTypeAssignments[truckId - 1] || "LowBed";
         const truckBodyOffset = getTruckVariantRoadOffset(assignedTruckType);
+        const outboundLaneOffset = getTravelLaneOffset(truckId, "outbound");
+        const inboundLaneOffset = getTravelLaneOffset(truckId, "inbound");
         if (mesh.userData?.truckType !== assignedTruckType) {
           setTruckVariantVisible(mesh, assignedTruckType);
         }
@@ -2182,6 +2351,7 @@ export function SimulationScene3D({
         const truckTrips = playback?.trips?.filter((trip) => trip.truckId === truckId) || [];
         if (!truckTrips.length) {
           mesh.visible = false;
+          mesh.position.set(0, -1000, 0);
           return;
         }
 
@@ -2213,8 +2383,10 @@ export function SimulationScene3D({
           const outboundRatio = (minute - activeTrip.rigDownFinish) / tripDuration;
           const forwardMinute = Math.min(minute + 0.6, activeTrip.arrivalAtDestination);
           const nextOutboundRatio = (forwardMinute - activeTrip.rigDownFinish) / tripDuration;
-          currentWorld = interpolateWorldPathWithEndpointOffset(projectedRouteMetrics, outboundRatio, truckBodyOffset, 1.5);
-          nextWorld = interpolateWorldPathWithEndpointOffset(projectedRouteMetrics, nextOutboundRatio, truckBodyOffset, 1.5);
+          currentWorld = interpolateWorldPathWithEndpointOffset(projectedRouteMetrics, outboundRatio, truckBodyOffset, 1.5)
+            .add(outboundLaneOffset);
+          nextWorld = interpolateWorldPathWithEndpointOffset(projectedRouteMetrics, nextOutboundRatio, truckBodyOffset, 1.5)
+            .add(outboundLaneOffset);
           distanceKm = routeDistanceKm * Math.max(0, Math.min(1, outboundRatio));
         } else if (minute < activeTrip.rigUpFinish) {
           currentWorld = getDestinationParkingWorld(truckId);
@@ -2225,8 +2397,10 @@ export function SimulationScene3D({
           const inboundRatio = (minute - activeTrip.rigUpFinish) / tripDuration;
           const forwardMinute = Math.min(minute + 0.6, activeTrip.returnToSource);
           const nextInboundRatio = (forwardMinute - activeTrip.rigUpFinish) / tripDuration;
-          currentWorld = interpolateWorldPathWithEndpointOffset(reversedProjectedRouteMetrics, inboundRatio, truckBodyOffset, 1.5);
-          nextWorld = interpolateWorldPathWithEndpointOffset(reversedProjectedRouteMetrics, nextInboundRatio, truckBodyOffset, 1.5);
+          currentWorld = interpolateWorldPathWithEndpointOffset(reversedProjectedRouteMetrics, inboundRatio, truckBodyOffset, 1.5)
+            .add(inboundLaneOffset);
+          nextWorld = interpolateWorldPathWithEndpointOffset(reversedProjectedRouteMetrics, nextInboundRatio, truckBodyOffset, 1.5)
+            .add(inboundLaneOffset);
           distanceKm = routeDistanceKm * Math.max(0, 1 - Math.min(1, inboundRatio));
         } else {
           currentWorld = getDestinationParkingWorld(truckId);

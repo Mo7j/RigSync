@@ -606,6 +606,15 @@ export function RigMovePage({
     );
   }, [isCustomizeActive, logicalLoads, move.simulation, activeScenario, deferredTotalTrucks]);
   const selectedScenario = isCustomizeActive && customPreviewScenario ? customPreviewScenario : activeScenario;
+  const effectiveTruckCount = isCustomizeActive
+    ? (deferredTotalTrucks || totalTrucks || selectedScenario?.truckCount || 1)
+    : (selectedScenario?.truckCount || totalTrucks || 1);
+  const effectiveTruckSetup = isCustomizeActive
+    ? deferredTruckSetup
+    : buildDisplayedTruckCounts(truckSetup, effectiveTruckCount).map((truck) => ({
+        ...truck,
+        count: String(truck.count),
+      }));
 
   const displaySimulation = useMemo(
     () => ({
@@ -616,9 +625,9 @@ export function RigMovePage({
       bestScenario: selectedScenario,
       routeGeometry: selectedScenario.routeGeometry,
       routeMinutes: selectedScenario.routeMinutes,
-      truckSetup: deferredTruckSetup,
+      truckSetup: effectiveTruckSetup,
     }),
-    [move.simulation, selectedScenario, deferredTruckSetup],
+    [move.simulation, selectedScenario, effectiveTruckSetup],
   );
 
   const totalMinutes = displaySimulation.bestPlan.totalMinutes;
@@ -630,8 +639,8 @@ export function RigMovePage({
   const activePlanSummary = getPlanSummary(selectedScenario);
   const activePlanDashboard = getPlanDashboardStats(selectedScenario, move);
   const displayedTruckCounts = useMemo(
-    () => buildDisplayedTruckCounts(truckSetup, selectedScenario?.truckCount || totalTrucks),
-    [truckSetup, selectedScenario, totalTrucks],
+    () => buildDisplayedTruckCounts(effectiveTruckSetup, effectiveTruckCount),
+    [effectiveTruckSetup, effectiveTruckCount],
   );
   const focusedRigStats = useMemo(
     () =>
@@ -675,7 +684,7 @@ export function RigMovePage({
   }
 
   const playbackSpeedOptions = [
-    { value: "500", label: "Normal" },
+    { value: "1500", label: "Normal" },
     { value: "15000", label: "Medium" },
     { value: "50000", label: "Fast" },
   ];
@@ -799,7 +808,7 @@ export function RigMovePage({
                     "div",
                     { className: "scene-plan-summary-card scene-plan-summary-card-title" },
                     h("span", { className: "scene-panel-kicker" }, "Selected Plan"),
-                    h("strong", { className: "scene-plan-summary-title" }, `${isCustomizeActive ? "Customize" : activeScenario.name} | ${isCustomizeActive ? totalTrucks : activeScenario.truckCount} Trucks`),
+                    h("strong", { className: "scene-plan-summary-title" }, `${isCustomizeActive ? "Customize" : activeScenario.name} | ${effectiveTruckCount} Trucks`),
                   ),
                 ),
                 h(
@@ -854,7 +863,7 @@ export function RigMovePage({
                     "div",
                     { className: "scene-plan-summary-card scene-plan-summary-card-title" },
                     h("span", { className: "scene-panel-kicker" }, "Selected Plan"),
-                    h("strong", { className: "scene-plan-summary-title" }, `${isCustomizeActive ? "Customize" : activeScenario.name} | ${isCustomizeActive ? totalTrucks : activeScenario.truckCount} Trucks`),
+                    h("strong", { className: "scene-plan-summary-title" }, `${isCustomizeActive ? "Customize" : activeScenario.name} | ${effectiveTruckCount} Trucks`),
                   ),
                 ),
                 h(
