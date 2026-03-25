@@ -250,7 +250,12 @@ function App() {
     let cancelled = false;
 
     async function ensureMovePlans() {
-      if (route.page !== "move" || !activeMove || !logicalLoads.length || hasMultiTruckPlans(activeMove)) {
+      const needsRouteRefresh =
+        activeMove?.routeMode !== "live" ||
+        (activeMove?.simulation?.routeGeometry?.length || 0) < 3;
+      const needsPlanRefresh = activeMove ? !hasMultiTruckPlans(activeMove) : false;
+
+      if (route.page !== "move" || !activeMove || !logicalLoads.length || (!needsPlanRefresh && !needsRouteRefresh)) {
         return;
       }
 
@@ -479,6 +484,7 @@ function App() {
       workerCount: bestScenario.workerCount,
       truckCount: bestScenario.truckCount,
       truckSetup: sanitizedTruckSetup,
+      routeDistanceKm: routeData.distanceKm,
       routeMinutes: routeData.minutes,
       routeSource: routeData.source,
       routeGeometry: routeData.geometry,
@@ -510,6 +516,7 @@ function App() {
       startLabel,
       endLabel,
       truckSetup: sanitizedTruckSetup,
+      routeKm: routeData.distanceKm,
       eta: formatMinutes(bestPlan.totalMinutes),
       routeTime: formatMinutes(routeData.minutes),
       progressMinute: 0,

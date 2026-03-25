@@ -6,7 +6,7 @@ function roundCoordinate(value) {
   return Math.round(value * 100000) / 100000;
 }
 
-function compactGeometry(geometry, maxPoints = 120) {
+function compactGeometry(geometry, maxPoints = 1200) {
   if (!Array.isArray(geometry) || geometry.length <= maxPoints) {
     return geometry;
   }
@@ -67,6 +67,7 @@ function compactScenarioPlan(plan) {
     workerCount: plan.workerCount,
     truckCount: plan.truckCount,
     capacity: plan.capacity,
+    routeDistanceKm: plan.routeDistanceKm,
     routeMinutes: plan.routeMinutes,
     routeSource: plan.routeSource,
     routeGeometry: compactGeometry(plan.routeGeometry || []),
@@ -101,6 +102,7 @@ function compactSimulation(simulation) {
     workerCount: simulation.workerCount,
     truckCount: simulation.truckCount,
     truckSetup: simulation.truckSetup || [],
+    routeDistanceKm: simulation.routeDistanceKm,
     routeMinutes: simulation.routeMinutes,
     routeSource: simulation.routeSource,
     preferredScenarioName,
@@ -198,7 +200,10 @@ export function updateMoveProgress(moveId, progressMinute) {
 
 export function createMoveRecord({ name, startPoint, endPoint, startLabel, endLabel, simulation, routeMode, loadCount }) {
   const totalMinutes = simulation.bestPlan.totalMinutes;
-  const routeKm = Math.max(1, Math.round(haversineKilometers(startPoint, endPoint) * 10) / 10);
+  const routeKm =
+    simulation?.routeDistanceKm ||
+    simulation?.bestScenario?.routeDistanceKm ||
+    Math.max(1, Math.round(haversineKilometers(startPoint, endPoint) * 10) / 10);
   const now = new Date();
 
   return {

@@ -141,21 +141,26 @@ export async function fetchRouteData(start, end) {
   const payload = await response.json();
   const route = payload?.routes?.[0];
   const seconds = route?.duration;
+  const distanceMeters = route?.distance;
 
-  if (!seconds || !route?.geometry?.coordinates?.length) {
+  if (!seconds || !distanceMeters || !route?.geometry?.coordinates?.length) {
     throw new Error("No route duration returned");
   }
 
   return {
     minutes: Math.max(1, Math.round(seconds / 60)),
+    distanceKm: Math.max(1, Math.round((distanceMeters / 1000) * 10) / 10),
     geometry: route.geometry.coordinates.map(([lng, lat]) => [lat, lng]),
     source: "OSRM driving route",
   };
 }
 
 export function fallbackRouteData(start, end) {
+  const distanceKm = haversineKilometers(start, end);
+
   return {
     minutes: haversineMinutes(start, end),
+    distanceKm: Math.max(1, Math.round(distanceKm * 10) / 10),
     geometry: [
       [start.lat, start.lng],
       [end.lat, end.lng],
@@ -371,6 +376,7 @@ export function buildScenarioPlans(logicalLoads, routeData, workerCount, truckCo
           name: variant.name,
           waves,
           routeMinutes: routeData.minutes,
+          routeDistanceKm: routeData.distanceKm,
           processingMinutes: Math.max(0, playback.totalMinutes - routeData.minutes),
           totalMinutes: playback.totalMinutes,
           playback,
@@ -387,6 +393,7 @@ export function buildScenarioPlans(logicalLoads, routeData, workerCount, truckCo
         truckCount: planTruckCount,
         capacity,
         routeMinutes: routeData.minutes,
+        routeDistanceKm: routeData.distanceKm,
         routeSource: routeData.source,
         routeGeometry: routeData.geometry,
         variantPlans,

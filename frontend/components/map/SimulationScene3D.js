@@ -1169,20 +1169,20 @@ export function SimulationScene3D({
 
     const routeGeometry = simulation?.routeGeometry || [];
     const routePoints = routeGeometry.map(([lat, lng]) => ({ lat, lng }));
-    const straightRoutePoints =
-      startPoint && endPoint
-        ? [startPoint, endPoint]
-        : routePoints.length >= 2
-          ? [routePoints[0], routePoints[routePoints.length - 1]]
+    const activeRoutePoints =
+      routePoints.length >= 2
+        ? routePoints
+        : startPoint && endPoint
+          ? [startPoint, endPoint]
           : routePoints;
     const geoPoints = [
       ...(startPoint ? [startPoint] : []),
-      ...straightRoutePoints,
+      ...activeRoutePoints,
       ...(endPoint ? [endPoint] : []),
     ];
     const projection = buildProjection(geoPoints);
-    const measuredRouteMetrics = buildRouteMetrics(routePoints.length >= 2 ? routePoints : straightRoutePoints);
-    const projectedRoute = straightRoutePoints.map((point) => projection.project(point, 1.2));
+    const measuredRouteMetrics = buildRouteMetrics(activeRoutePoints);
+    const projectedRoute = activeRoutePoints.map((point) => projection.project(point, 1.2));
     const straightStartWorld = projectedRoute[0] || new THREE.Vector3(0, 1.2, 0);
     const straightEndWorld = projectedRoute[projectedRoute.length - 1] || new THREE.Vector3(0, 1.2, 0);
     const platformSize = Math.max(340, projection.extent * 0.32);

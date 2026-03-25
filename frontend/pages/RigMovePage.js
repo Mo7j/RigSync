@@ -507,11 +507,13 @@ export function RigMovePage({
   }, [isSpeedDropdownOpen]);
 
   useEffect(() => {
+    const isNewMove = previousMoveIdRef.current !== move?.id;
+
     setHasSceneInitialized(Boolean(sceneAssetsReady));
     setTruckSetup(normalizeTruckSetup(move));
     setActiveScenarioName(move?.simulation?.preferredScenarioName || "");
     setActivePlanKey((current) => {
-      if (previousMoveIdRef.current !== move?.id) {
+      if (isNewMove) {
         previousMoveIdRef.current = move?.id || null;
         return move?.simulation?.preferredScenarioName || "";
       }
@@ -519,7 +521,9 @@ export function RigMovePage({
       return current === "customize" ? "customize" : move?.simulation?.preferredScenarioName || "";
     });
     setActiveView("map");
-    setSceneMode("3d");
+    if (isNewMove) {
+      setSceneMode("3d");
+    }
     setFocusedRigSide(null);
     setIsSpeedDropdownOpen(false);
   }, [move?.id, move?.updatedAt]);
@@ -724,47 +728,45 @@ export function RigMovePage({
         h(
           "div",
           { className: "scene-bottom-controls" },
-          isPlaybackRunning || isPlaybackPaused
-            ? h(
-                "div",
-                {
-                  ref: speedDropdownRef,
-                  className: `scene-speed-dropdown${isSpeedDropdownOpen ? " is-open" : ""}`,
-                },
-                h(
-                  "button",
-                  {
-                    type: "button",
-                    className: "scene-speed-select",
-                    onClick: () => setIsSpeedDropdownOpen((current) => !current),
-                    "aria-haspopup": "listbox",
-                    "aria-expanded": isSpeedDropdownOpen ? "true" : "false",
-                  },
-                  h("span", null, activePlaybackSpeedOption.label),
-                ),
-                isSpeedDropdownOpen
-                  ? h(
-                      "div",
-                      { className: "scene-speed-menu", role: "listbox", "aria-label": "Playback speed" },
-                      playbackSpeedOptions.map((option) =>
-                        h(
-                          "button",
-                          {
-                            key: `speed-${option.value}`,
-                            type: "button",
-                            className: `scene-speed-option${String(playbackSpeed) === option.value ? " is-active" : ""}`,
-                            onClick: () => {
-                              onPlaybackSpeedChange?.(option.value === "1" ? 1 : option.value);
-                              setIsSpeedDropdownOpen(false);
-                            },
-                          },
-                          option.label,
-                        ),
-                      ),
-                    )
-                  : null,
-              )
-            : null,
+          h(
+            "div",
+            {
+              ref: speedDropdownRef,
+              className: `scene-speed-dropdown${isSpeedDropdownOpen ? " is-open" : ""}`,
+            },
+            h(
+              "button",
+              {
+                type: "button",
+                className: "scene-speed-select",
+                onClick: () => setIsSpeedDropdownOpen((current) => !current),
+                "aria-haspopup": "listbox",
+                "aria-expanded": isSpeedDropdownOpen ? "true" : "false",
+              },
+              h("span", null, activePlaybackSpeedOption.label),
+            ),
+            isSpeedDropdownOpen
+              ? h(
+                  "div",
+                  { className: "scene-speed-menu", role: "listbox", "aria-label": "Playback speed" },
+                  playbackSpeedOptions.map((option) =>
+                    h(
+                      "button",
+                      {
+                        key: `speed-${option.value}`,
+                        type: "button",
+                        className: `scene-speed-option${String(playbackSpeed) === option.value ? " is-active" : ""}`,
+                        onClick: () => {
+                          onPlaybackSpeedChange?.(option.value === "1" ? 1 : option.value);
+                          setIsSpeedDropdownOpen(false);
+                        },
+                      },
+                      option.label,
+                    ),
+                  ),
+                )
+              : null,
+          ),
           h(
             "button",
             {
