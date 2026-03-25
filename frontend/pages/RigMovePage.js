@@ -5,6 +5,7 @@ import { Card, StatCard } from "../components/ui/Card.js";
 import { ProgressBar } from "../components/ui/ProgressBar.js";
 import { Field, TextInput } from "../components/ui/Field.js";
 import { SimulationScene3D } from "../components/map/SimulationScene3D.js";
+import { LeafletMap } from "../components/map/LeafletMap.js";
 import { formatMinutes } from "../lib/format.js";
 import { buildScenarioPlans } from "../features/rigMoves/simulation.js";
 
@@ -478,6 +479,7 @@ export function RigMovePage({
   const [activeScenarioName, setActiveScenarioName] = useState(move?.simulation?.preferredScenarioName || "");
   const [activePlanKey, setActivePlanKey] = useState(move?.simulation?.preferredScenarioName || "");
   const [activeView, setActiveView] = useState("map");
+  const [sceneMode, setSceneMode] = useState("3d");
   const [focusedRigSide, setFocusedRigSide] = useState(null);
   const [isSpeedDropdownOpen, setIsSpeedDropdownOpen] = useState(false);
 
@@ -517,6 +519,7 @@ export function RigMovePage({
       return current === "customize" ? "customize" : move?.simulation?.preferredScenarioName || "";
     });
     setActiveView("map");
+    setSceneMode("3d");
     setFocusedRigSide(null);
     setIsSpeedDropdownOpen(false);
   }, [move?.id, move?.updatedAt]);
@@ -685,19 +688,27 @@ export function RigMovePage({
           onClick: onBack,
           children: "<",
         }),
-        h(SimulationScene3D, {
-          startPoint: move.startPoint,
-          endPoint: move.endPoint,
-          startLabel: move.startLabel,
-          endLabel: move.endLabel,
-          simulation: displaySimulation,
-          currentMinute: visibleMinute,
-          sceneFocusResetKey,
-          heightClass: "scene-only-canvas",
-          showOverlay: false,
-          onReadyStateChange: onScenePlaybackReadyChange,
-          onRigFocusChange: setFocusedRigSide,
-        }),
+        sceneMode === "3d"
+          ? h(SimulationScene3D, {
+              startPoint: move.startPoint,
+              endPoint: move.endPoint,
+              startLabel: move.startLabel,
+              endLabel: move.endLabel,
+              simulation: displaySimulation,
+              currentMinute: visibleMinute,
+              sceneFocusResetKey,
+              heightClass: "scene-only-canvas",
+              showOverlay: false,
+              onReadyStateChange: onScenePlaybackReadyChange,
+              onRigFocusChange: setFocusedRigSide,
+            })
+          : h(LeafletMap, {
+              startPoint: move.startPoint,
+              endPoint: move.endPoint,
+              simulation: displaySimulation,
+              currentMinute: visibleMinute,
+              heightClass: "scene-only-canvas",
+            }),
         h(
           "div",
           { className: "scene-move-info" },
@@ -710,47 +721,60 @@ export function RigMovePage({
             h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Travel"), h("strong", null, move.routeTime || formatMinutes(move.simulation?.routeMinutes || 0))),
           ),
         ),
-        isPlaybackRunning || isPlaybackPaused
-          ? h(
-              "div",
-              {
-                ref: speedDropdownRef,
-                className: `scene-speed-dropdown${isSpeedDropdownOpen ? " is-open" : ""}`,
-              },
-              h(
-                "button",
+        h(
+          "div",
+          { className: "scene-bottom-controls" },
+          isPlaybackRunning || isPlaybackPaused
+            ? h(
+                "div",
                 {
-                  type: "button",
-                  className: "scene-speed-select",
-                  onClick: () => setIsSpeedDropdownOpen((current) => !current),
-                  "aria-haspopup": "listbox",
-                  "aria-expanded": isSpeedDropdownOpen ? "true" : "false",
+                  ref: speedDropdownRef,
+                  className: `scene-speed-dropdown${isSpeedDropdownOpen ? " is-open" : ""}`,
                 },
-                h("span", null, activePlaybackSpeedOption.label),
-              ),
-              isSpeedDropdownOpen
-                ? h(
-                    "div",
-                    { className: "scene-speed-menu", role: "listbox", "aria-label": "Playback speed" },
-                    playbackSpeedOptions.map((option) =>
-                      h(
-                        "button",
-                        {
-                          key: `speed-${option.value}`,
-                          type: "button",
-                          className: `scene-speed-option${String(playbackSpeed) === option.value ? " is-active" : ""}`,
-                          onClick: () => {
-                            onPlaybackSpeedChange?.(option.value === "1" ? 1 : option.value);
-                            setIsSpeedDropdownOpen(false);
+                h(
+                  "button",
+                  {
+                    type: "button",
+                    className: "scene-speed-select",
+                    onClick: () => setIsSpeedDropdownOpen((current) => !current),
+                    "aria-haspopup": "listbox",
+                    "aria-expanded": isSpeedDropdownOpen ? "true" : "false",
+                  },
+                  h("span", null, activePlaybackSpeedOption.label),
+                ),
+                isSpeedDropdownOpen
+                  ? h(
+                      "div",
+                      { className: "scene-speed-menu", role: "listbox", "aria-label": "Playback speed" },
+                      playbackSpeedOptions.map((option) =>
+                        h(
+                          "button",
+                          {
+                            key: `speed-${option.value}`,
+                            type: "button",
+                            className: `scene-speed-option${String(playbackSpeed) === option.value ? " is-active" : ""}`,
+                            onClick: () => {
+                              onPlaybackSpeedChange?.(option.value === "1" ? 1 : option.value);
+                              setIsSpeedDropdownOpen(false);
+                            },
                           },
-                        },
-                        option.label,
+                          option.label,
+                        ),
                       ),
-                    ),
-                  )
-                : null,
-            )
-          : null,
+                    )
+                  : null,
+              )
+            : null,
+          h(
+            "button",
+            {
+              type: "button",
+              className: "scene-dimension-toggle",
+              onClick: () => setSceneMode((current) => (current === "3d" ? "2d" : "3d")),
+            },
+            sceneMode === "3d" ? "2D" : "3D",
+          ),
+        ),
         h(
           "aside",
           { className: "scene-panel scene-panel-left scene-panel-left-merged" },

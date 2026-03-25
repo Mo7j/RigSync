@@ -1664,6 +1664,9 @@ p {
 }
 
 .scene-only-canvas {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
   width: 100%;
   height: 100%;
   min-height: 100vh;
@@ -1686,6 +1689,14 @@ p {
 
 .scene-only-shell .scene-3d-shell::before {
   display: none;
+}
+
+.scene-only-shell .real-map,
+.scene-only-shell .leaflet-container,
+.scene-only-shell .leaflet-pane,
+.scene-only-shell .leaflet-top,
+.scene-only-shell .leaflet-bottom {
+  z-index: 1;
 }
 
 .scene-panel {
@@ -1730,12 +1741,19 @@ p {
   overflow: visible;
 }
 
-.scene-speed-dropdown {
+.scene-bottom-controls {
   position: absolute;
   right: 24px;
   bottom: 24px;
   z-index: 6;
-  width: min(132px, calc(100vw - 48px));
+  display: flex;
+  align-items: flex-end;
+  gap: 10px;
+}
+
+.scene-speed-dropdown {
+  position: relative;
+  width: 132px;
 }
 
 .scene-speed-dropdown::after {
@@ -1804,6 +1822,25 @@ p {
 
 .scene-speed-option:hover,
 .scene-speed-option.is-active {
+  background: rgba(255, 216, 74, 0.08);
+  color: #ffd84a;
+}
+
+.scene-dimension-toggle {
+  min-width: 64px;
+  height: 38px;
+  border: 0;
+  border-radius: 18px;
+  background: rgba(255, 255, 255, 0.02);
+  color: #f5f7fb;
+  font-size: 0.84rem;
+  font-weight: 500;
+  padding: 0 16px;
+  backdrop-filter: blur(18px);
+  box-shadow: none;
+}
+
+.scene-dimension-toggle:hover {
   background: rgba(255, 216, 74, 0.08);
   color: #ffd84a;
 }
