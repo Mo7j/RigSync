@@ -13,8 +13,8 @@ const MODEL_PATHS = {
   flatbedTruck: "/assets/models/FlatBed.glb",
   lowbedTruck: "/assets/models/LowBed.glb",
   heavyHaulerTruck: "/assets/models/HeavyHauler.glb",
-  rig: "/assets/models/1.glb",
-  terrain: "/assets/models/m.glb",
+  rig: "/assets/models/rig.glb",
+  terrain: "/assets/models/mountain.glb",
 };
 
 export function preloadSimulationSceneAssets() {
