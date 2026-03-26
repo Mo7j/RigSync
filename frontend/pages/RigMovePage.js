@@ -924,6 +924,7 @@ function PlaybackActionButton({ isRunning, isBusy, isPaused, onRun, onEnd, onPau
     { className: "scene-playback-action" },
     h(Button, {
       type: "button",
+      className: `scene-playback-main-button${!isRunning && !isPaused && label === "Resume" ? " is-resume" : ""}`,
       isBusy: isBusy,
       onClick: isRunning || isPaused ? onEnd : onRun,
       children: isRunning || isPaused ? "End" : label,
@@ -974,6 +975,7 @@ export function RigMovePage({
   const [activePlanKey, setActivePlanKey] = useState(move?.simulation?.preferredScenarioName || "");
   const [activeView, setActiveView] = useState("map");
   const [sceneMode, setSceneMode] = useState("3d");
+  const [activeStageKey, setActiveStageKey] = useState("planning");
   const [timelineZoom, setTimelineZoom] = useState(1);
   const [timelineRowType, setTimelineRowType] = useState("truck");
   const [timelineGapMinutes, setTimelineGapMinutes] = useState(8 * 60);
@@ -1213,13 +1215,139 @@ export function RigMovePage({
         "main",
         { className: "scene-only-shell" },
         !isTimelineMode
-          ? h(Button, {
-              type: "button",
-              variant: "ghost",
-              className: "scene-back-button",
-              onClick: onBack,
-              children: "<",
-            })
+          ? h(
+              "div",
+              { className: "scene-top-bar" },
+              h(
+                "div",
+                { className: "scene-top-left-actions" },
+                h(Button, {
+                  type: "button",
+                  variant: "ghost",
+                  className: "scene-back-button",
+                  onClick: onBack,
+                  children: h(
+                    "svg",
+                    {
+                      className: "scene-back-icon",
+                      viewBox: "0 0 16 16",
+                      "aria-hidden": "true",
+                    },
+                    h("path", {
+                      d: "M 10.5 3.5 L 6 8 L 10.5 12.5",
+                      fill: "none",
+                      stroke: "currentColor",
+                      "stroke-width": "2.2",
+                      "stroke-linecap": "round",
+                      "stroke-linejoin": "round",
+                    }),
+                  ),
+                }),
+                h(Button, {
+                  type: "button",
+                  variant: "ghost",
+                  className: "scene-top-action-button",
+                  onClick: () => setSceneMode("timeline"),
+                  children: "Timeline",
+                }),
+              ),
+              h(
+                "div",
+                { className: "scene-top-title scene-passive-overlay" },
+                h("span", { className: "scene-panel-kicker" }, "Move"),
+                h("strong", { className: "scene-top-title-text" }, move.name || "Rig Move"),
+                h(
+                  "div",
+                  { className: "scene-stage-progress" },
+                  [
+                    {
+                      key: "planning",
+                      label: "Planning",
+                      icon: h(
+                        "svg",
+                        { className: "scene-stage-icon", viewBox: "0 0 16 16", "aria-hidden": "true" },
+                        h("path", {
+                          d: "M 3.5 4.5 H 12.5 M 3.5 8 H 12.5 M 3.5 11.5 H 9.5",
+                          fill: "none",
+                          stroke: "currentColor",
+                          "stroke-width": "1.8",
+                          "stroke-linecap": "round",
+                        }),
+                      ),
+                    },
+                    {
+                      key: "tracking",
+                      label: "Tracking",
+                      icon: h(
+                        "svg",
+                        { className: "scene-stage-icon", viewBox: "0 0 16 16", "aria-hidden": "true" },
+                        h("path", {
+                          d: "M 8 3.5 C 5.2 3.5 3.3 5.4 3.3 8 C 3.3 10.6 5.2 12.5 8 12.5 C 10.8 12.5 12.7 10.6 12.7 8 C 12.7 5.4 10.8 3.5 8 3.5 Z",
+                          fill: "none",
+                          stroke: "currentColor",
+                          "stroke-width": "1.6",
+                        }),
+                        h("path", {
+                          d: "M 8 5.6 V 8 L 9.9 9.4",
+                          fill: "none",
+                          stroke: "currentColor",
+                          "stroke-width": "1.6",
+                          "stroke-linecap": "round",
+                          "stroke-linejoin": "round",
+                        }),
+                      ),
+                    },
+                    {
+                      key: "analysing",
+                      label: "Analysing",
+                      icon: h(
+                        "svg",
+                        { className: "scene-stage-icon", viewBox: "0 0 16 16", "aria-hidden": "true" },
+                        h("path", {
+                          d: "M 4 11.5 L 6.3 8.6 L 8 9.8 L 11.5 5.8",
+                          fill: "none",
+                          stroke: "currentColor",
+                          "stroke-width": "1.8",
+                          "stroke-linecap": "round",
+                          "stroke-linejoin": "round",
+                        }),
+                        h("path", {
+                          d: "M 4 4.5 V 11.5 H 12",
+                          fill: "none",
+                          stroke: "currentColor",
+                          "stroke-width": "1.5",
+                          "stroke-linecap": "round",
+                          "stroke-linejoin": "round",
+                        }),
+                      ),
+                    },
+                  ].map((stage, index, stages) => {
+                    const activeStageIndex = stages.findIndex((item) => item.key === activeStageKey);
+                    const isCompleted = activeStageIndex > index;
+                    const isActive = activeStageIndex === index;
+
+                    return h(
+                      "div",
+                      {
+                        key: stage.key,
+                        className: `scene-stage-item${isActive ? " is-active" : ""}${isCompleted ? " is-completed" : ""}`,
+                      },
+                      h(
+                        "button",
+                        {
+                          type: "button",
+                          className: "scene-stage-button",
+                          onClick: () => setActiveStageKey(stage.key),
+                        },
+                        h("div", { className: "scene-stage-node" }, stage.icon),
+                        h("span", { className: "scene-stage-label" }, stage.label),
+                      ),
+                      index < stages.length - 1 ? h("span", { className: "scene-stage-link", "aria-hidden": "true" }) : null,
+                    );
+                  }),
+                ),
+              ),
+            )
           : null,
         isTimelineMode
           ? h(
@@ -1506,7 +1634,7 @@ export function RigMovePage({
                 "aria-haspopup": "listbox",
                 "aria-expanded": isSpeedDropdownOpen ? "true" : "false",
               },
-              h("span", null, activePlaybackSpeedOption.label),
+              h("span", null, "Speed"),
             ),
             isSpeedDropdownOpen
               ? h(
@@ -1539,19 +1667,23 @@ export function RigMovePage({
           h(
             "div",
             { className: "scene-mode-switcher" },
-            ["3d", "2d", "timeline"].map((mode) =>
-              h(
-                "button",
-                {
-                  key: `scene-mode-${mode}`,
-                  type: "button",
-                  className: `scene-dimension-toggle${sceneMode === mode ? " is-active" : ""}`,
-                  onClick: () => setSceneMode(mode),
-                },
-                mode === "3d" ? "3D" : mode === "2d" ? "2D" : "Time Line",
+            h(
+              "div",
+              { className: "scene-mode-mini-nav" },
+              ["3d", "2d"].map((mode) =>
+                h(
+                  "button",
+                  {
+                    key: `scene-mode-${mode}`,
+                    type: "button",
+                    className: `scene-dimension-toggle scene-mode-mini-nav-button${sceneMode === mode ? " is-active" : ""}`,
+                    onClick: () => setSceneMode(mode),
+                  },
+                  mode === "3d" ? "3D" : "2D",
                 ),
               ),
             ),
+          ),
           sceneMode === "timeline"
             ? h(
                 "div",
@@ -1587,7 +1719,7 @@ export function RigMovePage({
             ? [
                 h(
                   "div",
-                  { className: "scene-plan-summary-stack" },
+                  { className: "scene-plan-summary-stack scene-passive-overlay" },
                   h(
                     "div",
                     { className: "scene-plan-summary-card scene-plan-summary-card-title" },
@@ -1642,7 +1774,7 @@ export function RigMovePage({
             : [
                 h(
                   "div",
-                  { className: "scene-plan-summary-stack" },
+                  { className: "scene-plan-summary-stack scene-passive-overlay" },
                   h(
                     "div",
                     { className: "scene-plan-summary-card scene-plan-summary-card-title" },
@@ -1652,11 +1784,11 @@ export function RigMovePage({
                 ),
                 h(
                   "section",
-                  { className: "scene-panel-section scene-panel-section-plain" },
+                  { className: "scene-panel-section scene-panel-section-plain scene-passive-overlay" },
                   displayedTruckCounts.map((truck) =>
                     h(
                       "div",
-                      { key: truck.id, className: "truck-count-row" },
+                      { key: truck.id, className: "truck-count-row scene-passive-overlay" },
                       h("span", null, truck.type || "Truck"),
                       h("strong", null, String(truck.count)),
                     ),
