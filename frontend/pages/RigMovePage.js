@@ -426,6 +426,294 @@ function LoadScheduleTable({ playback, currentMinute }) {
   );
 }
 
+function parseFirstInteger(value) {
+  const match = String(value || "").match(/\d+/);
+  return match ? Number.parseInt(match[0], 10) : null;
+}
+
+function findLoadTrip(playback, loadId) {
+  return (playback?.trips || []).find((trip) => trip.loadId === loadId) || null;
+}
+
+function getLoadStage(trip, currentMinute) {
+  if (!trip) {
+    return null;
+  }
+
+  if (currentMinute < trip.loadStart) {
+    return "queued";
+  }
+  if (currentMinute < trip.rigDownFinish) {
+    return "loading";
+  }
+  if (currentMinute < trip.arrivalAtDestination) {
+    return "in-transit";
+  }
+  if (currentMinute < trip.rigUpFinish) {
+    return "rig-up";
+  }
+  return "delivered";
+}
+
+function formatMinutePoint(value) {
+  return formatMinutes(Math.max(0, Math.round(value || 0)));
+}
+
+function answerLoadLocation({ trip, currentMinute, move }) {
+  const stage = getLoadStage(trip, currentMinute);
+  const sourceLabel = formatLocationLabel(move?.startLabel, "source");
+  const destinationLabel = formatLocationLabel(move?.endLabel, "destination");
+
+  if (stage === "queued") {
+    return `Load #${trip.loadId} is queued at ${sourceLabel}. Truck ${trip.truckId} is scheduled to start it at ${formatMinutePoint(trip.loadStart)}.`;
+  }
+  if (stage === "loading") {
+    return `Load #${trip.loadId} is at ${sourceLabel} and currently loading on truck ${trip.truckId}. It should leave at ${formatMinutePoint(trip.rigDownFinish)}.`;
+  }
+  if (stage === "in-transit") {
+    return `Load #${trip.loadId} is in transit on truck ${trip.truckId} between ${sourceLabel} and ${destinationLabel}. ETA is ${formatMinutePoint(trip.arrivalAtDestination)}.`;
+  }
+  if (stage === "rig-up") {
+    return `Load #${trip.loadId} has reached ${destinationLabel} and is in rig-up on truck ${trip.truckId}. Rig-up should finish at ${formatMinutePoint(trip.rigUpFinish)}.`;
+  }
+  return `Load #${trip.loadId} has been delivered to ${destinationLabel}. Rig-up finished at ${formatMinutePoint(trip.rigUpFinish)}.`;
+}
+
+function answerLoadTiming({ trip, currentMinute }) {
+  const stage = getLoadStage(trip, currentMinute);
+
+  if (stage === "queued") {
+    return `Load #${trip.loadId} starts at ${formatMinutePoint(trip.loadStart)}, departs at ${formatMinutePoint(trip.rigDownFinish)}, arrives at ${formatMinutePoint(trip.arrivalAtDestination)}, and finishes rig-up at ${formatMinutePoint(trip.rigUpFinish)}.`;
+  }
+  if (stage === "loading") {
+    return `Load #${trip.loadId} is loading now. It should arrive in ${formatMinutePoint(trip.arrivalAtDestination - currentMinute)} at ${formatMinutePoint(trip.arrivalAtDestination)}.`;
+  }
+  if (stage === "in-transit") {
+    return `Load #${trip.loadId} is already on the road. It should arrive in ${formatMinutePoint(trip.arrivalAtDestination - currentMinute)} at ${formatMinutePoint(trip.arrivalAtDestination)}.`;
+  }
+  if (stage === "rig-up") {
+    return `Load #${trip.loadId} already arrived at ${formatMinutePoint(trip.arrivalAtDestination)}. Rig-up should complete in ${formatMinutePoint(trip.rigUpFinish - currentMinute)} at ${formatMinutePoint(trip.rigUpFinish)}.`;
+  }
+  return `Load #${trip.loadId} already arrived at ${formatMinutePoint(trip.arrivalAtDestination)} and finished at ${formatMinutePoint(trip.rigUpFinish)}.`;
+}
+
+function answerTruckStatus({ playback, truckId, currentMinute, move }) {
+  const truckTrips = (playback?.trips || []).filter((trip) => trip.truckId === truckId);
+  if (!truckTrips.length) {
+    return `Truck ${truckId} is not part of the current plan.`;
+  }
+
+  const activeTrip = truckTrips.find((trip) => {
+    const tripEnd = trip.returnToSource ?? trip.arrivalAtDestination;
+    return currentMinute >= trip.loadStart && currentMinute <= tripEnd;
+  });
+
+  if (!activeTrip) {
+    const nextTrip = truckTrips.find((trip) => currentMinute < trip.loadStart);
+    if (nextTrip) {
+      return `Truck ${truckId} is waiting at ${formatLocationLabel(move?.startLabel, "source")} and will start load #${nextTrip.loadId} at ${formatMinutePoint(nextTrip.loadStart)}.`;
+    }
+
+    const lastTrip = truckTrips[truckTrips.length - 1];
+    return `Truck ${truckId} completed its last assigned load, #${lastTrip.loadId}.`;
+  }
+
+  return answerLoadLocation({ trip: activeTrip, currentMinute, move }).replace(`Load #${activeTrip.loadId}`, `Truck ${truckId} with load #${activeTrip.loadId}`);
+}
+
+function buildAssistantReply({ question, move, playback, currentMinute, rigLoads, lastLog, completion }) {
+  const normalized = String(question || "").trim().toLowerCase();
+
+  if (!normalized) {
+    return "Ask about a load, a truck, ETA, or current move status.";
+  }
+
+  if (/(status|summary|what.*happening|update|progress)/.test(normalized) && !/(load|truck)\s*#?\d+/.test(normalized)) {
+    return `Move progress is ${completion}% complete. ${rigLoads.movingCount} loads are moving, ${rigLoads.sourceCount} are still at source, and ${rigLoads.destinationCount} are at destination. Latest event: ${lastLog?.title || "No live event yet"}.`;
+  }
+
+  if (/(how many|loads left|remaining|left)/.test(normalized)) {
+    const remaining = Math.max(0, rigLoads.totalCount - rigLoads.destinationCount);
+    return `${remaining} loads are still not fully finished. ${rigLoads.movingCount} are currently moving and ${rigLoads.sourceCount} are still at source.`;
+  }
+
+  if (/(what'?s moving|which loads are moving|in transit|moving now)/.test(normalized)) {
+    const movingTrips = (playback?.trips || []).filter(
+      (trip) => currentMinute >= trip.rigDownFinish && currentMinute < trip.arrivalAtDestination,
+    );
+
+    if (!movingTrips.length) {
+      return "No loads are in transit right now.";
+    }
+
+    const summary = movingTrips
+      .slice(0, 5)
+      .map((trip) => `#${trip.loadId} on truck ${trip.truckId}`)
+      .join(", ");
+    return movingTrips.length > 5 ? `Loads currently moving: ${summary}, and ${movingTrips.length - 5} more.` : `Loads currently moving: ${summary}.`;
+  }
+
+  if (normalized.includes("truck")) {
+    const truckId = parseFirstInteger(normalized);
+    if (truckId !== null) {
+      return answerTruckStatus({ playback, truckId, currentMinute, move });
+    }
+  }
+
+  if (normalized.includes("load") || normalized.includes("#")) {
+    const loadId = parseFirstInteger(normalized);
+    if (loadId === null) {
+      return "Tell me the load number, for example: where is load 56?";
+    }
+
+    const trip = findLoadTrip(playback, loadId);
+    if (!trip) {
+      return `I can't find load #${loadId} in the current move plan.`;
+    }
+
+    if (/(where|location|located|status)/.test(normalized)) {
+      return answerLoadLocation({ trip, currentMinute, move });
+    }
+
+    if (/(when|eta|arrive|arrival|how long|finish)/.test(normalized)) {
+      return answerLoadTiming({ trip, currentMinute });
+    }
+
+    return `${answerLoadLocation({ trip, currentMinute, move })} ${answerLoadTiming({ trip, currentMinute })}`;
+  }
+
+  if (/(eta|arrive|arrival|how long)/.test(normalized)) {
+    return "Ask with a load number, for example: when does load 56 arrive?";
+  }
+
+  return "I can answer questions like: where is load 56, when does load 56 arrive, what is moving now, how many loads are left, or where is truck 2.";
+}
+
+function MoveAssistant({ move, playback, currentMinute, rigLoads, lastLog, completion }) {
+  const [draft, setDraft] = useState("");
+  const [isOpen, setIsOpen] = useState(false);
+  const [messages, setMessages] = useState([]);
+
+  function toggleOpen() {
+    setIsOpen((current) => {
+      const next = !current;
+      if (!next) {
+        setMessages([]);
+        setDraft("");
+      }
+      return next;
+    });
+  }
+
+  function submitQuestion(event) {
+    event?.preventDefault?.();
+
+    const question = draft.trim();
+    if (!question) {
+      return;
+    }
+
+    const reply = buildAssistantReply({
+      question,
+      move,
+      playback,
+      currentMinute,
+      rigLoads,
+      lastLog,
+      completion,
+    });
+
+    setMessages((current) => [
+      ...current,
+      { id: `user-${Date.now()}`, role: "user", text: question },
+      { id: `assistant-${Date.now() + 1}`, role: "assistant", text: reply },
+    ]);
+    setDraft("");
+    setIsOpen(true);
+  }
+
+  return h(
+    "div",
+    { className: `move-assistant-overlay${isOpen ? " is-open" : ""}` },
+    isOpen && messages.length
+      ? h(
+          "div",
+          { className: "move-assistant-chat" },
+          messages.slice(-2).map((message) =>
+            h(
+              "div",
+              {
+                key: message.id,
+                className: `move-assistant-row move-assistant-row-${message.role}`,
+              },
+              h(
+                "p",
+                {
+                  className: `move-assistant-bubble move-assistant-bubble-${message.role}`,
+                },
+                message.role === "assistant" ? h(TypewriterText, { text: message.text }) : message.text,
+              ),
+            ),
+          ),
+        )
+      : null,
+    h(
+      "div",
+      { className: "move-assistant-dock" },
+      isOpen
+        ? h(
+            "form",
+            { className: "move-assistant-form", onSubmit: submitQuestion },
+            h("input", {
+              className: "move-assistant-input",
+              type: "text",
+              value: draft,
+              placeholder: "help ?",
+              onInput: (event) => setDraft(event.target.value),
+            }),
+          )
+        : null,
+      h(
+        "button",
+        {
+          type: "button",
+          className: "move-assistant-trigger",
+          "aria-label": isOpen ? "Close assistant" : "Open assistant",
+          onClick: toggleOpen,
+        },
+        isOpen ? "x" : "?",
+      ),
+    ),
+  );
+}
+
+function TypewriterText({ text, speed = 16 }) {
+  const [visibleText, setVisibleText] = useState("");
+
+  useEffect(() => {
+    const content = String(text || "");
+    setVisibleText("");
+
+    if (!content) {
+      return undefined;
+    }
+
+    let index = 0;
+    const timer = window.setInterval(() => {
+      index += 1;
+      setVisibleText(content.slice(0, index));
+
+      if (index >= content.length) {
+        window.clearInterval(timer);
+      }
+    }, speed);
+
+    return () => window.clearInterval(timer);
+  }, [text, speed]);
+
+  return visibleText;
+}
+
 function PlaybackActionButton({ isRunning, isBusy, isPaused, onRun, onEnd, onPauseToggle, label = "Run" }) {
   return h(
     "div",
@@ -1058,6 +1346,16 @@ export function RigMovePage({
               ),
             )
           : null,
+        isPlaybackRunning || isPlaybackPaused
+          ? h(MoveAssistant, {
+              move,
+              playback: displaySimulation.bestPlan.playback,
+              currentMinute: visibleMinute,
+              rigLoads,
+              lastLog,
+              completion,
+            })
+          : null,
       )
     : h(
         AppLayout,
@@ -1216,5 +1514,15 @@ export function RigMovePage({
             ),
           ),
         ),
+        isPlaybackRunning || isPlaybackPaused
+          ? h(MoveAssistant, {
+              move,
+              playback: displaySimulation.bestPlan.playback,
+              currentMinute: visibleMinute,
+              rigLoads,
+              lastLog,
+              completion,
+            })
+          : null,
       );
 }
