@@ -23,6 +23,10 @@ import { preloadSimulationSceneAssets } from "./components/map/SimulationScene3D
 
 const { useEffect, useRef, useState } = React;
 
+function isCoordinateLabel(label) {
+  return typeof label === "string" && /^-?\d+(\.\d+)?\s*,\s*-?\d+(\.\d+)?$/.test(label.trim());
+}
+
 function getActiveScenario(move) {
   const scenarioPlans = move?.simulation?.scenarioPlans || [];
   if (!scenarioPlans.length) {
@@ -455,15 +459,19 @@ function App() {
       routeMode = "estimated";
     }
 
-    try {
-      const [nextStartLabel, nextEndLabel] = await Promise.all([
-        fetchLocationLabel(startPoint),
-        fetchLocationLabel(endPoint),
-      ]);
-      startLabel = nextStartLabel || startLabel;
-      endLabel = nextEndLabel || endLabel;
-    } catch {
-      // Keep coordinate fallback labels when reverse geocoding is unavailable.
+    const shouldResolveStartLabel = !startLabel || isCoordinateLabel(startLabel);
+    const shouldResolveEndLabel = !endLabel || isCoordinateLabel(endLabel);
+    if (shouldResolveStartLabel || shouldResolveEndLabel) {
+      try {
+        const [nextStartLabel, nextEndLabel] = await Promise.all([
+          shouldResolveStartLabel ? fetchLocationLabel(startPoint) : Promise.resolve(null),
+          shouldResolveEndLabel ? fetchLocationLabel(endPoint) : Promise.resolve(null),
+        ]);
+        startLabel = nextStartLabel || startLabel;
+        endLabel = nextEndLabel || endLabel;
+      } catch {
+        // Keep coordinate fallback labels when reverse geocoding is unavailable.
+      }
     }
 
     const scenarioPlans = buildScenarioPlans(logicalLoads, routeData, workerCount, truckCount);

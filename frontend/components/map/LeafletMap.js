@@ -1,7 +1,7 @@
 import { React, h } from "../../lib/react.js";
 import { DEFAULT_CENTER, getTruckPosition, getTruckStatus } from "../../features/rigMoves/simulation.js";
 
-const { useEffect, useRef } = React;
+const { useEffect, useRef, useState } = React;
 
 function createTruckIcon(truckId) {
   const svg = `
@@ -198,6 +198,8 @@ export function LeafletMap({
   onPickPoint,
   heightClass = "map-frame",
 }) {
+  const [locationRequestState, setLocationRequestState] = useState("idle");
+  const [locationRequestError, setLocationRequestError] = useState("");
   const mapElementRef = useRef(null);
   const mapRef = useRef(null);
   const markersRef = useRef({ start: null, end: null });
@@ -255,6 +257,13 @@ export function LeafletMap({
     map.on("click", handleClick);
     return () => map.off("click", handleClick);
   }, [pickerTarget, onPickPoint]);
+
+  useEffect(() => {
+    if (!pickerTarget) {
+      setLocationRequestState("idle");
+      setLocationRequestError("");
+    }
+  }, [pickerTarget]);
 
   useEffect(() => {
     const map = mapRef.current;
@@ -431,15 +440,76 @@ export function LeafletMap({
     });
   }, [simulation, currentMinute]);
 
+  function handleUseMyLocation(event) {
+    event.stopPropagation();
+
+    if (!pickerTarget || typeof onPickPoint !== "function") {
+      return;
+    }
+
+    if (!navigator.geolocation) {
+      setLocationRequestState("error");
+      setLocationRequestError("Location access is not available in this browser.");
+      return;
+    }
+
+    setLocationRequestState("loading");
+    setLocationRequestError("");
+
+    navigator.geolocation.getCurrentPosition(
+      (position) => {
+        const point = {
+          lat: position.coords.latitude,
+          lng: position.coords.longitude,
+        };
+
+        setLocationRequestState("idle");
+        setLocationRequestError("");
+        focusMapOnPoint(mapRef.current, point, 13);
+        onPickPoint({ target: pickerTarget, point });
+      },
+      (error) => {
+        setLocationRequestState("error");
+        if (error?.code === error.PERMISSION_DENIED) {
+          setLocationRequestError("Location permission was denied.");
+          return;
+        }
+        if (error?.code === error.POSITION_UNAVAILABLE) {
+          setLocationRequestError("Current location is unavailable.");
+          return;
+        }
+        if (error?.code === error.TIMEOUT) {
+          setLocationRequestError("Location request timed out.");
+          return;
+        }
+        setLocationRequestError("Unable to get your current location.");
+      },
+      {
+        enableHighAccuracy: true,
+        timeout: 10000,
+        maximumAge: 0,
+      },
+    );
+  }
+
   return h(
     "div",
     { className: heightClass },
     h("div", { ref: mapElementRef, className: "real-map" }),
     pickerTarget
       ? h(
-          "div",
-          { className: "map-picker-hint" },
-          `Click anywhere on the map to set the ${pickerTarget === "start" ? "start" : "end"} location.`,
+          "button",
+          {
+            type: "button",
+            className: `map-picker-hint${locationRequestState === "loading" ? " is-loading" : ""}`,
+            onClick: handleUseMyLocation,
+          },
+          h("strong", { className: "map-picker-hint-title" }, locationRequestState === "loading" ? "Locating..." : "My location"),
+          h(
+            "span",
+            { className: "map-picker-hint-copy" },
+            locationRequestError || "Use your current location for this point.",
+          ),
         )
       : null,
   );

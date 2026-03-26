@@ -2,7 +2,7 @@ import { React, h } from "../../lib/react.js";
 
 const { useEffect } = React;
 
-export function Modal({ title, description, children, onClose }) {
+export function Modal({ title, description, children, onClose, flushBody = false }) {
   useEffect(() => {
     const handleEscape = (event) => {
       if (event.key === "Escape") {
@@ -23,7 +23,7 @@ export function Modal({ title, description, children, onClose }) {
     h(
       "div",
       {
-        className: "modal-shell",
+        className: `modal-shell${flushBody ? " modal-shell-flush" : ""}`,
         onClick: (event) => event.stopPropagation(),
       },
       h(

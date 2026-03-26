@@ -6,7 +6,7 @@ import { ProgressBar } from "../components/ui/ProgressBar.js";
 import { Field, TextInput } from "../components/ui/Field.js";
 import { SimulationScene3D } from "../components/map/SimulationScene3D.js";
 import { LeafletMap } from "../components/map/LeafletMap.js";
-import { formatMinutes } from "../lib/format.js";
+import { formatLocationLabel, formatMinutes } from "../lib/format.js";
 import { buildScenarioPlans } from "../features/rigMoves/simulation.js";
 
 const { useDeferredValue, useEffect, useMemo, useRef, useState } = React;
@@ -242,7 +242,9 @@ function getRigSiteStats({ side, move, playback, currentMinute, totalMinutes }) 
   ).length;
   const progress = totalLoads > 0 ? Math.round((completedLoads / totalLoads) * 100) : 0;
   const remainingLoads = Math.max(0, totalLoads - completedLoads);
-  const label = side === "source" ? move?.startLabel || "Source Site" : move?.endLabel || "Destination Site";
+  const label = side === "source"
+    ? formatLocationLabel(move?.startLabel, "Source Site")
+    : formatLocationLabel(move?.endLabel, "Destination Site");
   const stateLabel =
     side === "source"
       ? progress >= 100
@@ -670,7 +672,7 @@ export function RigMovePage({
       AppLayout,
       {
         title: move.name,
-        subtitle: `${move.startLabel} -> ${move.endLabel}`,
+        subtitle: `${formatLocationLabel(move.startLabel, "Source")} -> ${formatLocationLabel(move.endLabel, "Destination")}`,
         currentUser,
         onLogout,
         fullBleed: true,
@@ -731,8 +733,8 @@ export function RigMovePage({
           h(
             "div",
             { className: "scene-move-info-grid" },
-            h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item scene-move-info-row-full" }, h("span", { className: "scene-dashboard-label" }, "From"), h("strong", null, move.startLabel || "Source")),
-            h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item scene-move-info-row-full" }, h("span", { className: "scene-dashboard-label" }, "To"), h("strong", null, move.endLabel || "Destination")),
+            h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item scene-move-info-row-full" }, h("span", { className: "scene-dashboard-label" }, "From"), h("strong", null, formatLocationLabel(move.startLabel, "Source"))),
+            h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item scene-move-info-row-full" }, h("span", { className: "scene-dashboard-label" }, "To"), h("strong", null, formatLocationLabel(move.endLabel, "Destination"))),
             h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Distance"), h("strong", null, `${move.routeKm || 0} km`)),
             h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Travel"), h("strong", null, move.routeTime || formatMinutes(move.simulation?.routeMinutes || 0))),
           ),
@@ -1061,7 +1063,7 @@ export function RigMovePage({
         AppLayout,
         {
           title: move.name,
-          subtitle: `${move.startLabel} -> ${move.endLabel}`,
+          subtitle: `${formatLocationLabel(move.startLabel, "Source")} -> ${formatLocationLabel(move.endLabel, "Destination")}`,
           currentUser,
           onLogout,
           onBack,
@@ -1151,7 +1153,7 @@ export function RigMovePage({
                 h(StatCard, {
                   label: "Source",
                   value: String(rigLoads.sourceCount),
-                  meta: `${move.startLabel}`,
+                  meta: `${formatLocationLabel(move.startLabel, "Source")}`,
                   tone: "default",
                 }),
                 h(StatCard, {
@@ -1163,7 +1165,7 @@ export function RigMovePage({
                 h(StatCard, {
                   label: "Destination",
                   value: String(rigLoads.destinationCount),
-                  meta: `${move.endLabel}`,
+                  meta: `${formatLocationLabel(move.endLabel, "Destination")}`,
                   tone: "green",
                 }),
               ),

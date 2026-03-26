@@ -508,6 +508,21 @@ function centerAndScaleModel(root, { targetWidth = 24, targetHeight = 12, lift =
   return root;
 }
 
+function getTruckFollowOffset(heading, distance, lift) {
+  return new THREE.Vector3(
+    -Math.sin(heading) * distance,
+    lift,
+    -Math.cos(heading) * distance,
+  );
+}
+
+function getTruckFocusTargetWorld(truckRoot) {
+  const variantKey = truckRoot?.userData?.activeTruckVariantKey || "fallback";
+  const variantRoot = truckRoot?.userData?.truckVariants?.[variantKey] || truckRoot;
+  const bounds = new THREE.Box3().setFromObject(variantRoot);
+  return bounds.getCenter(new THREE.Vector3());
+}
+
 function loadModelTemplate(key) {
   if (assetTemplateCache.has(key)) {
     return assetTemplateCache.get(key);
@@ -1118,13 +1133,15 @@ function getRigBoardParkingWorld(position, routeDirection, radius, truckId) {
   const boardWidth = radius * 3.6;
   const boardDepth = radius * 2.45;
   const slotIndex = Math.max(0, truckId - 1);
-  const laneDepth = boardDepth * 0.74;
-  const rowSpacing = 10;
+  const laneDepth = boardDepth * 0.975;
+  const rowSpacing = 7.8;
   const rows = Math.max(1, Math.floor(laneDepth / rowSpacing));
   const rowIndex = slotIndex % rows;
   const columnIndex = Math.floor(slotIndex / rows);
-  const localX = Math.min(boardWidth * 0.42, (boardWidth * 0.22) + (columnIndex * 7.5));
-  const localZ = (-laneDepth * 0.5) + (rowIndex * rowSpacing) + ((laneDepth - ((rows - 1) * rowSpacing)) * 0.5);
+  const localX = Math.min(boardWidth * 0.42, (boardWidth * 0.17) + (columnIndex * 19));
+  const rowDistanceFromCenter = Math.ceil(rowIndex / 2);
+  const rowSideDirection = rowIndex === 0 ? 0 : (rowIndex % 2 === 1 ? 1 : -1);
+  const localZ = rowSideDirection * rowDistanceFromCenter * rowSpacing;
   const worldOffset = new THREE.Vector3(localX, 2.35, localZ)
     .applyAxisAngle(new THREE.Vector3(0, 1, 0), boardRotation);
 
@@ -1317,6 +1334,7 @@ export function SimulationScene3D({
   const focusedTruckIdRef = useRef(null);
   const focusedTruckOffsetRef = useRef(null);
   const focusedTruckLastTargetRef = useRef(null);
+  const focusedTruckFollowConfigRef = useRef(null);
   const hoveredRigComponentRef = useRef(null);
   const cameraTransitioningRef = useRef(false);
   const hoveredObjectRef = useRef(null);
@@ -1545,6 +1563,7 @@ function buildRouteTooltip(routeInfo) {
     focusedTruckIdRef.current = null;
     focusedTruckOffsetRef.current = null;
     focusedTruckLastTargetRef.current = null;
+    focusedTruckFollowConfigRef.current = null;
     hoveredRigComponentRef.current = null;
     cameraTransitioningRef.current = false;
     hoveredObjectRef.current = null;
@@ -1619,9 +1638,56 @@ function buildRouteTooltip(routeInfo) {
     const outboundLaneMetricsB = buildWorldPathMetrics(outboundLanePointsB);
     const inboundLaneMetricsA = buildWorldPathMetrics(inboundLanePointsA);
     const inboundLaneMetricsB = buildWorldPathMetrics(inboundLanePointsB);
-    function getTravelLaneMetrics(truckId, direction) {
+    const playbackTrips = simulation?.bestPlan?.playback?.trips || [];
+
+    function getTripLaneKey(trip) {
+      return trip
+        ? `${trip.loadId ?? "load"}::${trip.truckId ?? "truck"}::${trip.loadStart ?? "start"}::${trip.rigUpFinish ?? "rigup"}`
+        : null;
+    }
+
+    function buildLaneAssignmentMap(trips, timeField) {
+      const assignments = new Map();
+      let useFirstLane = false;
+
+      [...trips]
+        .sort((a, b) => {
+          if ((a?.[timeField] ?? 0) !== (b?.[timeField] ?? 0)) {
+            return (a?.[timeField] ?? 0) - (b?.[timeField] ?? 0);
+          }
+          if ((a?.loadStart ?? 0) !== (b?.loadStart ?? 0)) {
+            return (a?.loadStart ?? 0) - (b?.loadStart ?? 0);
+          }
+          if ((a?.rigUpFinish ?? 0) !== (b?.rigUpFinish ?? 0)) {
+            return (a?.rigUpFinish ?? 0) - (b?.rigUpFinish ?? 0);
+          }
+          if ((a?.truckId ?? 0) !== (b?.truckId ?? 0)) {
+            return (a?.truckId ?? 0) - (b?.truckId ?? 0);
+          }
+          return (a?.loadId ?? 0) - (b?.loadId ?? 0);
+        })
+        .forEach((trip) => {
+          useFirstLane = !useFirstLane;
+          assignments.set(getTripLaneKey(trip), useFirstLane);
+        });
+
+      return assignments;
+    }
+
+    const outboundLaneOrderByTrip = buildLaneAssignmentMap(playbackTrips, "loadStart");
+    const inboundLaneOrderByTrip = buildLaneAssignmentMap(
+      playbackTrips.filter((trip) => trip.returnToSource != null),
+      "rigUpFinish",
+    );
+
+    function getTravelLaneMetrics(truckId, direction, trip = null) {
       const slotIndex = Math.max(0, truckId - 1);
-      const useFirstLane = slotIndex % 2 === 0;
+      const tripLaneKey = getTripLaneKey(trip);
+      const useFirstLane = trip
+        ? (direction === "outbound"
+          ? (outboundLaneOrderByTrip.get(tripLaneKey) ?? (slotIndex % 2 === 0))
+          : (inboundLaneOrderByTrip.get(tripLaneKey) ?? (slotIndex % 2 === 0)))
+        : slotIndex % 2 === 0;
       if (direction === "outbound") {
         return useFirstLane ? outboundLaneMetricsA : outboundLaneMetricsB;
       }
@@ -1641,8 +1707,8 @@ function buildRouteTooltip(routeInfo) {
       return Math.atan2(tangent.x, tangent.z);
     }
 
-    function getLaneParkingWorld(truckId, direction) {
-      const pathMetrics = getTravelLaneMetrics(truckId, direction);
+    function getLaneParkingWorld(truckId, direction, trip = null) {
+      const pathMetrics = getTravelLaneMetrics(truckId, direction, trip);
       const points = pathMetrics?.points || [];
       if (points.length < 2) {
         const fallbackHeading = Math.atan2(routeDirectionWorld.x, routeDirectionWorld.z);
@@ -1706,6 +1772,9 @@ function buildRouteTooltip(routeInfo) {
     controls.minPolarAngle = Math.PI * 0.2;
     const handleControlsStart = () => {
       cameraTransitioningRef.current = false;
+      if (focusedTruckIdRef.current != null) {
+        focusedTruckFollowConfigRef.current = null;
+      }
       zoomState.currentTarget.copy(controls.target);
       zoomState.desiredTarget.copy(controls.target);
       zoomState.currentPosition.copy(camera.position);
@@ -1713,7 +1782,11 @@ function buildRouteTooltip(routeInfo) {
     };
     controls.addEventListener("start", handleControlsStart);
     const handleControlsChange = () => {
-      if (focusedTruckIdRef.current != null && !cameraTransitioningRef.current) {
+      if (
+        focusedTruckIdRef.current != null &&
+        !cameraTransitioningRef.current &&
+        !focusedTruckFollowConfigRef.current
+      ) {
         focusedTruckOffsetRef.current = camera.position.clone().sub(controls.target);
       }
     };
@@ -2236,24 +2309,31 @@ function buildRouteTooltip(routeInfo) {
       focusedRigSideRef.current = targetObject.userData?.rigInfo?.side || null;
       focusedTruckIdRef.current = null;
       focusedTruckOffsetRef.current = null;
+      focusedTruckFollowConfigRef.current = null;
       onRigFocusChange?.(focusedRigSideRef.current);
       cameraTransitioningRef.current = true;
     }
 
     function focusOnTruck(targetObject) {
-      const bounds = new THREE.Box3().setFromObject(targetObject);
-      const center = bounds.getCenter(new THREE.Vector3());
-      const size = bounds.getSize(new THREE.Vector3());
-      const focusDistance = Math.max(size.x, size.y, size.z, 10);
-      const direction = new THREE.Vector3(0, 0.34, 1).normalize();
+      const truckId = targetObject.userData?.truckId ?? null;
+      const variantKey = targetObject.userData?.activeTruckVariantKey || "fallback";
+      const { targetWidth, targetHeight } = getTruckVariantDimensions(variantKey);
+      const heading = truckHeadingRef.current.get(truckId) ?? targetObject.rotation.y ?? 0;
+      const followDistance = Math.max(targetWidth * 1.7, 24);
+      const followLift = Math.max(targetHeight * 1.3, 10.5);
+      const followOffset = getTruckFollowOffset(heading, followDistance, followLift);
+      const focusTarget = getTruckFocusTargetWorld(targetObject);
 
-      zoomState.desiredTarget.copy(center);
-      zoomState.desiredTarget.y = Math.max(center.y, 2.8);
-      zoomState.desiredPosition.copy(center).add(direction.multiplyScalar(focusDistance * 2.4));
+      zoomState.desiredTarget.copy(focusTarget);
+      zoomState.desiredPosition.copy(zoomState.desiredTarget).add(followOffset);
       focusedRigSideRef.current = null;
-      focusedTruckIdRef.current = targetObject.userData?.truckId ?? null;
-      focusedTruckOffsetRef.current = zoomState.desiredPosition.clone().sub(zoomState.desiredTarget);
-      focusedTruckLastTargetRef.current = zoomState.desiredTarget.clone();
+      focusedTruckIdRef.current = truckId;
+      focusedTruckOffsetRef.current = followOffset.clone();
+      focusedTruckLastTargetRef.current = focusTarget.clone();
+      focusedTruckFollowConfigRef.current = {
+        distance: followDistance,
+        lift: followLift,
+      };
       onRigFocusChange?.(null);
       cameraTransitioningRef.current = true;
     }
@@ -2265,6 +2345,7 @@ function buildRouteTooltip(routeInfo) {
       focusedTruckIdRef.current = null;
       focusedTruckOffsetRef.current = null;
       focusedTruckLastTargetRef.current = null;
+      focusedTruckFollowConfigRef.current = null;
       onRigFocusChange?.(null);
       cameraTransitioningRef.current = true;
     }
@@ -2513,8 +2594,8 @@ function buildRouteTooltip(routeInfo) {
           28,
           truckId,
         );
-        const sourceLaneParking = getLaneParkingWorld(truckId, "outbound");
-        const destinationLaneParking = getLaneParkingWorld(truckId, "inbound");
+        const sourceLaneParking = getLaneParkingWorld(truckId, "outbound", activeTrip);
+        const destinationLaneParking = getLaneParkingWorld(truckId, "inbound", activeTrip);
 
         let currentWorld = roadStartWorld;
         let nextWorld = roadStartWorld;
@@ -2538,7 +2619,7 @@ function buildRouteTooltip(routeInfo) {
           const outboundRatio = (minute - activeTrip.rigDownFinish) / tripDuration;
           const forwardMinute = Math.min(minute + 0.6, activeTrip.arrivalAtDestination);
           const nextOutboundRatio = (forwardMinute - activeTrip.rigDownFinish) / tripDuration;
-          const outboundLaneMetrics = getTravelLaneMetrics(truckId, "outbound");
+          const outboundLaneMetrics = getTravelLaneMetrics(truckId, "outbound", activeTrip);
           currentWorld = interpolateWorldPathWithEndpointOffset(outboundLaneMetrics, outboundRatio, truckBodyOffset, roadTravelHeight);
           nextWorld = interpolateWorldPathWithEndpointOffset(outboundLaneMetrics, nextOutboundRatio, truckBodyOffset, roadTravelHeight);
           distanceKm = routeDistanceKm * Math.max(0, Math.min(1, outboundRatio));
@@ -2551,7 +2632,7 @@ function buildRouteTooltip(routeInfo) {
           const inboundRatio = (minute - activeTrip.rigUpFinish) / tripDuration;
           const forwardMinute = Math.min(minute + 0.6, activeTrip.returnToSource);
           const nextInboundRatio = (forwardMinute - activeTrip.rigUpFinish) / tripDuration;
-          const inboundLaneMetrics = getTravelLaneMetrics(truckId, "inbound");
+          const inboundLaneMetrics = getTravelLaneMetrics(truckId, "inbound", activeTrip);
           currentWorld = interpolateWorldPathWithEndpointOffset(inboundLaneMetrics, inboundRatio, truckBodyOffset, roadTravelHeight);
           nextWorld = interpolateWorldPathWithEndpointOffset(inboundLaneMetrics, nextInboundRatio, truckBodyOffset, roadTravelHeight);
           distanceKm = routeDistanceKm * Math.max(0, 1 - Math.min(1, inboundRatio));
@@ -2589,7 +2670,7 @@ function buildRouteTooltip(routeInfo) {
         } else if (activeTrip?.returnToSource && minute < activeTrip.returnToSource) {
           const tripDuration = Math.max(activeTrip.returnToSource - activeTrip.rigUpFinish, 1);
           const inboundRatio = Math.max(0, Math.min(1, (minute - activeTrip.rigUpFinish) / tripDuration));
-          heading = inboundRatio < 0.03
+          heading = inboundRatio < 0
             ? getContinuousAngle(destinationSiteParking.heading, lastHeading)
             : getContinuousAngle(movingHeading, lastHeading);
         } else {
@@ -2665,16 +2746,20 @@ function buildRouteTooltip(routeInfo) {
       if (focusedTruckIdRef.current != null) {
         const focusedTruck = truckMeshes.get(focusedTruckIdRef.current);
         if (focusedTruck?.visible) {
-          const nextTarget = focusedTruck.position.clone();
-          nextTarget.y = Math.max(nextTarget.y, 3.4);
+          const nextTarget = getTruckFocusTargetWorld(focusedTruck);
           const previousTarget = focusedTruckLastTargetRef.current;
 
           if (!previousTarget) {
             focusedTruckLastTargetRef.current = nextTarget.clone();
           } else if (!cameraTransitioningRef.current) {
-            const delta = nextTarget.clone().sub(previousTarget);
-            controls.target.add(delta);
-            camera.position.add(delta);
+            const followConfig = focusedTruckFollowConfigRef.current;
+            const heading = truckHeadingRef.current.get(focusedTruckIdRef.current) ?? focusedTruck.rotation.y ?? 0;
+            const desiredOffset = followConfig
+              ? getTruckFollowOffset(heading, followConfig.distance, followConfig.lift)
+              : (focusedTruckOffsetRef.current || camera.position.clone().sub(controls.target));
+            controls.target.lerp(nextTarget, 0.18);
+            camera.position.lerp(nextTarget.clone().add(desiredOffset), 0.18);
+            focusedTruckOffsetRef.current = camera.position.clone().sub(controls.target);
             zoomState.currentTarget.copy(controls.target);
             zoomState.desiredTarget.copy(controls.target);
             zoomState.currentPosition.copy(camera.position);

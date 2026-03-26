@@ -21,6 +21,20 @@ export function formatCoordinate(latlng) {
   return `${latlng.lat.toFixed(5)}, ${latlng.lng.toFixed(5)}`;
 }
 
+export function formatLocationLabel(label, fallback = "") {
+  if (!label || typeof label !== "string") {
+    return fallback;
+  }
+
+  const trimmed = label.trim();
+  if (/^-?\d+(\.\d+)?\s*,\s*-?\d+(\.\d+)?$/.test(trimmed)) {
+    return fallback || trimmed;
+  }
+
+  const primary = trimmed.split(",")[0]?.trim();
+  return primary || trimmed || fallback;
+}
+
 export function formatDate(date) {
   return new Intl.DateTimeFormat("en-US", {
     weekday: "long",

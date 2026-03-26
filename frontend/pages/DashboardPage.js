@@ -6,10 +6,23 @@ import { Field, TextInput } from "../components/ui/Field.js";
 import { ProgressBar } from "../components/ui/ProgressBar.js";
 import { Modal } from "../components/ui/Modal.js";
 import { LeafletMap } from "../components/map/LeafletMap.js";
-import { formatCoordinate, formatDate } from "../lib/format.js";
+import { formatCoordinate, formatDate, formatLocationLabel } from "../lib/format.js";
 import { fetchLocationLabel } from "../features/rigMoves/api.js";
 
-const { useState } = React;
+const { useRef, useState } = React;
+
+function getSelectedLocationValue(point, label, fallbackLabel) {
+  if (!point) {
+    return "";
+  }
+
+  const resolvedLabel = formatLocationLabel(label, "");
+  if (resolvedLabel) {
+    return resolvedLabel;
+  }
+
+  return label || formatCoordinate(point) || fallbackLabel;
+}
 
 function MoveList({ moves, onOpenMove }) {
   if (!moves.length) {
@@ -65,7 +78,33 @@ export function DashboardPage({
   const [endLabel, setEndLabel] = useState("");
   const [pickerTarget, setPickerTarget] = useState(null);
   const [fieldErrors, setFieldErrors] = useState({});
-  const [isResolvingLocation, setIsResolvingLocation] = useState(false);
+  const startLookupRequestRef = useRef(0);
+  const endLookupRequestRef = useRef(0);
+
+  async function resolveLocationLabelWithRetry(point, applyLabel, requestRef) {
+    const requestId = requestRef.current + 1;
+    requestRef.current = requestId;
+    const maxAttempts = 4;
+
+    for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+      try {
+        const resolvedLabel = await fetchLocationLabel(point);
+        if (requestRef.current !== requestId) {
+          return;
+        }
+        if (resolvedLabel) {
+          applyLabel(resolvedLabel);
+          return;
+        }
+      } catch {
+        // Retry a few times before keeping the coordinate fallback.
+      }
+
+      if (attempt < maxAttempts - 1) {
+        await new Promise((resolve) => window.setTimeout(resolve, 1200 * (attempt + 1)));
+      }
+    }
+  }
 
   function openPicker(target) {
     setPickerTarget(target);
@@ -75,25 +114,15 @@ export function DashboardPage({
     if (target === "start") {
       setStartPoint(point);
       setStartLabel(formatCoordinate(point));
+      setFieldErrors((current) => ({ ...current, start: undefined }));
+      void resolveLocationLabelWithRetry(point, setStartLabel, startLookupRequestRef);
     } else {
       setEndPoint(point);
       setEndLabel(formatCoordinate(point));
+      setFieldErrors((current) => ({ ...current, end: undefined }));
+      void resolveLocationLabelWithRetry(point, setEndLabel, endLookupRequestRef);
     }
     setPickerTarget(null);
-
-    setIsResolvingLocation(true);
-    try {
-      const resolvedLabel = await fetchLocationLabel(point);
-      if (target === "start") {
-        setStartLabel(resolvedLabel);
-      } else {
-        setEndLabel(resolvedLabel);
-      }
-    } catch {
-      // Keep coordinate fallback if reverse geocoding fails.
-    } finally {
-      setIsResolvingLocation(false);
-    }
   }
 
   async function handleSubmit(event) {
@@ -171,7 +200,7 @@ export function DashboardPage({
               Field,
               {
                 label: "Start Location",
-                hint: startPoint ? startLabel || formatCoordinate(startPoint) : "Select the source rig on the map.",
+                hint: startPoint ? formatCoordinate(startPoint) : "Select the source rig on the map.",
                 error: fieldErrors.start,
                 action: h(
                   Button,
@@ -186,7 +215,7 @@ export function DashboardPage({
               },
               h(TextInput, {
                 type: "text",
-                value: startPoint ? startLabel || formatCoordinate(startPoint) : "",
+                value: getSelectedLocationValue(startPoint, startLabel, "Selected source rig"),
                 placeholder: "Click Select to open map",
                 readOnly: true,
               }),
@@ -195,7 +224,7 @@ export function DashboardPage({
               Field,
               {
                 label: "End Location",
-                hint: endPoint ? endLabel || formatCoordinate(endPoint) : "Select the destination rig on the map.",
+                hint: endPoint ? formatCoordinate(endPoint) : "Select the destination rig on the map.",
                 error: fieldErrors.end,
                 action: h(
                   Button,
@@ -210,12 +239,11 @@ export function DashboardPage({
               },
               h(TextInput, {
                 type: "text",
-                value: endPoint ? endLabel || formatCoordinate(endPoint) : "",
+                value: getSelectedLocationValue(endPoint, endLabel, "Selected destination rig"),
                 placeholder: "Click Select to open map",
                 readOnly: true,
               }),
             ),
-            isResolvingLocation ? h("p", { className: "muted-copy" }, "Resolving location name...") : null,
             createError ? h("p", { className: "field-error" }, createError) : null,
             loadsError ? h("p", { className: "field-error" }, loadsError) : null,
             h(Button, {
@@ -236,6 +264,7 @@ export function DashboardPage({
             title: pickerTarget === "start" ? "Select start location" : "Select end location",
             description: "The map only appears while choosing a location. Click the exact rig position to continue.",
             onClose: () => setPickerTarget(null),
+            flushBody: true,
           },
           h(LeafletMap, {
             startPoint,
