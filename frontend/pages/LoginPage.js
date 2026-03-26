@@ -30,14 +30,30 @@ export function LoginPage({ isAuthenticated, onLogin, onBackHome }) {
     "main",
     { className: "auth-shell" },
     h(
-      "button",
+      Button,
       {
         type: "button",
-        className: "icon-button auth-back-button",
+        variant: "ghost",
+        className: "scene-back-button auth-back-button",
         onClick: onBackHome,
         "aria-label": "Back to Home",
+        children: h(
+          "svg",
+          {
+            className: "scene-back-icon",
+            viewBox: "0 0 16 16",
+            "aria-hidden": "true",
+          },
+          h("path", {
+            d: "M 10.5 3.5 L 6 8 L 10.5 12.5",
+            fill: "none",
+            stroke: "currentColor",
+            "stroke-width": "2.2",
+            "stroke-linecap": "round",
+            "stroke-linejoin": "round",
+          }),
+        ),
       },
-      "<",
     ),
     h(
       Card,

@@ -128,6 +128,34 @@ function haversineMinutes(start, end) {
   return Math.max(15, Math.round((distanceKm / averageTruckSpeedKmh) * 60));
 }
 
+function normalizeTruckTypeLabel(type) {
+  const normalized = String(type || "").trim().toLowerCase();
+  if (normalized === "support") {
+    return "Low bed";
+  }
+  return type || "Heavy Haul";
+}
+
+function buildFleetForPlayback(truckCount, truckSetup = []) {
+  const normalizedSetup = (truckSetup || [])
+    .map((item) => ({
+      type: normalizeTruckTypeLabel(item?.type),
+      count: Math.max(1, Number.parseInt(item?.count, 10) || 0),
+    }))
+    .filter((item) => item.type && item.count > 0);
+
+  const expandedFleet = normalizedSetup.flatMap((item) =>
+    Array.from({ length: item.count }, () => item.type),
+  );
+  const fallbackType = normalizedSetup[0]?.type || "Heavy Haul";
+
+  return Array.from({ length: truckCount }, (_, index) => ({
+    id: index + 1,
+    type: expandedFleet[index] || fallbackType,
+    availableAt: 0,
+  }));
+}
+
 export async function fetchRouteData(start, end) {
   const coordinates = `${start.lng},${start.lat};${end.lng},${end.lat}`;
   const response = await fetch(
@@ -275,12 +303,9 @@ function buildFleetPlanCounts(requestedTruckCount) {
   return [...new Set(counts)].sort((a, b) => a - b).slice(0, 3);
 }
 
-export function buildPlayback(plan, truckCount) {
+export function buildPlayback(plan, truckCount, truckSetup = []) {
   const steps = [];
-  const trucks = Array.from({ length: truckCount }, (_, index) => ({
-    id: index + 1,
-    availableAt: 0,
-  }));
+  const trucks = buildFleetForPlayback(truckCount, truckSetup);
   const trips = [];
   let stageReadyAt = 0;
 
@@ -304,6 +329,7 @@ export function buildPlayback(plan, truckCount) {
 
       trips.push({
         truckId: truck.id,
+        truckType: truck.type,
         loadId: load.id,
         description: load.description,
         loadStart,
@@ -360,7 +386,7 @@ export function buildPlayback(plan, truckCount) {
   };
 }
 
-export function buildScenarioPlans(logicalLoads, routeData, workerCount, truckCount) {
+export function buildScenarioPlans(logicalLoads, routeData, workerCount, truckCount, truckSetup = []) {
   const plannerVariants = buildSchedules(logicalLoads);
   const fleetPlanCounts = buildFleetPlanCounts(truckCount);
 
@@ -370,7 +396,7 @@ export function buildScenarioPlans(logicalLoads, routeData, workerCount, truckCo
       const capacity = Math.max(1, Math.min(scenarioWorkerCount, planTruckCount));
       const variantPlans = plannerVariants.map((variant) => {
         const waves = variant.wavesForCapacity(capacity);
-        const playback = buildPlayback({ routeMinutes: routeData.minutes, waves }, planTruckCount);
+        const playback = buildPlayback({ routeMinutes: routeData.minutes, waves }, planTruckCount, truckSetup);
 
         return {
           name: variant.name,

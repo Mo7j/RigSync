@@ -2,6 +2,8 @@ import { MOVES_STORAGE_KEY } from "../../lib/constants.js";
 import { clampPercentage, formatCoordinate, formatMinutes, formatShortDate } from "../../lib/format.js";
 import { haversineKilometers, parseCoordinateString } from "./simulation.js";
 
+const MOVE_SESSIONS_STORAGE_KEY = `${MOVES_STORAGE_KEY}:sessions`;
+
 function roundCoordinate(value) {
   return Math.round(value * 100000) / 100000;
 }
@@ -40,6 +42,7 @@ function compactPlayback(playback) {
     totalMinutes: playback.totalMinutes,
     trips: (playback.trips || []).map((trip) => ({
       truckId: trip.truckId,
+      truckType: trip.truckType,
       loadId: trip.loadId,
       description: trip.description,
       loadStart: trip.loadStart,
@@ -141,6 +144,37 @@ function normalizeStoredMove(move) {
   };
 }
 
+function readMoveSessions() {
+  try {
+    const raw = window.localStorage.getItem(MOVE_SESSIONS_STORAGE_KEY);
+    const parsed = raw ? JSON.parse(raw) : {};
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function writeMoveSessions(nextSessions) {
+  window.localStorage.setItem(MOVE_SESSIONS_STORAGE_KEY, JSON.stringify(nextSessions));
+}
+
+function applyMoveSessions(moves) {
+  const sessions = readMoveSessions();
+  return moves.map((move) => {
+    const session = sessions[move.id];
+    if (!session) {
+      return move;
+    }
+
+    return {
+      ...move,
+      progressMinute: session.progressMinute ?? move.progressMinute ?? 0,
+      completionPercentage: session.completionPercentage ?? move.completionPercentage ?? 0,
+      playbackSpeed: session.playbackSpeed ?? move.playbackSpeed,
+    };
+  });
+}
+
 function safeReadStorage() {
   try {
     const raw = window.localStorage.getItem(MOVES_STORAGE_KEY);
@@ -168,12 +202,27 @@ function saveMoves(nextMoves) {
 }
 
 export function readMoves() {
-  return safeReadStorage().sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt));
+  return applyMoveSessions(safeReadStorage())
+    .sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt));
 }
 
 export function upsertMove(move) {
   const current = readMoves().filter((item) => item.id !== move.id);
-  return saveMoves([move, ...current]);
+  return applyMoveSessions(saveMoves([move, ...current]));
+}
+
+export function removeMove(moveId) {
+  const nextMoves = readMoves().filter((move) => move.id !== moveId);
+  saveMoves(nextMoves);
+
+  const currentSessions = readMoveSessions();
+  if (currentSessions[moveId]) {
+    const nextSessions = { ...currentSessions };
+    delete nextSessions[moveId];
+    writeMoveSessions(nextSessions);
+  }
+
+  return nextMoves;
 }
 
 export function updateMoveProgress(moveId, progressMinute) {
@@ -196,6 +245,20 @@ export function updateMoveProgress(moveId, progressMinute) {
   });
 
   return saveMoves(nextMoves);
+}
+
+export function persistMoveSession(moveId, sessionState) {
+  const currentSessions = readMoveSessions();
+  const nextSessions = {
+    ...currentSessions,
+    [moveId]: {
+      ...(currentSessions[moveId] || {}),
+      ...sessionState,
+    },
+  };
+
+  writeMoveSessions(nextSessions);
+  return nextSessions[moveId];
 }
 
 export function createMoveRecord({ name, startPoint, endPoint, startLabel, endLabel, simulation, routeMode, loadCount }) {

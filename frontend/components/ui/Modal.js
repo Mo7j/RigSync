@@ -2,7 +2,7 @@ import { React, h } from "../../lib/react.js";
 
 const { useEffect } = React;
 
-export function Modal({ title, description, children, onClose, flushBody = false }) {
+export function Modal({ title, description, children, onClose, flushBody = false, eyebrow = "Location Selector", className = "" }) {
   useEffect(() => {
     const handleEscape = (event) => {
       if (event.key === "Escape") {
@@ -23,7 +23,7 @@ export function Modal({ title, description, children, onClose, flushBody = false
     h(
       "div",
       {
-        className: `modal-shell${flushBody ? " modal-shell-flush" : ""}`,
+        className: `modal-shell${flushBody ? " modal-shell-flush" : ""}${className ? ` ${className}` : ""}`,
         onClick: (event) => event.stopPropagation(),
       },
       h(
@@ -32,7 +32,7 @@ export function Modal({ title, description, children, onClose, flushBody = false
         h(
           "div",
           null,
-          h("p", { className: "eyebrow" }, "Location Selector"),
+          h("p", { className: "eyebrow" }, eyebrow),
           h("h3", null, title),
           description ? h("p", { className: "muted-copy" }, description) : null,
         ),

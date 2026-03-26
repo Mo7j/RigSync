@@ -50,10 +50,10 @@ function MoveList({ moves, onOpenMove }) {
           "div",
           { className: "move-row-head" },
           h("strong", null, move.name),
-          h("span", { className: "move-row-percentage" }, `${move.completionPercentage}%`),
+          h("span", { className: "move-row-percentage" }, `${Math.max(0, Math.min(100, Math.round(move.completionPercentage || 0)))}%`),
         ),
         h("span", { className: "move-row-meta" }, `${move.routeTime} • ${move.routeKm} km`),
-        h(ProgressBar, { value: move.completionPercentage }),
+        h(ProgressBar, { value: Math.max(0, Math.min(100, Math.round(move.completionPercentage || 0))) }),
       ),
     ),
   );

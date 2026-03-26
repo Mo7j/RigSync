@@ -12,6 +12,8 @@ import {
   readMoves,
   createMoveRecord,
   upsertMove,
+  persistMoveSession,
+  removeMove,
   migrateLegacyHistory,
 } from "./features/rigMoves/storage.js";
 import { HomePage } from "./pages/HomePage.js";
@@ -77,6 +79,7 @@ function App() {
   const animationFrameRef = useRef(null);
   const animationStartedAtRef = useRef(null);
   const lastPersistedMinuteRef = useRef(0);
+  const lastSavedMoveSessionRef = useRef("");
 
   useEffect(() => {
     if ("scrollRestoration" in window.history) {
@@ -249,6 +252,75 @@ function App() {
       setIsPlaybackPaused(false);
     }
   }, [route.page, activeMove?.id]);
+
+  useEffect(() => {
+    if (route.page !== "move" || !activeMove) {
+      lastSavedMoveSessionRef.current = "";
+      return;
+    }
+
+    const restoredMinute = Math.min(activeMove.progressMinute || 0, activeTotalMinutes || activeMove.progressMinute || 0);
+    const restoredSpeed = Number(activeMove.playbackSpeed) || 15000;
+
+    setCurrentMinute(restoredMinute);
+    lastPersistedMinuteRef.current = restoredMinute;
+    setPlaybackSpeed(restoredSpeed);
+    setIsPlaybackRunning(false);
+    setIsPlaybackPaused(restoredMinute > 0 && restoredMinute < activeTotalMinutes);
+    lastSavedMoveSessionRef.current = `${activeMove.id}:${Math.round(restoredMinute)}:${restoredSpeed}`;
+  }, [route.page, activeMove?.id]);
+
+  useEffect(() => {
+    if (route.page !== "move" || !activeMove) {
+      return undefined;
+    }
+
+    const flushMoveSession = (minuteOverride = lastPersistedMinuteRef.current) => {
+      const nextMinute = Math.max(0, Math.min(Math.round(minuteOverride || 0), activeTotalMinutes || Math.round(minuteOverride || 0)));
+      const nextSpeed = Number(playbackSpeed) || 15000;
+      const nextCompletion = activeTotalMinutes > 0 ? Math.min(100, Math.max(0, (nextMinute / activeTotalMinutes) * 100)) : 0;
+      const nextSnapshot = `${activeMove.id}:${nextMinute}:${nextSpeed}`;
+
+      if (lastSavedMoveSessionRef.current === nextSnapshot) {
+        return;
+      }
+
+      lastSavedMoveSessionRef.current = nextSnapshot;
+      persistMoveSession(activeMove.id, {
+        progressMinute: nextMinute,
+        completionPercentage: nextCompletion,
+        playbackSpeed: nextSpeed,
+      });
+      setMoves((current) =>
+        current.map((move) =>
+          move.id === activeMove.id
+            ? {
+                ...move,
+                progressMinute: nextMinute,
+                completionPercentage: nextCompletion,
+                playbackSpeed: nextSpeed,
+              }
+            : move,
+        ),
+      );
+    };
+
+    const intervalId = window.setInterval(() => {
+      flushMoveSession(lastPersistedMinuteRef.current);
+    }, 2000);
+
+    const handleBeforeUnload = () => {
+      flushMoveSession(lastPersistedMinuteRef.current);
+    };
+
+    window.addEventListener("beforeunload", handleBeforeUnload);
+
+    return () => {
+      window.clearInterval(intervalId);
+      window.removeEventListener("beforeunload", handleBeforeUnload);
+      flushMoveSession(lastPersistedMinuteRef.current);
+    };
+  }, [route.page, activeMove?.id, playbackSpeed, activeTotalMinutes]);
 
   useEffect(() => {
     let cancelled = false;
@@ -474,7 +546,7 @@ function App() {
       }
     }
 
-    const scenarioPlans = buildScenarioPlans(logicalLoads, routeData, workerCount, truckCount);
+    const scenarioPlans = buildScenarioPlans(logicalLoads, routeData, workerCount, truckCount, sanitizedTruckSetup);
     const bestScenario = scenarioPlans.reduce(
       (best, plan) => (!best || plan.totalMinutes < best.totalMinutes ? plan : best),
       null,
@@ -526,8 +598,9 @@ function App() {
       routeKm: routeData.distanceKm,
       eta: formatMinutes(bestPlan.totalMinutes),
       routeTime: formatMinutes(routeData.minutes),
-      progressMinute: 0,
-      completionPercentage: 0,
+      progressMinute: previousMove.progressMinute || 0,
+      completionPercentage: previousMove.completionPercentage || 0,
+      playbackSpeed: previousMove.playbackSpeed || 15000,
       simulation,
     };
   }
@@ -597,6 +670,7 @@ function App() {
     setAreSceneAssetsReady(false);
     setIsScenePlaybackReady(false);
     setIsPlaybackRunning(false);
+    lastPersistedMinuteRef.current = 0;
     setCurrentMinute(0);
     setIsPlaybackPaused(false);
     navigateTo(`/move/${moveId}`);
@@ -631,9 +705,21 @@ function App() {
     };
 
     setMoves(upsertMove(updatedMove));
+    lastPersistedMinuteRef.current = 0;
     setCurrentMinute(0);
     setIsPlaybackRunning(false);
     setIsPlaybackPaused(false);
+  }
+
+  function handleDeleteMove(moveId) {
+    const targetMove = moves.find((move) => move.id === moveId);
+    if (!targetMove) {
+      return;
+    }
+
+    navigateTo("/dashboard");
+    const nextMoves = removeMove(moveId);
+    setMoves(nextMoves);
   }
 
   function handleRunSelectedPlan() {
@@ -706,6 +792,21 @@ function App() {
     });
   }
 
+  if (route.page === "move" && session && areMovesHydrated && !activeMove) {
+    return h(DashboardPage, {
+      moves,
+      currentUser: session,
+      currentDate: new Date(),
+      loadsReady: !isLoadingLoads && !loadsError,
+      loadsError,
+      createError,
+      isCreatingMove,
+      onCreateMove: handleCreateMove,
+      onOpenMove: handleOpenMove,
+      onLogout: handleLogout,
+    });
+  }
+
   if (route.page === "move" && session) {
     return h(RigMovePage, {
       move: activeMove,
@@ -726,6 +827,7 @@ function App() {
       onRunCustomPlan: handleRunCustomPlan,
       onPausePlayback: handlePauseTogglePlayback,
       onEndPlayback: handleEndPlayback,
+      onDeleteMove: handleDeleteMove,
       onBack: () => navigateTo("/dashboard"),
       onLogout: handleLogout,
       currentUser: session,

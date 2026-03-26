@@ -4,10 +4,12 @@ import { Button } from "../components/ui/Button.js";
 import { Card, StatCard } from "../components/ui/Card.js";
 import { ProgressBar } from "../components/ui/ProgressBar.js";
 import { Field, TextInput } from "../components/ui/Field.js";
+import { Modal } from "../components/ui/Modal.js";
 import { SimulationScene3D } from "../components/map/SimulationScene3D.js";
 import { LeafletMap } from "../components/map/LeafletMap.js";
 import { formatLocationLabel, formatMinutes } from "../lib/format.js";
 import { buildScenarioPlans } from "../features/rigMoves/simulation.js";
+import { persistMoveSession } from "../features/rigMoves/storage.js";
 
 const { useDeferredValue, useEffect, useMemo, useRef, useState } = React;
 
@@ -298,8 +300,20 @@ function buildTruckScheduleRows(playback, truckCount) {
   const trips = playback?.trips || [];
   const totalMinutes = Math.max(playback?.totalMinutes || 1, 1);
 
+  function getTruckToneClass(truckType) {
+    const normalized = String(truckType || "").trim().toLowerCase();
+    if (normalized.includes("flat")) {
+      return "scene-timeline-segment-truck-flatbed";
+    }
+    if (normalized.includes("low") || normalized.includes("support")) {
+      return "scene-timeline-segment-truck-lowbed";
+    }
+    return "scene-timeline-segment-truck-heavyhaul";
+  }
+
   return Array.from({ length: truckCount }, (_, index) => {
     const truckId = index + 1;
+    let rowToneClass = "scene-timeline-segment-truck-heavyhaul";
     const truckTrips = trips
       .filter((trip) => trip.truckId === truckId)
       .map((trip, tripIndex) => ({
@@ -312,10 +326,16 @@ function buildTruckScheduleRows(playback, truckCount) {
         moveWidth: ((trip.arrivalAtDestination - trip.rigDownFinish) / totalMinutes) * 100,
         upLeft: ((trip.arrivalAtDestination - trip.loadStart) / totalMinutes) * 100,
         upWidth: ((trip.rigUpFinish - trip.arrivalAtDestination) / totalMinutes) * 100,
+        toneClass: getTruckToneClass(trip.truckType),
       }));
+
+    if (truckTrips[0]?.toneClass) {
+      rowToneClass = truckTrips[0].toneClass;
+    }
 
     return {
       truckId,
+      toneClass: rowToneClass,
       trips: truckTrips,
     };
   });
@@ -427,6 +447,12 @@ function LoadScheduleTable({ playback, currentMinute }) {
 }
 
 function FullScreenTimeline({ playback, currentMinute, zoom = 1, rowType = "truck", gapMinutes = 8 * 60 }) {
+  const headerScrollRef = useRef(null);
+  const bodyScrollRef = useRef(null);
+  const fixedBodyRef = useRef(null);
+  const syncingHeaderRef = useRef(false);
+  const syncingBodyRef = useRef(false);
+  const [hoverCard, setHoverCard] = useState(null);
   const totalMinutes = Math.max(playback?.totalMinutes || 1, 1);
   const trips = playback?.trips || [];
   const buildMergedPhaseItems = (phaseKey, toneClass, getRange) => {
@@ -496,90 +522,259 @@ function FullScreenTimeline({ playback, currentMinute, zoom = 1, rowType = "truc
   });
   const currentX = `${(Math.min(currentMinute, totalMinutes) / totalMinutes) * 100}%`;
   const pixelsPerTick = 180;
-  const minTimelineWidth = Math.max(2400, Math.round(tickCount * pixelsPerTick * zoom));
+  const timelineWidth = Math.max(Math.round(tickCount * pixelsPerTick * zoom), 1);
+
+  function handleHeaderScroll(event) {
+    if (syncingHeaderRef.current) {
+      syncingHeaderRef.current = false;
+      return;
+    }
+
+    const nextLeft = event.currentTarget.scrollLeft;
+    if (bodyScrollRef.current) {
+      syncingBodyRef.current = true;
+      bodyScrollRef.current.scrollLeft = nextLeft;
+    }
+  }
+
+  function handleBodyScroll(event) {
+    if (syncingBodyRef.current) {
+      syncingBodyRef.current = false;
+    }
+
+    const nextLeft = event.currentTarget.scrollLeft;
+    const nextTop = event.currentTarget.scrollTop;
+
+    if (headerScrollRef.current && headerScrollRef.current.scrollLeft !== nextLeft) {
+      syncingHeaderRef.current = true;
+      headerScrollRef.current.scrollLeft = nextLeft;
+    }
+
+    if (fixedBodyRef.current && fixedBodyRef.current.scrollTop !== nextTop) {
+      fixedBodyRef.current.scrollTop = nextTop;
+    }
+
+    if (hoverCard) {
+      setHoverCard(null);
+    }
+  }
+
+  function handleTripHover(event, label) {
+    const bodyNode = bodyScrollRef.current;
+    if (!bodyNode) {
+      return;
+    }
+
+    const bounds = bodyNode.getBoundingClientRect();
+    const cardWidth = 280;
+    const cardHeight = 44;
+    const rawLeft = event.clientX - bounds.left + bodyNode.scrollLeft + 14;
+    const rawTop = event.clientY - bounds.top + bodyNode.scrollTop + 16;
+    const minLeft = bodyNode.scrollLeft + 8;
+    const maxLeft = bodyNode.scrollLeft + bodyNode.clientWidth - cardWidth - 8;
+    const minTop = bodyNode.scrollTop + 8;
+    const maxTop = bodyNode.scrollTop + bodyNode.clientHeight - cardHeight - 8;
+
+    setHoverCard({
+      label,
+      left: Math.max(minLeft, Math.min(maxLeft, rawLeft)),
+      top: Math.max(minTop, Math.min(maxTop, rawTop)),
+    });
+  }
+
+  useEffect(() => {
+    const bodyNode = bodyScrollRef.current;
+    const headerNode = headerScrollRef.current;
+    if (!bodyNode || !headerNode || totalMinutes <= 0) {
+      return;
+    }
+
+    const markerOffset = (Math.min(currentMinute, totalMinutes) / totalMinutes) * timelineWidth;
+    const viewportWidth = bodyNode.clientWidth;
+    const maxScrollLeft = Math.max(0, timelineWidth - viewportWidth);
+    const targetScrollLeft = Math.max(0, Math.min(maxScrollLeft, markerOffset - viewportWidth * 0.65));
+
+    if (Math.abs(bodyNode.scrollLeft - targetScrollLeft) > 1) {
+      syncingBodyRef.current = true;
+      bodyNode.scrollLeft = targetScrollLeft;
+    }
+
+    if (Math.abs(headerNode.scrollLeft - targetScrollLeft) > 1) {
+      syncingHeaderRef.current = true;
+      headerNode.scrollLeft = targetScrollLeft;
+    }
+  }, [currentMinute, totalMinutes, timelineWidth]);
 
   return h(
     "section",
     { className: "scene-timeline-shell" },
     h(
       "div",
-      { className: "scene-timeline-scroll" },
+      { className: "scene-timeline-fixed-column" },
       h(
         "div",
-        { className: "scene-timeline-canvas", style: { minWidth: `${minTimelineWidth}px` } },
-        h(
-          "div",
-          { className: "scene-timeline-header" },
-          h("div", { className: "scene-timeline-header-copy" }, h("span", null, rowType === "phase" ? "Phase" : "Truck"), h("strong", null, "Schedule")),
+        { className: "scene-timeline-header-copy" },
+        h("span", null, rowType === "phase" ? "Phase" : "Truck"),
+        h("strong", null, "Schedule"),
+      ),
+      h(
+        "div",
+        { ref: fixedBodyRef, className: "scene-timeline-fixed-body" },
+        rows.map((row) =>
           h(
             "div",
-            { className: "scene-timeline-ticks" },
-            ticks.map((tick) =>
-              h(
-                "span",
-                {
-                  key: tick.key,
-                  className: "scene-timeline-tick",
-                  style: { left: tick.left },
-                },
-                tick.label,
+            { key: `timeline-copy-${row.key || row.truckId}`, className: "scene-timeline-row-copy" },
+            h("strong", null, rowType === "phase" ? row.label : `Truck ${row.truckId}`),
+            h("span", null, rowType === "phase" ? `${row.items.length} active window${row.items.length === 1 ? "" : "s"}` : `${row.trips.length} loads in sequence`),
+          ),
+        ),
+      ),
+    ),
+    h(
+      "div",
+      { className: "scene-timeline-main" },
+      h(
+        "div",
+        {
+          ref: headerScrollRef,
+          className: "scene-timeline-header-scroll",
+          onScroll: handleHeaderScroll,
+        },
+        h(
+          "div",
+          { className: "scene-timeline-header-track", style: { width: `${timelineWidth}px` } },
+          h(
+            "div",
+            { className: "scene-timeline-header" },
+            h(
+              "div",
+              { className: "scene-timeline-ticks" },
+              ticks.map((tick) =>
+                h(
+                  "span",
+                  {
+                    key: tick.key,
+                    className: "scene-timeline-tick",
+                    style: { left: tick.left },
+                  },
+                  tick.label,
+                ),
               ),
             ),
           ),
         ),
-        h("div", { className: "scene-timeline-current-marker", style: { left: currentX } }),
-        rows.map((row) =>
-          h(
-            "article",
-            { key: `timeline-row-${row.key || row.truckId}`, className: "scene-timeline-row" },
-            h(
-              "div",
-              { className: "scene-timeline-row-copy" },
-              h("strong", null, rowType === "phase" ? row.label : `Truck ${row.truckId}`),
-              h("span", null, rowType === "phase" ? `${row.items.length} active window${row.items.length === 1 ? "" : "s"}` : `${row.trips.length} loads in sequence`),
-            ),
-            h(
-              "div",
-              { className: "scene-timeline-row-track" },
-              ticks.map((tick) =>
-                h("span", {
-                  key: `timeline-grid-${row.key || row.truckId}-${tick.key}`,
-                  className: "scene-timeline-grid-line",
-                  style: { left: tick.left },
-                }),
-              ),
-              (row.items || row.trips || []).map((trip) =>
+      ),
+      h(
+        "div",
+        {
+          ref: bodyScrollRef,
+          className: "scene-timeline-scroll",
+          onScroll: handleBodyScroll,
+        },
+        h(
+          "div",
+          { className: "scene-timeline-canvas", style: { width: `${timelineWidth}px` } },
+          h("div", { className: "scene-timeline-current-marker", style: { left: currentX } }),
+          hoverCard
+            ? h(
+                "div",
+                {
+                  className: "scene-timeline-hover-card move-floating-card is-visible",
+                  style: {
+                    left: `${hoverCard.left}px`,
+                    top: `${hoverCard.top}px`,
+                  },
+                },
+                h("div", { className: "scene-timeline-hover-card-title" }, hoverCard.label),
+              )
+            : null,
+          rows.map((row) => {
+            const rowKey = row.key || row.truckId;
+            const rowTrips = (row.items || row.trips || []).map((trip) => {
+              const tripStartMinute = rowType === "phase" ? trip.startMinute : trip.rigDownFinish;
+              const tripEndMinute = rowType === "phase" ? trip.endMinute : trip.arrivalAtDestination;
+              const tripWidthPercent = rowType === "phase"
+                ? trip.width
+                : (((trip.arrivalAtDestination - trip.rigDownFinish) / totalMinutes) * 100);
+              const tripWidthPx = (tripWidthPercent / 100) * timelineWidth;
+              const tripSizeClass = tripWidthPx < 72 ? " is-micro" : tripWidthPx < 132 ? " is-compact" : "";
+              const visibleDuration = Math.max(0, Math.min(currentMinute, tripEndMinute) - tripStartMinute);
+              const activeFillPercent = tripEndMinute > tripStartMinute
+                ? Math.max(0, Math.min(100, (visibleDuration / (tripEndMinute - tripStartMinute)) * 100))
+                : 0;
+              const toneClass = rowType === "phase" ? trip.toneClass : (trip.toneClass || row.toneClass || "scene-timeline-segment-truck-heavyhaul");
+
+              return h(
+                "div",
+                {
+                  key: trip.key,
+                  className: `scene-timeline-trip${rowType === "phase" ? " is-phase" : " is-truck"}${tripSizeClass}`,
+                  style: {
+                    left: `${rowType === "phase" ? trip.left : ((trip.rigDownFinish / totalMinutes) * 100)}%`,
+                    width: `${tripWidthPercent}%`,
+                  },
+                  onPointerEnter: (event) =>
+                    handleTripHover(
+                      event,
+                      `${rowType === "phase" ? row.label : trip.description} | ${formatTimelineClock(tripStartMinute)} -> ${formatTimelineClock(tripEndMinute)}`,
+                    ),
+                  onPointerMove: (event) =>
+                    handleTripHover(
+                      event,
+                      `${rowType === "phase" ? row.label : trip.description} | ${formatTimelineClock(tripStartMinute)} -> ${formatTimelineClock(tripEndMinute)}`,
+                    ),
+                  onPointerLeave: () => setHoverCard(null),
+                },
                 h(
                   "div",
-                  {
-                    key: trip.key,
-                    className: "scene-timeline-trip",
-                    style: {
-                      left: `${rowType === "phase" ? trip.left : ((trip.rigDownFinish / totalMinutes) * 100)}%`,
-                      width: `${rowType === "phase" ? trip.width : (((trip.arrivalAtDestination - trip.rigDownFinish) / totalMinutes) * 100)}%`,
-                    },
-                    title: rowType === "phase"
-                      ? trip.title
-                      : `${trip.description} | ${formatMinutes(Math.round(trip.rigDownFinish))} -> ${formatMinutes(Math.round(trip.arrivalAtDestination))}`,
-                  },
-                  h(
-                    "span",
-                    { className: "scene-timeline-trip-label" },
-                    rowType === "phase"
-                      ? trip.label
-                      : `Load #${trip.loadId} ${formatTimelineClock(trip.rigDownFinish)} to ${formatTimelineClock(trip.arrivalAtDestination)}`,
-                  ),
+                  { className: "scene-timeline-trip-shell" },
                   h("span", {
-                    className: `scene-timeline-segment ${rowType === "phase" ? trip.toneClass : "scene-timeline-segment-move"}`,
+                    className: `scene-timeline-segment scene-timeline-segment-future ${toneClass}`,
                     style: {
                       left: "0%",
                       width: "100%",
                     },
                   }),
+                  h("span", {
+                    className: `scene-timeline-segment scene-timeline-segment-active${activeFillPercent >= 99.5 ? " is-complete" : ""} ${toneClass}`,
+                    style: {
+                      left: "0%",
+                      width: `${activeFillPercent}%`,
+                    },
+                  }),
+                  h(
+                    "span",
+                    { className: "scene-timeline-trip-pill" },
+                    rowType === "phase" ? row.label : `#${trip.loadId}`,
+                  ),
+                  h(
+                    "span",
+                    { className: "scene-timeline-trip-label" },
+                    rowType === "phase"
+                      ? trip.label
+                      : `${formatTimelineClock(trip.rigDownFinish)} to ${formatTimelineClock(trip.arrivalAtDestination)}`,
+                  ),
                 ),
+              );
+            });
+
+            return h(
+              "article",
+              { key: `timeline-row-${rowKey}`, className: "scene-timeline-row" },
+              h(
+                "div",
+                { className: "scene-timeline-row-track" },
+                ticks.map((tick) =>
+                  h("span", {
+                    key: `timeline-grid-${rowKey}-${tick.key}`,
+                    className: "scene-timeline-grid-line",
+                    style: { left: tick.left },
+                  }),
+                ),
+                rowTrips,
               ),
-            ),
-          ),
+            );
+          }),
         ),
       ),
     ),
@@ -963,6 +1158,7 @@ export function RigMovePage({
   onRunCustomPlan,
   onPausePlayback,
   onEndPlayback,
+  onDeleteMove,
   onBack,
   onLogout,
   currentUser,
@@ -973,14 +1169,29 @@ export function RigMovePage({
   const [truckSetup, setTruckSetup] = useState(() => normalizeTruckSetup(move));
   const [activeScenarioName, setActiveScenarioName] = useState(move?.simulation?.preferredScenarioName || "");
   const [activePlanKey, setActivePlanKey] = useState(move?.simulation?.preferredScenarioName || "");
-  const [activeView, setActiveView] = useState("map");
-  const [sceneMode, setSceneMode] = useState("3d");
+  const [activeView, setActiveView] = useState(move?.activeView || "map");
+  const [sceneMode, setSceneMode] = useState(move?.sceneMode || "3d");
+  const [previousSceneMode, setPreviousSceneMode] = useState(
+    move?.previousSceneMode || (move?.sceneMode === "2d" || move?.sceneMode === "3d" ? move.sceneMode : "3d"),
+  );
   const [activeStageKey, setActiveStageKey] = useState("planning");
-  const [timelineZoom, setTimelineZoom] = useState(1);
-  const [timelineRowType, setTimelineRowType] = useState("truck");
-  const [timelineGapMinutes, setTimelineGapMinutes] = useState(8 * 60);
+  const [timelineZoom, setTimelineZoom] = useState(move?.timelineZoom || 1);
+  const [timelineRowType, setTimelineRowType] = useState(move?.timelineRowType || "truck");
+  const [timelineGapMinutes, setTimelineGapMinutes] = useState(move?.timelineGapMinutes || 3 * 60);
   const [focusedRigSide, setFocusedRigSide] = useState(null);
   const [isSpeedDropdownOpen, setIsSpeedDropdownOpen] = useState(false);
+  const [isDeleteConfirmOpen, setIsDeleteConfirmOpen] = useState(false);
+
+  function handleSceneModeChange(nextMode) {
+    if (nextMode === "timeline") {
+      setPreviousSceneMode((current) => (sceneMode === "timeline" ? current : sceneMode));
+      setSceneMode("timeline");
+      return;
+    }
+
+    setPreviousSceneMode(nextMode);
+    setSceneMode(nextMode);
+  }
 
   useEffect(() => {
     if (sceneAssetsReady) {
@@ -1021,16 +1232,35 @@ export function RigMovePage({
 
       return current === "customize" ? "customize" : move?.simulation?.preferredScenarioName || "";
     });
-    setActiveView("map");
     if (isNewMove) {
-      setSceneMode("3d");
-      setTimelineZoom(1);
-      setTimelineRowType("truck");
-      setTimelineGapMinutes(8 * 60);
+      setActiveView(move?.activeView || "map");
+      setSceneMode(move?.sceneMode || "3d");
+      setPreviousSceneMode(
+        move?.previousSceneMode || (move?.sceneMode === "2d" || move?.sceneMode === "3d" ? move.sceneMode : "3d"),
+      );
+      setTimelineZoom(move?.timelineZoom || 1);
+      setTimelineRowType(move?.timelineRowType || "truck");
+      setTimelineGapMinutes(move?.timelineGapMinutes || 3 * 60);
       setIsSpeedDropdownOpen(false);
+      setIsDeleteConfirmOpen(false);
     }
     setFocusedRigSide(null);
   }, [move?.id, move?.updatedAt]);
+
+  useEffect(() => {
+    if (!move?.id) {
+      return;
+    }
+
+    persistMoveSession(move.id, {
+      activeView,
+      sceneMode,
+      previousSceneMode,
+      timelineZoom,
+      timelineRowType,
+      timelineGapMinutes,
+    });
+  }, [move?.id, activeView, sceneMode, previousSceneMode, timelineZoom, timelineRowType, timelineGapMinutes]);
 
   if (isLoadingMove) {
     return h(
@@ -1099,7 +1329,7 @@ export function RigMovePage({
       source: move.simulation?.routeSource || activeScenario?.routeSource || "Preview route",
     };
     const previewWorkerCount = Math.max(move.simulation?.workerCount || 0, deferredTotalTrucks + 2);
-    const previewPlans = buildScenarioPlans(logicalLoads, routeData, previewWorkerCount, deferredTotalTrucks);
+    const previewPlans = buildScenarioPlans(logicalLoads, routeData, previewWorkerCount, deferredTotalTrucks, deferredTruckSetup);
 
     return (
       previewPlans.find((scenario) => scenario.truckCount === deferredTotalTrucks) ||
@@ -1202,15 +1432,22 @@ export function RigMovePage({
   const activePlaybackSpeedOption =
     playbackSpeedOptions.find((option) => option.value === String(playbackSpeed)) ||
     playbackSpeedOptions[0];
+  const activePlaybackSpeedIndex = Math.max(
+    0,
+    playbackSpeedOptions.findIndex((option) => option.value === String(playbackSpeed)),
+  );
   const isTimelineMode = sceneMode === "timeline";
   const timelineRowsCount = timelineRowType === "phase" ? 3 : effectiveTruckCount;
   const timelineWorkingMinutes = getTimelineWorkingMinutes(displaySimulation.bestPlan.playback, timelineRowType);
+  const timelineWorkingMinutesPerTruck = Math.round(
+    getTimelineWorkingMinutes(displaySimulation.bestPlan.playback, "truck") / Math.max(effectiveTruckCount, 1),
+  );
   const timelineUtilizationPercent = Math.min(
     100,
     Math.round((timelineWorkingMinutes / Math.max(timelineRowsCount * totalMinutes, 1)) * 100),
   );
 
-  return activeView === "map"
+  const pageContent = activeView === "map"
     ? h(
         "main",
         { className: "scene-only-shell" },
@@ -1243,11 +1480,36 @@ export function RigMovePage({
                     }),
                   ),
                 }),
+                h(
+                  Button,
+                  {
+                    type: "button",
+                    variant: "ghost",
+                    className: "scene-back-button scene-back-button-inline scene-delete-button",
+                    onClick: () => setIsDeleteConfirmOpen(true),
+                    "aria-label": "Delete move",
+                  },
+                  h(
+                    "svg",
+                    {
+                      className: "scene-back-icon",
+                      viewBox: "0 0 16 16",
+                      "aria-hidden": "true",
+                    },
+                    h("path", {
+                      d: "M 5.2 5.2 L 10.8 10.8 M 10.8 5.2 L 5.2 10.8",
+                      fill: "none",
+                      stroke: "currentColor",
+                      "stroke-width": "2",
+                      "stroke-linecap": "round",
+                    }),
+                  ),
+                ),
                 h(Button, {
                   type: "button",
                   variant: "ghost",
                   className: "scene-top-action-button",
-                  onClick: () => setSceneMode("timeline"),
+                  onClick: () => handleSceneModeChange("timeline"),
                   children: "Timeline",
                 }),
               ),
@@ -1351,14 +1613,85 @@ export function RigMovePage({
           : null,
         isTimelineMode
           ? h(
+              "div",
+              { className: "scene-top-left-actions scene-top-left-actions-timeline" },
+              h(Button, {
+                type: "button",
+                variant: "ghost",
+                className: "scene-back-button scene-back-button-inline",
+                onClick: () => handleSceneModeChange(previousSceneMode || "3d"),
+                children: h(
+                  "svg",
+                  {
+                    className: "scene-back-icon",
+                    viewBox: "0 0 16 16",
+                    "aria-hidden": "true",
+                  },
+                  h("path", {
+                    d: "M 10.5 3.5 L 6 8 L 10.5 12.5",
+                    fill: "none",
+                    stroke: "currentColor",
+                    "stroke-width": "2.2",
+                    "stroke-linecap": "round",
+                    "stroke-linejoin": "round",
+                  }),
+                ),
+              }),
+            )
+          : null,
+        isTimelineMode
+          ? h(
               "section",
               { className: "scene-timeline-layout" },
+              h(FullScreenTimeline, {
+                playback: displaySimulation.bestPlan.playback,
+                currentMinute: visibleMinute,
+                zoom: timelineZoom,
+                rowType: timelineRowType,
+                gapMinutes: timelineGapMinutes,
+              }),
               h(
                 "aside",
                 { className: "scene-timeline-sidebar" },
                 h(
                   Card,
                   { className: "scene-timeline-sidebar-card" },
+                  h(
+                    "div",
+                    { className: "scene-timeline-sidebar-section" },
+                    h("span", { className: "scene-panel-kicker" }, "Stats"),
+                    timelineRowType === "phase"
+                      ? [
+                          h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Completion"), h("strong", null, `${completion}%`)),
+                          h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Current Time"), h("strong", null, formatMinutes(Math.round(visibleMinute)))),
+                          h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Time Left"), h("strong", null, formatMinutes(Math.max(0, Math.round(totalMinutes - visibleMinute))))),
+                          h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Phase Rows"), h("strong", null, "3")),
+                          h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Gap"), h("strong", null, `${timelineGapMinutes / 60}h`)),
+                          h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Loads"), h("strong", null, String(activePlanSummary.totalLoads))),
+                          h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "At Source"), h("strong", null, String(rigLoads.sourceCount))),
+                          h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Rig Down"), h("strong", null, `${Math.round(phases.down)}%`)),
+                          h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Move"), h("strong", null, `${Math.round(phases.move)}%`)),
+                          h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Rig Up"), h("strong", null, `${Math.round(phases.up)}%`)),
+                          h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Round Trips"), h("strong", null, String(activePlanSummary.roundTrips))),
+                          h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Total Time"), h("strong", null, formatMinutes(activePlanSummary.totalMinutes))),
+                          h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Phase Utilization"), h("strong", null, `${timelineUtilizationPercent}%`)),
+                        ]
+                      : [
+                          h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Completion"), h("strong", null, `${completion}%`)),
+                          h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Current Time"), h("strong", null, formatMinutes(Math.round(visibleMinute)))),
+                          h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Time Left"), h("strong", null, formatMinutes(Math.max(0, Math.round(totalMinutes - visibleMinute))))),
+                          h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Rows"), h("strong", null, String(timelineRowsCount))),
+                          h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Row Mode"), h("strong", null, "Truck")),
+                          h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Gap"), h("strong", null, `${timelineGapMinutes / 60}h`)),
+                          h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Loads"), h("strong", null, String(activePlanSummary.totalLoads))),
+                          h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Moving Now"), h("strong", null, String(rigLoads.movingCount))),
+                          h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Completed"), h("strong", null, String(rigLoads.destinationCount))),
+                          h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Round Trips"), h("strong", null, String(activePlanSummary.roundTrips))),
+                          h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Total Time"), h("strong", null, formatMinutes(activePlanSummary.totalMinutes))),
+                          h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Avg / Truck"), h("strong", null, formatMinutes(timelineWorkingMinutesPerTruck))),
+                          h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Utilization"), h("strong", null, `${timelineUtilizationPercent}%`)),
+                        ],
+                  ),
                   h(
                     "div",
                     { className: "scene-timeline-sidebar-section" },
@@ -1374,6 +1707,7 @@ export function RigMovePage({
                           {
                             type: "button",
                             className: "scene-dimension-toggle",
+                            disabled: timelineZoom <= 1,
                             onClick: () => setTimelineZoom((current) => Math.max(1, current / 2)),
                           },
                           "-",
@@ -1384,6 +1718,7 @@ export function RigMovePage({
                           {
                             type: "button",
                             className: "scene-dimension-toggle",
+                            disabled: timelineZoom >= 8,
                             onClick: () => setTimelineZoom((current) => Math.min(8, current * 2)),
                           },
                           "+",
@@ -1391,65 +1726,18 @@ export function RigMovePage({
                       ),
                       h(
                         "div",
-                        {
-                          ref: speedDropdownRef,
-                          className: `scene-speed-dropdown${isSpeedDropdownOpen ? " is-open" : ""}`,
-                          onPointerDown: (event) => event.stopPropagation(),
-                          onPointerMove: (event) => event.stopPropagation(),
-                        },
+                        { className: "scene-speed-button-wrap" },
                         h(
                           "button",
                           {
                             type: "button",
-                            className: "scene-speed-select",
-                            onClick: () => setIsSpeedDropdownOpen((current) => !current),
-                            "aria-haspopup": "listbox",
-                            "aria-expanded": isSpeedDropdownOpen ? "true" : "false",
+                            className: "scene-speed-button",
+                            onClick: () => {
+                              const nextOption = playbackSpeedOptions[(activePlaybackSpeedIndex + 1) % playbackSpeedOptions.length];
+                              onPlaybackSpeedChange?.(Number(nextOption.value));
+                            },
                           },
-                          h("span", null, activePlaybackSpeedOption.label),
-                        ),
-                        isSpeedDropdownOpen
-                          ? h(
-                              "div",
-                              {
-                                className: "scene-speed-menu",
-                                role: "listbox",
-                                "aria-label": "Playback speed",
-                                onPointerDown: (event) => event.stopPropagation(),
-                                onPointerMove: (event) => event.stopPropagation(),
-                              },
-                              playbackSpeedOptions.map((option) =>
-                                h(
-                                  "button",
-                                  {
-                                    key: `speed-${option.value}`,
-                                    type: "button",
-                                    className: `scene-speed-option${String(playbackSpeed) === option.value ? " is-active" : ""}`,
-                                    onClick: () => {
-                                      onPlaybackSpeedChange?.(Number(option.value));
-                                      setIsSpeedDropdownOpen(false);
-                                    },
-                                  },
-                                  option.label,
-                                ),
-                              ),
-                            )
-                          : null,
-                      ),
-                    ),
-                    h(
-                      "div",
-                      { className: "scene-mode-switcher" },
-                      ["3d", "2d", "timeline"].map((mode) =>
-                        h(
-                          "button",
-                          {
-                            key: `scene-mode-sidebar-${mode}`,
-                            type: "button",
-                            className: `scene-dimension-toggle${sceneMode === mode ? " is-active" : ""}`,
-                            onClick: () => setSceneMode(mode),
-                          },
-                          mode === "3d" ? "3D" : mode === "2d" ? "2D" : "Time Line",
+                          h("span", null, `Speed ${activePlaybackSpeedOption.label}`),
                         ),
                       ),
                     ),
@@ -1496,81 +1784,20 @@ export function RigMovePage({
                   ),
                   h(
                     "div",
-                    { className: "scene-timeline-sidebar-section" },
-                    h("span", { className: "scene-panel-kicker" }, "Stats"),
-                    h("strong", { className: "scene-plan-summary-title" }, timelineRowType === "truck" ? "Truck KPIs" : "Phase KPIs"),
-                    h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Ideal Total Time"), h("strong", null, formatMinutes(activePlanSummary.totalMinutes))),
-                    h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Working Total Time"), h("strong", null, formatMinutes(timelineWorkingMinutes))),
-                    h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Utilization %"), h("strong", null, `${timelineUtilizationPercent}%`)),
-                  ),
-                  h(
-                    "div",
-                    { className: "scene-timeline-sidebar-section" },
-                    h("span", { className: "scene-panel-kicker" }, "Plan Selection"),
-                    h("strong", { className: "scene-plan-summary-title" }, `${isCustomizeActive ? "Customize" : activeScenario.name} | ${effectiveTruckCount} Trucks`),
-                    h(PlanSwitcher, {
-                      scenarios: scenarioPlans,
-                      activePlanKey,
-                      onSelect: (planKey) => {
-                        setActivePlanKey(planKey);
-                        if (planKey === "customize") {
-                          return;
-                        }
-                        setActiveScenarioName(planKey);
-                        onSelectPlan({ moveId: move.id, scenarioName: planKey });
-                      },
-                    }),
-                    isCustomizeActive && !isPlaybackRunning && !isPlaybackPaused
-                      ? truckSetup.map((truck) =>
-                          h(
-                            "label",
-                            { key: `timeline-slider-${truck.id}`, className: "truck-slider-card" },
-                            h("div", { className: "truck-slider-head" }, h("span", null, truck.type || "Truck"), h("strong", null, truck.count)),
-                            h("input", {
-                              className: "truck-slider-input",
-                              type: "range",
-                              min: "1",
-                              max: String(getSliderMaxCount(Number.parseInt(truck.count, 10) || 0)),
-                              step: "1",
-                              value: truck.count,
-                              onInput: (event) => updateTruckCount(truck.id, event.target.value),
-                            }),
-                          ),
-                        )
-                      : displayedTruckCounts.map((truck) =>
-                          h(
-                            "div",
-                            { key: `timeline-truck-count-${truck.id}`, className: "truck-count-row" },
-                            h("span", null, truck.type || "Truck"),
-                            h("strong", null, String(truck.count)),
-                          ),
-                        ),
-                  ),
-                  h(
-                    "div",
                     { className: "scene-timeline-sidebar-section scene-timeline-sidebar-actions" },
-                    h("span", { className: "scene-panel-kicker" }, "Run"),
                     simulationError ? h("p", { className: "field-error" }, simulationError) : null,
-                    h("p", { className: "scene-dashboard-copy" }, isPlaybackRunning || isPlaybackPaused ? lastLog?.title || "Waiting for simulation" : `Cost: ${activePlanDashboard.costEstimate}`),
                     h(PlaybackActionButton, {
                       isRunning: isPlaybackRunning,
-                      isBusy: isCustomizeActive ? isSimulating : false,
+                      isBusy: false,
                       isPaused: isPlaybackPaused,
-                      onRun: isCustomizeActive ? () => onRunCustomPlan({ moveId: move.id, truckSetup }) : onRunPlayback,
+                      onRun: canResumePlayback ? onRunPlayback : onRunPlayback,
                       onEnd: onEndPlayback,
                       onPauseToggle: onPausePlayback,
-                      label: isCustomizeActive ? "Run" : canResumePlayback ? "Resume" : "Run",
+                      label: canResumePlayback ? "Resume" : "Run",
                     }),
                   ),
                 ),
               ),
-              h(FullScreenTimeline, {
-                playback: displaySimulation.bestPlan.playback,
-                currentMinute: visibleMinute,
-                zoom: timelineZoom,
-                rowType: timelineRowType,
-                gapMinutes: timelineGapMinutes,
-              }),
             )
           : sceneMode === "3d"
           ? h(SimulationScene3D, {
@@ -1673,14 +1900,14 @@ export function RigMovePage({
               ["3d", "2d"].map((mode) =>
                 h(
                   "button",
-                  {
-                    key: `scene-mode-${mode}`,
-                    type: "button",
-                    className: `scene-dimension-toggle scene-mode-mini-nav-button${sceneMode === mode ? " is-active" : ""}`,
-                    onClick: () => setSceneMode(mode),
-                  },
-                  mode === "3d" ? "3D" : "2D",
-                ),
+                {
+                  key: `scene-mode-${mode}`,
+                  type: "button",
+                  className: `scene-dimension-toggle scene-mode-mini-nav-button${sceneMode === mode ? " is-active" : ""}`,
+                  onClick: () => handleSceneModeChange(mode),
+                },
+                mode === "3d" ? "3D" : "2D",
+              ),
               ),
             ),
           ),
@@ -2151,4 +2378,42 @@ export function RigMovePage({
             })
           : null,
       );
+
+  return h(
+    React.Fragment,
+    null,
+    pageContent,
+    isDeleteConfirmOpen
+      ? h(
+          Modal,
+          {
+            eyebrow: "Move",
+            title: "Delete Move",
+            description: `Delete "${move.name}"? This cannot be undone.`,
+            className: "modal-shell-compact",
+            onClose: () => setIsDeleteConfirmOpen(false),
+          },
+          h(
+            "div",
+            { className: "auth-actions" },
+            h(Button, {
+              type: "button",
+              variant: "ghost",
+              className: "dashboard-field-button",
+              onClick: () => setIsDeleteConfirmOpen(false),
+              children: "Cancel",
+            }),
+            h(Button, {
+              type: "button",
+              className: "scene-top-action-button scene-delete-confirm-button",
+              onClick: () => {
+                setIsDeleteConfirmOpen(false);
+                onDeleteMove?.(move.id);
+              },
+              children: "Delete",
+            }),
+          ),
+        )
+      : null,
+  );
 }
