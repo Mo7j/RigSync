@@ -196,6 +196,9 @@ export function LeafletMap({
   currentMinute = 0,
   pickerTarget = null,
   onPickPoint,
+  onRigFocusChange = null,
+  onTruckFocusChange = null,
+  onFocusChange = null,
   heightClass = "map-frame",
 }) {
   const [locationRequestState, setLocationRequestState] = useState("idle");
@@ -273,11 +276,14 @@ export function LeafletMap({
 
     const handleDoubleClick = () => {
       resetMapToIdleFocus(map, startPoint, endPoint, simulation);
+      onRigFocusChange?.(null);
+      onTruckFocusChange?.(null);
+      onFocusChange?.(null);
     };
 
     map.on("dblclick", handleDoubleClick);
     return () => map.off("dblclick", handleDoubleClick);
-  }, [pickerTarget, startPoint, endPoint, simulation]);
+  }, [pickerTarget, startPoint, endPoint, simulation, onRigFocusChange, onTruckFocusChange]);
 
   useEffect(() => {
     const map = mapRef.current;
@@ -295,7 +301,11 @@ export function LeafletMap({
         markersRef.current.start = window.L.marker([startPoint.lat, startPoint.lng], {
           icon: createSourceIcon(),
         }).addTo(map);
-        markersRef.current.start.on("click", () => focusMapOnPoint(map, startPoint, 13));
+        markersRef.current.start.on("click", () => {
+          focusMapOnPoint(map, startPoint, 13);
+          onRigFocusChange?.("source");
+          onFocusChange?.({ kind: "rig", side: "source" });
+        });
       } else {
         markersRef.current.start.setLatLng([startPoint.lat, startPoint.lng]);
       }
@@ -311,7 +321,11 @@ export function LeafletMap({
         markersRef.current.end = window.L.marker([endPoint.lat, endPoint.lng], {
           icon: createDestinationIcon(),
         }).addTo(map);
-        markersRef.current.end.on("click", () => focusMapOnPoint(map, endPoint, 13));
+        markersRef.current.end.on("click", () => {
+          focusMapOnPoint(map, endPoint, 13);
+          onRigFocusChange?.("destination");
+          onFocusChange?.({ kind: "rig", side: "destination" });
+        });
       } else {
         markersRef.current.end.setLatLng([endPoint.lat, endPoint.lng]);
       }
@@ -321,7 +335,7 @@ export function LeafletMap({
       markersRef.current.end.remove();
       markersRef.current.end = null;
     }
-  }, [startPoint, endPoint, simulation, currentMinute]);
+  }, [startPoint, endPoint, simulation, currentMinute, onRigFocusChange, onTruckFocusChange]);
 
   useEffect(() => {
     const map = mapRef.current;
@@ -424,6 +438,8 @@ export function LeafletMap({
         marker.on("click", () => {
           const currentPosition = marker.getLatLng();
           focusMapOnPoint(map, { lat: currentPosition.lat, lng: currentPosition.lng }, 14);
+          onTruckFocusChange?.(truckId);
+          onFocusChange?.({ kind: "truck", truckId });
         });
 
         bindClampedTooltip(marker, `Truck ${truckId}: ${status}`, createSceneTooltipOptions({ offset: [0, -8] }));
@@ -438,7 +454,7 @@ export function LeafletMap({
         truckMarkersRef.current.delete(truckId);
       }
     });
-  }, [simulation, currentMinute]);
+  }, [simulation, currentMinute, onRigFocusChange, onTruckFocusChange]);
 
   function handleUseMyLocation(event) {
     event.stopPropagation();

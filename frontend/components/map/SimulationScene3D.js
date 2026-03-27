@@ -1310,6 +1310,8 @@ export function SimulationScene3D({
   showOverlay = true,
   onReadyStateChange = null,
   onRigFocusChange = null,
+  onTruckFocusChange = null,
+  onFocusChange = null,
 }) {
   const hostRef = useRef(null);
   const overlayRef = useRef(null);
@@ -2311,6 +2313,7 @@ function buildRouteTooltip(routeInfo) {
       focusedTruckOffsetRef.current = null;
       focusedTruckFollowConfigRef.current = null;
       onRigFocusChange?.(focusedRigSideRef.current);
+      onFocusChange?.({ kind: "rig", side: focusedRigSideRef.current });
       cameraTransitioningRef.current = true;
     }
 
@@ -2334,7 +2337,8 @@ function buildRouteTooltip(routeInfo) {
         distance: followDistance,
         lift: followLift,
       };
-      onRigFocusChange?.(null);
+      onTruckFocusChange?.(truckId);
+      onFocusChange?.({ kind: "truck", truckId });
       cameraTransitioningRef.current = true;
     }
 
@@ -2347,6 +2351,8 @@ function buildRouteTooltip(routeInfo) {
       focusedTruckLastTargetRef.current = null;
       focusedTruckFollowConfigRef.current = null;
       onRigFocusChange?.(null);
+      onTruckFocusChange?.(null);
+      onFocusChange?.(null);
       cameraTransitioningRef.current = true;
     }
 
@@ -2804,6 +2810,8 @@ function buildRouteTooltip(routeInfo) {
       disposed = true;
       onReadyStateChange?.(false);
       onRigFocusChange?.(null);
+      onTruckFocusChange?.(null);
+      onFocusChange?.(null);
       assetsReadyRef.current = false;
       focusedTruckLastTargetRef.current = null;
       window.cancelAnimationFrame(animationFrameId);

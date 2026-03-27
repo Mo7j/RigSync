@@ -174,9 +174,147 @@ function getPlanDashboardStats(scenario, move) {
   return {
     utilizationValue: utilization,
     utilization: `${utilization}%`,
+    rawCostEstimate: costEstimate,
     costEstimate: formatCurrency(costEstimate),
     loadsPerTruck: (trips.length / truckCount).toFixed(1),
     crewHours: String(Math.round((workerCount * totalMinutes) / 60)),
+  };
+}
+
+function getPlanComparisonStats(scenarios, selectedScenario, move, currentMinute = 0) {
+  const validScenarios = (scenarios || []).filter((scenario) => (scenario?.totalMinutes || 0) > 0);
+  const selectedTotalMinutes = selectedScenario?.totalMinutes || 0;
+  const averageMinutes = validScenarios.length
+    ? Math.round(validScenarios.reduce((sum, scenario) => sum + (scenario.totalMinutes || 0), 0) / validScenarios.length)
+    : selectedTotalMinutes;
+  const timeSavedMinutes = Math.max(0, averageMinutes - selectedTotalMinutes);
+  const timeSavedPercent = averageMinutes > 0 ? Math.round((timeSavedMinutes / averageMinutes) * 100) : 0;
+  const playback = selectedScenario?.bestVariant?.playback;
+  const trips = playback?.trips || [];
+  const totalLoads = trips.length;
+  const completedLoads = trips.filter((trip) => currentMinute >= trip.rigUpFinish).length;
+  const planDashboard = getPlanDashboardStats(selectedScenario, move);
+  const activeTruckIds = new Set(
+    trips
+      .filter((trip) => currentMinute >= trip.loadStart && currentMinute < (trip.returnToSource ?? trip.rigUpFinish))
+      .map((trip) => trip.truckId),
+  );
+  const routeKm = Number(move?.routeKm) || 0;
+  const costEstimate = planDashboard.rawCostEstimate || 0;
+
+  return {
+    averageMinutes,
+    timeSavedMinutes,
+    timeSavedPercent,
+    throughputLoadsPerDay: totalLoads > 0 && selectedTotalMinutes > 0 ? ((totalLoads / selectedTotalMinutes) * 1440).toFixed(1) : "0.0",
+    progressPercent: totalLoads > 0 ? Math.round((completedLoads / totalLoads) * 100) : 0,
+    activeFleet: activeTruckIds.size,
+    costPerLoad: totalLoads > 0 ? formatCurrency(costEstimate / totalLoads) : formatCurrency(0),
+    routeDistance: `${Math.round(routeKm * Math.max(totalLoads, 1))} km`,
+  };
+}
+
+function getTruckFocusStats({ truckId, playback, currentMinute, totalMinutes, move }) {
+  if (truckId == null || !playback?.trips?.length) {
+    return null;
+  }
+
+  const truckTrips = playback.trips.filter((trip) => trip.truckId === truckId);
+  if (!truckTrips.length) {
+    return null;
+  }
+
+  const activeTrip = truckTrips.find(
+    (trip) => currentMinute >= trip.loadStart && currentMinute < (trip.returnToSource ?? trip.rigUpFinish),
+  ) || null;
+  const completedLoads = truckTrips.filter((trip) => currentMinute >= trip.rigUpFinish).length;
+  const busyMinutes = truckTrips.reduce(
+    (sum, trip) => sum + Math.max(0, (trip.returnToSource ?? trip.rigUpFinish) - trip.loadStart),
+    0,
+  );
+  const utilization = Math.min(100, Math.round((busyMinutes / Math.max(totalMinutes, 1)) * 100));
+  const nextTrip = truckTrips.find((trip) => currentMinute < trip.loadStart) || null;
+  const lastTrip = [...truckTrips].reverse().find((trip) => currentMinute >= trip.rigUpFinish) || null;
+  const routeKm = Number(move?.routeKm) || 0;
+  const remainingAssignedLoads = truckTrips.filter((trip) => currentMinute < trip.rigUpFinish).length;
+
+  let statusLabel = "Idle";
+  let statusDetail = "Waiting for its next assignment.";
+
+  if (activeTrip) {
+    if (currentMinute < activeTrip.rigDownFinish) {
+      statusLabel = "Rig Down";
+      statusDetail = `Loading #${activeTrip.loadId} at the source rig.`;
+    } else if (currentMinute < activeTrip.arrivalAtDestination) {
+      statusLabel = "In Transit";
+      statusDetail = `Hauling #${activeTrip.loadId} to destination.`;
+    } else if (currentMinute < activeTrip.rigUpFinish) {
+      statusLabel = "Rig Up";
+      statusDetail = `Setting #${activeTrip.loadId} at destination.`;
+    } else {
+      statusLabel = "Returning";
+      statusDetail = "Returning to the source rig.";
+    }
+  } else if (nextTrip) {
+    statusLabel = "Queued";
+    statusDetail = `Next load #${nextTrip.loadId} starts in ${formatMinutes(Math.max(0, Math.round(nextTrip.loadStart - currentMinute)))}`;
+  } else if (lastTrip) {
+    statusLabel = "Complete";
+    statusDetail = `Finished assigned loads by ${formatMinutes(Math.round(lastTrip.rigUpFinish))}.`;
+  }
+
+  return {
+    truckId,
+    truckType: truckTrips[0]?.truckType || "Truck",
+    statusLabel,
+    statusDetail,
+    completedLoads,
+    remainingAssignedLoads,
+    utilization,
+    busyTime: formatMinutes(Math.round(busyMinutes)),
+    nextMilestone: activeTrip
+      ? formatMinutes(
+          Math.round(
+            Math.max(
+              0,
+              (currentMinute < activeTrip.rigDownFinish
+                ? activeTrip.rigDownFinish
+                : currentMinute < activeTrip.arrivalAtDestination
+                  ? activeTrip.arrivalAtDestination
+                  : currentMinute < activeTrip.rigUpFinish
+                    ? activeTrip.rigUpFinish
+                    : activeTrip.returnToSource ?? activeTrip.rigUpFinish) - currentMinute,
+            ),
+          ),
+        )
+      : nextTrip
+        ? formatMinutes(Math.max(0, Math.round(nextTrip.loadStart - currentMinute)))
+        : "0m",
+    assignedDistance: `${Math.round(routeKm * truckTrips.length * 2)} km`,
+  };
+}
+
+function getRigInsightStats({ side, move, playback, currentMinute, totalMinutes }) {
+  const base = getRigSiteStats({ side, move, playback, currentMinute, totalMinutes });
+  if (!base || !playback?.trips?.length) {
+    return null;
+  }
+
+  const trips = playback.trips;
+  const loadingNow = trips.filter((trip) => currentMinute >= trip.loadStart && currentMinute < trip.rigDownFinish).length;
+  const riggingNow = trips.filter(
+    (trip) => currentMinute >= trip.arrivalAtDestination && currentMinute < trip.rigUpFinish,
+  ).length;
+  const nextEventMinute = side === "source"
+    ? trips.filter((trip) => currentMinute < trip.rigDownFinish).map((trip) => trip.rigDownFinish).sort((a, b) => a - b)[0]
+    : trips.filter((trip) => currentMinute < trip.arrivalAtDestination).map((trip) => trip.arrivalAtDestination).sort((a, b) => a - b)[0];
+
+  return {
+    ...base,
+    loadingNow,
+    riggingNow,
+    nextEventIn: nextEventMinute != null ? formatMinutes(Math.max(0, Math.round(nextEventMinute - currentMinute))) : "0m",
+    sitePressure: side === "source" ? `${base.remainingLoads} still staged` : `${base.remainingLoads} still pending receipt`,
   };
 }
 
@@ -261,6 +399,7 @@ function getRigSiteStats({ side, move, playback, currentMinute, totalMinutes }) 
           : "Pending";
 
   return {
+    side,
     label,
     sideLabel: side === "source" ? "Source Rig Site" : "Destination Rig Site",
     stateLabel,
@@ -858,6 +997,89 @@ function formatMinutePoint(value) {
   return formatMinutes(Math.max(0, Math.round(value || 0)));
 }
 
+function normalizePlanningDate(value, fallbackIso) {
+  const matched = String(value || "").match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (matched) {
+    return `${matched[1]}-${matched[2]}-${matched[3]}`;
+  }
+
+  const fallbackDate = fallbackIso ? new Date(fallbackIso) : new Date();
+  if (Number.isNaN(fallbackDate.getTime())) {
+    return "2026-03-27";
+  }
+
+  const year = fallbackDate.getFullYear();
+  const month = String(fallbackDate.getMonth() + 1).padStart(2, "0");
+  const day = String(fallbackDate.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+
+function normalizePlanningTime(value) {
+  const matched = String(value || "").match(/^(\d{1,2}):(\d{2})$/);
+  if (!matched) {
+    return "06:00";
+  }
+
+  const hours = Math.min(23, Math.max(0, Number.parseInt(matched[1], 10) || 0));
+  const minutes = Math.min(59, Math.max(0, Number.parseInt(matched[2], 10) || 0));
+  return `${String(hours).padStart(2, "0")}:${String(minutes).padStart(2, "0")}`;
+}
+
+function parsePlanningTimeMinutes(value) {
+  const normalized = normalizePlanningTime(value);
+  const [hours, minutes] = normalized.split(":").map((part) => Number.parseInt(part, 10) || 0);
+  return (hours * 60) + minutes;
+}
+
+function formatPlanningDateLabel(value) {
+  const normalized = normalizePlanningDate(value);
+  const date = new Date(`${normalized}T00:00:00`);
+  if (Number.isNaN(date.getTime())) {
+    return normalized;
+  }
+
+  return new Intl.DateTimeFormat("en-US", {
+    month: "short",
+    day: "numeric",
+    year: "numeric",
+  }).format(date);
+}
+
+function formatPlanningDateTime(dateValue, timeValue) {
+  const normalizedDate = normalizePlanningDate(dateValue);
+  const normalizedTime = normalizePlanningTime(timeValue);
+  const date = new Date(`${normalizedDate}T${normalizedTime}:00`);
+  if (Number.isNaN(date.getTime())) {
+    return `${normalizedDate} ${normalizedTime}`;
+  }
+
+  return new Intl.DateTimeFormat("en-US", {
+    month: "short",
+    day: "numeric",
+    year: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+  }).format(date);
+}
+
+function getPlanEtaLabel(dateValue, timeValue, durationMinutes) {
+  const normalizedDate = normalizePlanningDate(dateValue);
+  const planningStartMinutes = parsePlanningTimeMinutes(timeValue);
+  const date = new Date(`${normalizedDate}T00:00:00`);
+  if (Number.isNaN(date.getTime())) {
+    return formatPlanningDateTime(normalizedDate, normalizePlanningTime(timeValue));
+  }
+
+  date.setMinutes(planningStartMinutes + Math.max(0, Math.round(durationMinutes || 0)));
+  return new Intl.DateTimeFormat("en-US", {
+    month: "short",
+    day: "numeric",
+    year: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+  }).format(date);
+}
+
 function answerLoadLocation({ trip, currentMinute, move }) {
   const stage = getLoadStage(trip, currentMinute);
   const sourceLabel = formatLocationLabel(move?.startLabel, "source");
@@ -1178,7 +1400,9 @@ export function RigMovePage({
   const [timelineZoom, setTimelineZoom] = useState(move?.timelineZoom || 1);
   const [timelineRowType, setTimelineRowType] = useState(move?.timelineRowType || "truck");
   const [timelineGapMinutes, setTimelineGapMinutes] = useState(move?.timelineGapMinutes || 3 * 60);
-  const [focusedRigSide, setFocusedRigSide] = useState(null);
+  const [planningStartDate, setPlanningStartDate] = useState(normalizePlanningDate(move?.planningStartDate, move?.createdAt));
+  const [planningStartTime, setPlanningStartTime] = useState(normalizePlanningTime(move?.planningStartTime));
+  const [focusTarget, setFocusTarget] = useState(null);
   const [isSpeedDropdownOpen, setIsSpeedDropdownOpen] = useState(false);
   const [isDeleteConfirmOpen, setIsDeleteConfirmOpen] = useState(false);
 
@@ -1241,11 +1465,19 @@ export function RigMovePage({
       setTimelineZoom(move?.timelineZoom || 1);
       setTimelineRowType(move?.timelineRowType || "truck");
       setTimelineGapMinutes(move?.timelineGapMinutes || 3 * 60);
+      setPlanningStartDate(normalizePlanningDate(move?.planningStartDate, move?.createdAt));
+      setPlanningStartTime(normalizePlanningTime(move?.planningStartTime));
       setIsSpeedDropdownOpen(false);
       setIsDeleteConfirmOpen(false);
     }
-    setFocusedRigSide(null);
+    if (isNewMove) {
+      setFocusTarget(null);
+    }
   }, [move?.id, move?.updatedAt]);
+
+  useEffect(() => {
+    setFocusTarget(null);
+  }, [sceneFocusResetKey]);
 
   useEffect(() => {
     if (!move?.id) {
@@ -1259,8 +1491,10 @@ export function RigMovePage({
       timelineZoom,
       timelineRowType,
       timelineGapMinutes,
+      planningStartDate,
+      planningStartTime,
     });
-  }, [move?.id, activeView, sceneMode, previousSceneMode, timelineZoom, timelineRowType, timelineGapMinutes]);
+  }, [move?.id, activeView, sceneMode, previousSceneMode, timelineZoom, timelineRowType, timelineGapMinutes, planningStartDate, planningStartTime]);
 
   if (isLoadingMove) {
     return h(
@@ -1377,15 +1611,43 @@ export function RigMovePage({
   );
   const focusedRigStats = useMemo(
     () =>
-      getRigSiteStats({
-        side: focusedRigSide,
+      getRigInsightStats({
+        side: focusTarget?.kind === "rig" ? focusTarget.side : null,
         move,
         playback: displaySimulation.bestPlan.playback,
         currentMinute: visibleMinute,
         totalMinutes,
       }),
-    [focusedRigSide, move, displaySimulation, visibleMinute, totalMinutes],
+    [focusTarget, move, displaySimulation, visibleMinute, totalMinutes],
   );
+  const focusedTruckStats = useMemo(
+    () =>
+      getTruckFocusStats({
+        truckId: focusTarget?.kind === "truck" ? focusTarget.truckId : null,
+        move,
+        playback: displaySimulation.bestPlan.playback,
+        currentMinute: visibleMinute,
+        totalMinutes,
+      }),
+    [focusTarget, move, displaySimulation, visibleMinute, totalMinutes],
+  );
+  const planComparisonStats = useMemo(
+    () => getPlanComparisonStats(scenarioPlans, selectedScenario, move, visibleMinute),
+    [scenarioPlans, selectedScenario, move, visibleMinute],
+  );
+  const isPlaybackActiveState = isPlaybackRunning || isPlaybackPaused;
+  const focusedTruckOverviewTitle = !isPlaybackActiveState
+    ? "Truck Overview"
+    : focusedTruckStats && (focusedTruckStats.statusLabel === "In Transit" || focusedTruckStats.statusLabel === "Returning")
+      ? "Moving"
+      : "Idle";
+  const focusedRigOverviewTitle = !isPlaybackActiveState
+    ? "Rig Overview"
+    : focusedRigStats?.side === "source" && focusedRigStats.loadingNow > 0
+      ? "Rigging Down"
+      : focusedRigStats?.side === "destination" && focusedRigStats.riggingNow > 0
+        ? "Rigging Up"
+        : "Idle";
 
   function updateTruckCount(truckId, nextCountValue) {
     const parsedCount = Math.max(1, Number.parseInt(nextCountValue, 10) || 1);
@@ -1446,6 +1708,12 @@ export function RigMovePage({
     100,
     Math.round((timelineWorkingMinutes / Math.max(timelineRowsCount * totalMinutes, 1)) * 100),
   );
+  const planningStartDateLabel = formatPlanningDateLabel(planningStartDate);
+  const planEtaLabel = getPlanEtaLabel(planningStartDate, planningStartTime, activePlanSummary.totalMinutes);
+
+  function handleFocusChange(nextFocusTarget) {
+    setFocusTarget(nextFocusTarget || null);
+  }
 
   const pageContent = activeView === "map"
     ? h(
@@ -1811,7 +2079,7 @@ export function RigMovePage({
               heightClass: "scene-only-canvas",
               showOverlay: false,
               onReadyStateChange: onScenePlaybackReadyChange,
-              onRigFocusChange: setFocusedRigSide,
+              onFocusChange: handleFocusChange,
             })
           : sceneMode === "2d"
             ? h(LeafletMap, {
@@ -1820,6 +2088,7 @@ export function RigMovePage({
                 simulation: displaySimulation,
                 currentMinute: visibleMinute,
                 heightClass: "scene-only-canvas",
+                onFocusChange: handleFocusChange,
               })
             : h(FullScreenTimeline, {
                 playback: displaySimulation.bestPlan.playback,
@@ -1948,11 +2217,11 @@ export function RigMovePage({
                   "div",
                   { className: "scene-plan-summary-stack scene-passive-overlay" },
                   h(
-                    "div",
-                    { className: "scene-plan-summary-card scene-plan-summary-card-title" },
-                    h("span", { className: "scene-panel-kicker" }, "Selected Plan"),
-                    h("strong", { className: "scene-plan-summary-title" }, `${isCustomizeActive ? "Customize" : activeScenario.name} | ${effectiveTruckCount} Trucks`),
-                  ),
+                  "div",
+                  { className: "scene-plan-summary-card scene-plan-summary-card-title" },
+                  h("span", { className: "scene-panel-kicker" }, "Selected Plan"),
+                  h("strong", { className: "scene-plan-summary-title" }, isCustomizeActive ? "Custom Plan" : activeScenario.name),
+                ),
                 ),
                 h(
                   "section",
@@ -1963,15 +2232,23 @@ export function RigMovePage({
                           "label",
                           { key: truck.id, className: "truck-slider-card" },
                           h("div", { className: "truck-slider-head" }, h("span", null, truck.type || "Truck"), h("strong", null, truck.count)),
-                          h("input", {
-                            className: "truck-slider-input",
-                            type: "range",
-                            min: "1",
-                            max: String(getSliderMaxCount(Number.parseInt(truck.count, 10) || 0)),
-                            step: "1",
-                            value: truck.count,
-                            onInput: (event) => updateTruckCount(truck.id, event.target.value),
-                          }),
+                          (() => {
+                            const min = 1;
+                            const max = getSliderMaxCount(Number.parseInt(truck.count, 10) || 0);
+                            const currentValue = Number.parseInt(truck.count, 10) || min;
+                            const progress = max > min ? ((currentValue - min) / (max - min)) * 100 : 100;
+
+                            return h("input", {
+                              className: "truck-slider-input",
+                              type: "range",
+                              min: String(min),
+                              max: String(max),
+                              step: "1",
+                              value: truck.count,
+                              style: { "--truck-slider-progress": `${progress}%` },
+                              onInput: (event) => updateTruckCount(truck.id, event.target.value),
+                            });
+                          })(),
                         ),
                       )
                     : truckSetup.map((truck) =>
@@ -1982,6 +2259,45 @@ export function RigMovePage({
                           h("strong", null, truck.count),
                         ),
                       ),
+                  !isPlaybackRunning && !isPlaybackPaused
+                    ? h(
+                        "div",
+                        { className: "truck-time-controls" },
+                        h(
+                          "label",
+                          { className: "truck-time-card" },
+                          h(
+                            "div",
+                            { className: "truck-slider-head" },
+                            h("span", null, "Start Date"),
+                            h("strong", null, planningStartDateLabel),
+                          ),
+                          h("input", {
+                            className: "truck-time-input",
+                            type: "date",
+                            value: planningStartDate,
+                            onInput: (event) => setPlanningStartDate(normalizePlanningDate(event.target.value, move?.createdAt)),
+                          }),
+                        ),
+                        h(
+                          "label",
+                          { className: "truck-time-card" },
+                          h(
+                            "div",
+                            { className: "truck-slider-head" },
+                            h("span", null, "Start Time"),
+                            h("strong", null, planningStartTime),
+                          ),
+                          h("input", {
+                            className: "truck-time-input",
+                            type: "time",
+                            value: planningStartTime,
+                            step: "300",
+                            onInput: (event) => setPlanningStartTime(normalizePlanningTime(event.target.value)),
+                          }),
+                        ),
+                      )
+                    : null,
                 ),
                 simulationError ? h("p", { className: "field-error section-spacing" }, simulationError) : null,
                 h(
@@ -2003,23 +2319,37 @@ export function RigMovePage({
                   "div",
                   { className: "scene-plan-summary-stack scene-passive-overlay" },
                   h(
-                    "div",
-                    { className: "scene-plan-summary-card scene-plan-summary-card-title" },
-                    h("span", { className: "scene-panel-kicker" }, "Selected Plan"),
-                    h("strong", { className: "scene-plan-summary-title" }, `${isCustomizeActive ? "Customize" : activeScenario.name} | ${effectiveTruckCount} Trucks`),
-                  ),
+                  "div",
+                  { className: "scene-plan-summary-card scene-plan-summary-card-title" },
+                  h("span", { className: "scene-panel-kicker" }, "Selected Plan"),
+                  h("strong", { className: "scene-plan-summary-title" }, isCustomizeActive ? "Custom Plan" : activeScenario.name),
+                ),
                 ),
                 h(
                   "section",
                   { className: "scene-panel-section scene-panel-section-plain scene-passive-overlay" },
-                  displayedTruckCounts.map((truck) =>
+                  [
+                    ...displayedTruckCounts.map((truck) =>
+                      h(
+                        "div",
+                        { key: truck.id, className: "truck-count-row scene-passive-overlay" },
+                        h("span", null, truck.type || "Truck"),
+                        h("strong", null, String(truck.count)),
+                      ),
+                    ),
                     h(
                       "div",
-                      { key: truck.id, className: "truck-count-row scene-passive-overlay" },
-                      h("span", null, truck.type || "Truck"),
-                      h("strong", null, String(truck.count)),
+                      { key: "planning-start-date", className: "truck-count-row scene-passive-overlay" },
+                      h("span", null, "Start Date"),
+                      h("strong", null, planningStartDateLabel),
                     ),
-                  ),
+                    h(
+                      "div",
+                      { key: "planning-start-time", className: "truck-count-row scene-passive-overlay" },
+                      h("span", null, "Start Time"),
+                      h("strong", null, planningStartTime),
+                    ),
+                  ],
                 ),
                 h(
                   "div",
@@ -2036,7 +2366,42 @@ export function RigMovePage({
               ],
         )
           : null,
-        !isTimelineMode && focusedRigStats
+        !isTimelineMode && focusedTruckStats
+          ? h(
+              "div",
+              { className: "scene-top-info-strip" },
+              h(
+                "div",
+                { className: "scene-plan-kpis" },
+                h("div", { className: "scene-dashboard-stack-item" }, h("span", { className: "scene-dashboard-label" }, `Truck ${focusedTruckStats.truckId}`), h("strong", null, focusedTruckStats.truckType), h("p", { className: "scene-dashboard-copy" }, focusedTruckStats.statusDetail)),
+                h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Status"), h("strong", null, focusedTruckStats.statusLabel)),
+                h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Completed Loads"), h("strong", null, String(focusedTruckStats.completedLoads))),
+                h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Remaining Assignments"), h("strong", null, String(focusedTruckStats.remainingAssignedLoads))),
+              ),
+              h(
+                "div",
+                { className: "scene-plan-dashboard" },
+                h(
+                  "div",
+                  { className: "scene-plan-summary-card scene-plan-summary-card-title" },
+                  h("span", { className: "scene-panel-kicker" }, "Truck Focus"),
+                  h("strong", { className: "scene-plan-summary-title" }, focusedTruckOverviewTitle),
+                ),
+                h(
+                  "div",
+                  { className: "scene-dashboard-pair" },
+                  h("div", { className: "scene-dashboard-inline scene-dashboard-pair-item" }, h("span", { className: "scene-dashboard-label" }, "Busy Time"), h("strong", null, focusedTruckStats.busyTime)),
+                  h("div", { className: "scene-dashboard-inline scene-dashboard-pair-item" }, h("span", { className: "scene-dashboard-label" }, "Next Milestone"), h("strong", null, focusedTruckStats.nextMilestone)),
+                ),
+                h(
+                  "div",
+                  { className: "scene-dashboard-pair" },
+                  h("div", { className: "scene-dashboard-inline scene-dashboard-pair-item" }, h("span", { className: "scene-dashboard-label" }, "Assigned Distance"), h("strong", null, focusedTruckStats.assignedDistance)),
+                  h("div", { className: "scene-dashboard-inline scene-dashboard-pair-item" }, h("span", { className: "scene-dashboard-label" }, "Plan Share"), h("strong", null, `${Math.round((focusedTruckStats.completedLoads / Math.max(activePlanSummary.totalLoads, 1)) * 100)}%`)),
+                ),
+              ),
+            )
+          : !isTimelineMode && focusedRigStats
           ? h(
               "div",
               { className: "scene-top-info-strip" },
@@ -2055,7 +2420,7 @@ export function RigMovePage({
                   "div",
                   { className: "scene-plan-summary-card scene-plan-summary-card-title" },
                   h("span", { className: "scene-panel-kicker" }, "Site Progress"),
-                  h("strong", { className: "scene-plan-summary-title" }, `${focusedRigStats.progress}% Complete`),
+                  h("strong", { className: "scene-plan-summary-title" }, focusedRigOverviewTitle),
                 ),
                 h(
                   "div",
@@ -2067,6 +2432,13 @@ export function RigMovePage({
                     h(ProgressBar, { value: focusedRigStats.progress }),
                   ),
                   h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Time Left"), h("strong", null, focusedRigStats.timeLeft)),
+                  h(
+                    "div",
+                    { className: "scene-dashboard-pair" },
+                    h("div", { className: "scene-dashboard-inline scene-dashboard-pair-item" }, h("span", { className: "scene-dashboard-label" }, focusedRigStats.side === "source" ? "Loading Now" : "Rigging Now"), h("strong", null, String(focusedRigStats.side === "source" ? focusedRigStats.loadingNow : focusedRigStats.riggingNow))),
+                    h("div", { className: "scene-dashboard-inline scene-dashboard-pair-item" }, h("span", { className: "scene-dashboard-label" }, "Next Event"), h("strong", null, focusedRigStats.nextEventIn)),
+                  ),
+                  h("div", { className: "scene-dashboard-stack-item" }, h("span", { className: "scene-dashboard-label" }, "Site Pressure"), h("strong", null, focusedRigStats.sitePressure)),
                 ),
               ),
             )
@@ -2120,10 +2492,11 @@ export function RigMovePage({
               h(
                 "div",
                 { className: "scene-plan-kpis" },
-                h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Total Time"), h("strong", null, formatMinutes(activePlanSummary.totalMinutes))),
-                h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Round Trips"), h("strong", null, String(activePlanSummary.roundTrips))),
-                h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Loads"), h("strong", null, String(activePlanSummary.totalLoads))),
-                h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Stages"), h("strong", null, String(activePlanSummary.waves))),
+                h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "ETA"), h("strong", null, planEtaLabel)),
+                h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Time Saved vs Avg"), h("strong", null, formatMinutes(planComparisonStats.timeSavedMinutes))),
+                h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Faster Than Avg"), h("strong", null, `${planComparisonStats.timeSavedPercent}%`)),
+                h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Avg Completion"), h("strong", null, formatMinutes(planComparisonStats.averageMinutes))),
+                h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Loads / Day"), h("strong", null, planComparisonStats.throughputLoadsPerDay)),
               ),
               h(
                 "div",
@@ -2132,48 +2505,40 @@ export function RigMovePage({
                   "div",
                   { className: "scene-plan-summary-card scene-plan-summary-card-title" },
                   h("span", { className: "scene-panel-kicker" }, "Plan Dashboard"),
-                  h("strong", { className: "scene-plan-summary-title" }, isCustomizeActive ? "Customize Stats" : "Selection Stats"),
-                ),
-                h(
-                  "div",
-                  { className: "scene-dashboard-gauge-card" },
-                  h("span", { className: "scene-dashboard-label" }, "Utilization"),
-                  h(
-                    "div",
-                    { className: "scene-utilization-gauge" },
-                    h(
-                      "svg",
-                      {
-                        className: "scene-utilization-gauge-svg",
-                        viewBox: "0 0 120 70",
-                        "aria-hidden": "true",
-                      },
-                      h("path", {
-                        className: "scene-utilization-gauge-track",
-                        d: "M 10 60 A 50 50 0 0 1 110 60",
-                        pathLength: "100",
-                      }),
-                      h("path", {
-                        className: "scene-utilization-gauge-progress",
-                        d: "M 10 60 A 50 50 0 0 1 110 60",
-                        pathLength: "100",
-                        style: { "--utilization-progress": Math.max(0, Math.min(activePlanDashboard.utilizationValue, 100)) },
-                      }),
-                    ),
-                    h("div", { className: "scene-utilization-gauge-inner" }, h("strong", null, activePlanDashboard.utilization)),
-                  ),
-                ),
-                h(
-                  "div",
-                  { className: "scene-dashboard-cost" },
-                  h("span", { className: "scene-dashboard-label" }, "Cost"),
-                  h("strong", null, activePlanDashboard.costEstimate),
+                  h("strong", { className: "scene-plan-summary-title" }, isCustomizeActive ? "Custom Plan Overview" : "Plan Overview"),
                 ),
                 h(
                   "div",
                   { className: "scene-dashboard-pair" },
-                  h("div", { className: "scene-dashboard-inline scene-dashboard-pair-item" }, h("span", { className: "scene-dashboard-label" }, "Loads / Truck"), h("strong", null, activePlanDashboard.loadsPerTruck)),
+                  h("div", { className: "scene-dashboard-inline scene-dashboard-pair-item" }, h("span", { className: "scene-dashboard-label" }, "Total Time"), h("strong", null, formatMinutes(activePlanSummary.totalMinutes))),
+                  h("div", { className: "scene-dashboard-inline scene-dashboard-pair-item" }, h("span", { className: "scene-dashboard-label" }, "Round Trips"), h("strong", null, String(activePlanSummary.roundTrips))),
+                ),
+                h(
+                  "div",
+                  { className: "scene-dashboard-pair" },
+                  h("div", { className: "scene-dashboard-inline scene-dashboard-pair-item" }, h("span", { className: "scene-dashboard-label" }, "Fleet Active Now"), h("strong", null, `${planComparisonStats.activeFleet}/${effectiveTruckCount}`)),
+                  h("div", { className: "scene-dashboard-inline scene-dashboard-pair-item" }, h("span", { className: "scene-dashboard-label" }, "Cost / Load"), h("strong", null, planComparisonStats.costPerLoad)),
+                ),
+                h(
+                  "div",
+                  { className: "scene-dashboard-pair" },
                   h("div", { className: "scene-dashboard-inline scene-dashboard-pair-item" }, h("span", { className: "scene-dashboard-label" }, "Crew Hours"), h("strong", null, activePlanDashboard.crewHours)),
+                  h("div", { className: "scene-dashboard-inline scene-dashboard-pair-item" }, h("span", { className: "scene-dashboard-label" }, "Loads / Truck"), h("strong", null, activePlanDashboard.loadsPerTruck)),
+                ),
+                h(
+                  "div",
+                  { className: "scene-dashboard-pair" },
+                  h("div", { className: "scene-dashboard-inline scene-dashboard-pair-item" }, h("span", { className: "scene-dashboard-label" }, "Load-Km Planned"), h("strong", null, planComparisonStats.routeDistance)),
+                ),
+                h(
+                  "div",
+                  { className: "scene-dashboard-phase-stack" },
+                  h(
+                    "div",
+                    { className: "scene-dashboard-phase-row" },
+                    h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Utilization"), h("strong", null, activePlanDashboard.utilization)),
+                    h(ProgressBar, { value: activePlanDashboard.utilizationValue }),
+                  ),
                 ),
               ),
             ) : null,

@@ -171,6 +171,8 @@ function applyMoveSessions(moves) {
       progressMinute: session.progressMinute ?? move.progressMinute ?? 0,
       completionPercentage: session.completionPercentage ?? move.completionPercentage ?? 0,
       playbackSpeed: session.playbackSpeed ?? move.playbackSpeed,
+      planningStartDate: session.planningStartDate ?? move.planningStartDate,
+      planningStartTime: session.planningStartTime ?? move.planningStartTime,
     };
   });
 }

@@ -2886,6 +2886,10 @@ p {
   pointer-events: auto;
 }
 
+.scene-panel-left-merged .scene-panel-section-plain.scene-passive-overlay {
+  pointer-events: none;
+}
+
 .scene-panel-right {
   right: 24px;
 }
@@ -2946,7 +2950,7 @@ p {
 .scene-plan-kpis {
   display: grid;
   gap: 18px;
-  width: min(200px, calc(100vw - 320px));
+  width: min(220px, calc(100vw - 320px));
 }
 
 .scene-dashboard-kpi-item {
@@ -3077,8 +3081,8 @@ p {
 
 .scene-dashboard-inline strong {
   color: var(--muted-strong);
-  font-size: 1rem;
-  font-weight: 800;
+  font-size: 0.8rem;
+  font-weight: 600;
   text-shadow: 0 8px 24px rgba(0, 0, 0, 0.48);
 }
 
@@ -3504,6 +3508,17 @@ p {
   gap: 8px;
 }
 
+.truck-time-controls {
+  display: grid;
+  gap: 10px;
+}
+
+.truck-time-card {
+  display: grid;
+  gap: 8px;
+  margin-top: 6px;
+}
+
 .truck-slider-head {
   display: flex;
   align-items: center;
@@ -3515,25 +3530,33 @@ p {
 
 .truck-slider-input {
   width: 100%;
-  accent-color: #f5b63a;
+  -webkit-appearance: none;
+  appearance: none;
+  background: transparent;
 }
 
 .truck-slider-input::-webkit-slider-runnable-track {
   height: 6px;
   border-radius: 999px;
-  background: rgba(245, 182, 58, 0.28);
+  background: linear-gradient(
+    to right,
+    #f5b63a 0,
+    #f5b63a var(--truck-slider-progress, 0%),
+    rgba(245, 182, 58, 0.28) var(--truck-slider-progress, 0%),
+    rgba(245, 182, 58, 0.28) 100%
+  );
 }
 
 .truck-slider-input::-webkit-slider-thumb {
   -webkit-appearance: none;
   appearance: none;
-  width: 16px;
-  height: 16px;
-  margin-top: -5px;
+  width: 12px;
+  height: 12px;
+  margin-top: -3px;
   border: 0;
   border-radius: 999px;
   background: #f5b63a;
-  box-shadow: 0 4px 12px rgba(245, 182, 58, 0.35);
+  box-shadow: none;
 }
 
 .truck-slider-input::-moz-range-track {
@@ -3543,13 +3566,42 @@ p {
   background: rgba(245, 182, 58, 0.28);
 }
 
-.truck-slider-input::-moz-range-thumb {
-  width: 16px;
-  height: 16px;
+.truck-slider-input::-moz-range-progress {
+  height: 6px;
   border: 0;
   border-radius: 999px;
   background: #f5b63a;
-  box-shadow: 0 4px 12px rgba(245, 182, 58, 0.35);
+}
+
+.truck-slider-input::-moz-range-thumb {
+  width: 12px;
+  height: 12px;
+  border: 0;
+  border-radius: 999px;
+  background: #f5b63a;
+  box-shadow: none;
+}
+
+.truck-time-input {
+  width: 100%;
+  min-height: 42px;
+  padding: 10px 12px;
+  border: 1px solid rgba(245, 182, 58, 0.22);
+  border-radius: 12px;
+  background: rgba(13, 19, 27, 0.72);
+  color: #f7fafc;
+  font: inherit;
+}
+
+.truck-time-input::-webkit-calendar-picker-indicator {
+  filter: invert(0.88);
+  opacity: 0.9;
+}
+
+.truck-time-input:focus {
+  outline: none;
+  border-color: rgba(245, 182, 58, 0.5);
+  box-shadow: 0 0 0 1px rgba(245, 182, 58, 0.28);
 }
 
 .truck-count-row {
