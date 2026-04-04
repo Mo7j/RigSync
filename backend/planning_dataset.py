@@ -1,4 +1,5 @@
 import math
+import os
 import re
 from functools import lru_cache
 from pathlib import Path
@@ -7,7 +8,31 @@ from openpyxl import load_workbook
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-DATASET_PATH = PROJECT_ROOT / "FinalData.xlsx"
+
+
+def resolve_dataset_path():
+    override = os.environ.get("RIGSYNC_DATASET_PATH")
+    if override:
+        return Path(override).expanduser()
+
+    search_roots = [
+        PROJECT_ROOT,
+        Path.home() / "Downloads",
+    ]
+    candidate_names = (
+        "iseData.xlsx",
+    )
+
+    for search_root in search_roots:
+        for candidate_name in candidate_names:
+            candidate = search_root / candidate_name
+            if candidate.exists():
+                return candidate
+
+    return PROJECT_ROOT / "FinalData.xlsx"
+
+
+DATASET_PATH = resolve_dataset_path()
 
 WORKER_ROLE_DEFINITIONS = [
     {"id": "assistant_driller", "label": "Assistant Driller"},
@@ -75,6 +100,12 @@ STARTUP_REUSABLE_IDS = {
     "SU-06",
     "SU-13",
     "SU-14",
+}
+
+SHEET_NAME_CANDIDATES = {
+    "rig": ("Expanded Loads", "Rig Loads"),
+    "startup": ("Expanded Additional Loads", "Additional Needed Loads"),
+    "truck": ("Trucks Info",),
 }
 
 
@@ -145,6 +176,12 @@ def normalize_truck_type(value):
     if not text:
         return None
     key = re.sub(r"[^a-z]", "", text.lower())
+    if "flatbed" in key:
+        key = "flatbed"
+    elif "lowbed" in key or "support" in key:
+        key = "lowbed"
+    elif "heavyhaul" in key:
+        key = "heavyhauler"
     return TRUCK_TYPE_ALIASES.get(key, text)
 
 
@@ -166,7 +203,43 @@ def parse_dependency_codes(value):
     text = normalize_text(value)
     if not text or text == "—":
         return []
-    return re.findall(r"[A-Z]{2}-\d+", text)
+    return [match.upper() for match in re.findall(r"\b(?:RL|SU)-\d+(?:-L\d+)?\b", text, flags=re.IGNORECASE)]
+
+
+def normalize_header(value):
+    text = normalize_text(value)
+    if not text:
+        return None
+    return re.sub(r"[^a-z0-9]+", "", text.lower())
+
+
+def read_sheet_rows(workbook, candidate_names):
+    sheet = next((workbook[name] for name in candidate_names if name in workbook.sheetnames), None)
+    if sheet is None:
+        raise KeyError(f"None of the expected sheets were found: {', '.join(candidate_names)}")
+
+    rows = list(sheet.iter_rows(values_only=True))
+    if not rows:
+        return []
+
+    headers = [normalize_header(value) for value in rows[0]]
+    records = []
+    for row in rows[1:]:
+        record = {}
+        for index, header in enumerate(headers):
+            if not header:
+                continue
+            record[header] = row[index] if index < len(row) else None
+        records.append(record)
+    return records
+
+
+def row_value(row, *header_names):
+    for header_name in header_names:
+        value = row.get(normalize_header(header_name))
+        if value is not None:
+            return value
+    return None
 
 
 def normalize_worker_role(value):
@@ -218,34 +291,36 @@ def parse_crew_counts(value):
 
 
 def build_rig_load_payload(row):
-    code = normalize_text(row[0])
+    code = normalize_text(row_value(row, "Load ID", "Code"))
     if not code:
         return None
 
-    minimum_crew = parse_crew_counts(row[14])
-    optimal_crew = parse_crew_counts(row[15])
-    weight_tons = parse_weight_tons(row[5])
-    dimensions = parse_dimension_triplet(row[6])
+    minimum_crew = parse_crew_counts(row_value(row, "Minimum Crew (Rig Down / Rig Up)", "Minimum Crew"))
+    optimal_crew = parse_crew_counts(row_value(row, "Optimal Crew (Rig Down / Rig Up)", "Optimal Crew"))
+    weight_value = row_value(row, "Weight (tons)", "Weight")
+    dimensions_value = row_value(row, "Dimensions (L x W x H)", "Dimensions")
+    is_expanded_code = bool(re.search(r"-L\d+$", code, flags=re.IGNORECASE))
+    load_count = 1 if is_expanded_code else (normalize_int(row_value(row, "Total Loads in Task", "Load Count", "Count")) or 1)
 
     return {
         "id": normalize_int(code),
         "code": code,
-        "load_type": normalize_text(row[1]),
-        "description": normalize_text(row[2]),
-        "category": normalize_text(row[3]),
-        "load_count": normalize_int(row[4]) or 1,
-        "weight_tons": weight_tons,
-        "weight_text": normalize_text(row[5]),
-        "dimensions": dimensions,
-        "dimensions_text": normalize_text(row[6]),
-        "priority": normalize_int(row[7]) or 0,
-        "rig_down_dependency_codes": parse_dependency_codes(row[8]),
-        "rig_up_dependency_codes": parse_dependency_codes(row[9]),
-        "avg_rig_down_minutes": parse_duration_minutes(row[10]),
-        "avg_rig_up_minutes": parse_duration_minutes(row[11]),
-        "is_critical": parse_yes_no(row[12]),
-        "truck_type": normalize_text(row[13]),
-        "truck_types": parse_truck_types(row[13]),
+        "load_type": normalize_text(row_value(row, "Load Type")),
+        "description": normalize_text(row_value(row, "Description")),
+        "category": normalize_text(row_value(row, "Category")),
+        "load_count": load_count,
+        "weight_tons": parse_weight_tons(weight_value),
+        "weight_text": normalize_text(weight_value),
+        "dimensions": parse_dimension_triplet(dimensions_value),
+        "dimensions_text": normalize_text(dimensions_value),
+        "priority": normalize_int(row_value(row, "Priority")) or 0,
+        "rig_down_dependency_codes": parse_dependency_codes(row_value(row, "Rig Down Predecessor(s)")),
+        "rig_up_dependency_codes": parse_dependency_codes(row_value(row, "Rig Up Predecessor(s)")),
+        "avg_rig_down_minutes": parse_duration_minutes(row_value(row, "Avg Rig Down Time", "Average Rig Down Time")),
+        "avg_rig_up_minutes": parse_duration_minutes(row_value(row, "Avg Rig Up Time", "Average Rig Up Time")),
+        "is_critical": parse_yes_no(row_value(row, "Critical Lift", "Critical")),
+        "truck_type": normalize_text(row_value(row, "Truck Type(s)", "Truck Type")),
+        "truck_types": parse_truck_types(row_value(row, "Truck Type(s)", "Truck Type")),
         "minimum_crew_down_count": sum(minimum_crew["rig_down"].values()),
         "minimum_crew_up_count": sum(minimum_crew["rig_up"].values()),
         "optimal_crew_down_count": sum(optimal_crew["rig_down"].values()),
@@ -254,49 +329,53 @@ def build_rig_load_payload(row):
         "minimum_crew_up_roles": minimum_crew["rig_up"],
         "optimal_crew_down_roles": optimal_crew["rig_down"],
         "optimal_crew_up_roles": optimal_crew["rig_up"],
-        "optimal_rig_down_minutes": parse_duration_minutes(row[16]),
-        "optimal_rig_up_minutes": parse_duration_minutes(row[17]),
+        "optimal_rig_down_minutes": parse_duration_minutes(row_value(row, "Optimal Rig Down Time")),
+        "optimal_rig_up_minutes": parse_duration_minutes(row_value(row, "Optimal Rig Up Time")),
     }
 
 
 def build_startup_load_payload(row):
-    code = normalize_text(row[0])
+    code = normalize_text(row_value(row, "Load ID", "Code"))
     if not code:
         return None
+    weight_value = row_value(row, "Weight (tons)", "Weight")
+    dimensions_value = row_value(row, "Dimensions (L x W x H)", "Dimensions")
+    is_expanded_code = bool(re.search(r"-L\d+$", code, flags=re.IGNORECASE))
+    count = 1 if is_expanded_code else (normalize_int(row_value(row, "Count", "Load #", "Load Count")) or 1)
 
     return {
         "id": code,
         "code": code,
-        "load_type": normalize_text(row[1]),
-        "description": normalize_text(row[2]),
-        "count": normalize_int(row[3]) or 1,
-        "weight_tons": parse_weight_tons(row[4]),
-        "weight_text": normalize_text(row[4]),
-        "dimensions": parse_dimension_triplet(row[5]),
-        "dimensions_text": normalize_text(row[5]),
-        "priority": normalize_int(row[6]) or 0,
-        "dependencyLabel": normalize_text(row[7]) or "Standalone startup load",
-        "rig_up_dependency_codes": parse_dependency_codes(row[7]),
-        "avg_rig_up_minutes": parse_duration_minutes(row[8]),
-        "truck_type": normalize_text(row[9]),
-        "truckTypes": parse_truck_types(row[9]),
-        "isReusable": code in STARTUP_REUSABLE_IDS,
+        "load_type": normalize_text(row_value(row, "Load Type")),
+        "description": normalize_text(row_value(row, "Description")),
+        "count": count,
+        "weight_tons": parse_weight_tons(weight_value),
+        "weight_text": normalize_text(weight_value),
+        "dimensions": parse_dimension_triplet(dimensions_value),
+        "dimensions_text": normalize_text(dimensions_value),
+        "priority": normalize_int(row_value(row, "Priority")) or 0,
+        "dependencyLabel": normalize_text(row_value(row, "Rig Up Predecessor(s)", "Dependency")) or "Standalone startup load",
+        "rig_up_dependency_codes": parse_dependency_codes(row_value(row, "Rig Up Predecessor(s)", "Dependency")),
+        "avg_rig_up_minutes": parse_duration_minutes(row_value(row, "Avg Rig Up Time", "Average Rig Up Time")),
+        "truck_type": normalize_text(row_value(row, "Truck Type(s)", "Truck Type")),
+        "truckTypes": parse_truck_types(row_value(row, "Truck Type(s)", "Truck Type")),
+        "isReusable": any(code.startswith(prefix) for prefix in STARTUP_REUSABLE_IDS),
     }
 
 
 def build_truck_spec_payload(row):
-    truck_type = normalize_truck_type(row[0])
+    truck_type = normalize_truck_type(row_value(row, "Truck Type", "Type"))
     if not truck_type:
         return None
 
-    alpha_values = [float(match) for match in re.findall(r"\d+(?:\.\d+)?", normalize_text(row[4]) or "")]
+    alpha_values = [float(match) for match in re.findall(r"\d+(?:\.\d+)?", normalize_text(row_value(row, "α", "Alpha")) or "")]
     alpha = sum(alpha_values) / len(alpha_values) if alpha_values else 0.3
 
     return {
         "type": truck_type,
-        "max_weight_tons": normalize_float(row[1]) or 0,
-        "dimensions": parse_dimension_triplet(row[2]),
-        "average_speed_kmh": normalize_float(row[3]) or 0,
+        "max_weight_tons": normalize_float(row_value(row, "Maximum Weight (tons)", "Maximum Weight")) or 0,
+        "dimensions": parse_dimension_triplet(row_value(row, "Approx. Truck Dimensions (L x W x H, m)", "Dimensions")),
+        "average_speed_kmh": normalize_float(row_value(row, "Average Speed (km/h)", "Average Speed")) or 0,
         "alpha": alpha,
     }
 
@@ -305,15 +384,11 @@ def build_truck_spec_payload(row):
 def load_planning_dataset():
     workbook = load_workbook(DATASET_PATH, data_only=True)
 
-    rig_sheet = workbook["Rig Loads"]
-    startup_sheet = workbook["Additional Needed Loads"]
-    truck_sheet = workbook["Trucks Info"]
-
     rig_loads = [
         payload
         for payload in (
             build_rig_load_payload(row)
-            for row in rig_sheet.iter_rows(min_row=2, values_only=True)
+            for row in read_sheet_rows(workbook, SHEET_NAME_CANDIDATES["rig"])
         )
         if payload
     ]
@@ -321,7 +396,7 @@ def load_planning_dataset():
         payload
         for payload in (
             build_startup_load_payload(row)
-            for row in startup_sheet.iter_rows(min_row=2, values_only=True)
+            for row in read_sheet_rows(workbook, SHEET_NAME_CANDIDATES["startup"])
         )
         if payload
     ]
@@ -329,7 +404,7 @@ def load_planning_dataset():
         payload
         for payload in (
             build_truck_spec_payload(row)
-            for row in truck_sheet.iter_rows(min_row=2, values_only=True)
+            for row in read_sheet_rows(workbook, SHEET_NAME_CANDIDATES["truck"])
         )
         if payload
     ]

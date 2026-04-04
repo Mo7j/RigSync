@@ -1,11 +1,10 @@
 const locationLabelCache = new Map();
 
 export async function fetchLoads() {
-  const [loadsResponse, startupResponse, truckSpecsResponse, workerRolesResponse] = await Promise.all([
+  const [loadsResponse, startupResponse, truckSpecsResponse] = await Promise.all([
     fetch("/api/loads"),
     fetch("/api/startup-loads"),
     fetch("/api/truck-specs"),
-    fetch("/api/worker-roles"),
   ]);
 
   if (!loadsResponse.ok) {
@@ -17,22 +16,16 @@ export async function fetchLoads() {
   if (!truckSpecsResponse.ok) {
     throw new Error(`Truck spec request failed with ${truckSpecsResponse.status}`);
   }
-  if (!workerRolesResponse.ok) {
-    throw new Error(`Worker roles request failed with ${workerRolesResponse.status}`);
-  }
-
-  const [rigLoads, startupLoads, truckSpecs, workerRoles] = await Promise.all([
+  const [rigLoads, startupLoads, truckSpecs] = await Promise.all([
     loadsResponse.json(),
     startupResponse.json(),
     truckSpecsResponse.json(),
-    workerRolesResponse.json(),
   ]);
 
   return {
     rigLoads,
     startupLoads,
     truckSpecs,
-    workerRoles,
   };
 }
 

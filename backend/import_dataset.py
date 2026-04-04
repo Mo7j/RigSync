@@ -14,6 +14,15 @@ from models import (
 from planning_dataset import DATASET_PATH, load_planning_dataset
 
 
+PLANNING_TABLES = [
+    "load_dependencies",
+    "load_allowed_truck_types",
+    "load_role_requirements",
+    "load_templates",
+    "truck_specs",
+]
+
+
 def _dimension_value(dimensions, key):
     return float((dimensions or {}).get(key) or 0)
 
@@ -73,6 +82,20 @@ def _validate_fit(load_template, compatible_types, truck_specs_by_type):
         if fits_weight and fits_length and fits_width and fits_height:
             return True
 
+    # Some ISE loads are explicitly assigned to a heavy-haul truck even though
+    # they exceed normal deck dimensions. Treat those as special-permit moves
+    # instead of blocking the whole planning dataset import.
+    for truck_type in compatible_types:
+        truck_spec = truck_specs_by_type.get(truck_type)
+        if not truck_spec:
+            continue
+        fits_weight = (
+            load_template.weight_tons is None
+            or load_template.weight_tons <= truck_spec.max_weight_tons
+        )
+        if fits_weight and "heavy" in str(truck_type).lower():
+            return True
+
     return False
 
 
@@ -82,15 +105,7 @@ def import_dataset():
 
     dataset = load_planning_dataset()
     with engine.begin() as connection:
-        for table_name in [
-            "load_dependencies",
-            "load_allowed_truck_types",
-            "load_role_requirements",
-            "load_templates",
-            "truck_specs",
-            "rig_loads",
-            "startup_loads",
-        ]:
+        for table_name in [*PLANNING_TABLES, "rig_loads", "startup_loads"]:
             connection.execute(text(f"DROP TABLE IF EXISTS {table_name} CASCADE"))
     Base.metadata.create_all(bind=engine)
 
@@ -200,9 +215,15 @@ def import_dataset():
 
         session.commit()
         return {
+            "rig_loads": len(dataset["rig_loads"]),
+            "startup_loads": len(dataset["startup_loads"]),
             "load_templates": len(templates_by_code),
+            "load_dependencies": session.query(LoadDependency).count(),
+            "load_allowed_truck_types": session.query(LoadAllowedTruckType).count(),
+            "load_role_requirements": session.query(LoadRoleRequirement).count(),
             "truck_specs": len(truck_specs_by_type),
             "source": str(DATASET_PATH),
+            "planning_tables": PLANNING_TABLES,
         }
     except Exception:
         session.rollback()
@@ -214,6 +235,14 @@ def import_dataset():
 if __name__ == "__main__":
     result = import_dataset()
     print(
-        f"Imported {result['load_templates']} load templates and "
-        f"{result['truck_specs']} truck specs from {result['source']}"
+        "Planning dataset import completed.\n"
+        f"Source workbook: {result['source']}\n"
+        f"Planning tables rebuilt: {', '.join(result['planning_tables'])}\n"
+        f"Rig load rows: {result['rig_loads']}\n"
+        f"Startup load rows: {result['startup_loads']}\n"
+        f"Load templates: {result['load_templates']}\n"
+        f"Truck specs: {result['truck_specs']}\n"
+        f"Allowed truck mappings: {result['load_allowed_truck_types']}\n"
+        f"Dependencies: {result['load_dependencies']}\n"
+        f"Role requirements: {result['load_role_requirements']}"
     )

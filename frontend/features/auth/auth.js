@@ -1,3 +1,5 @@
+import { AUTH_STORAGE_KEY } from "../../lib/constants.js";
+
 export const TEST_USERS = [
   {
     id: "manager-nasser",
@@ -48,6 +50,27 @@ export const TEST_USERS = [
 export const TEST_USER = TEST_USERS[0];
 let currentSession = null;
 
+function readStoredSession() {
+  try {
+    const stored = window.localStorage.getItem(AUTH_STORAGE_KEY);
+    return stored ? JSON.parse(stored) : null;
+  } catch {
+    return null;
+  }
+}
+
+function persistSession(session) {
+  try {
+    if (!session) {
+      window.localStorage.removeItem(AUTH_STORAGE_KEY);
+      return;
+    }
+    window.localStorage.setItem(AUTH_STORAGE_KEY, JSON.stringify(session));
+  } catch {
+    // Ignore storage errors and keep in-memory session.
+  }
+}
+
 export function findUserByCredentials(email, password) {
   return (
     TEST_USERS.find(
@@ -61,6 +84,10 @@ export function getManagedForemen(managerId) {
 }
 
 export function getSession() {
+  if (!currentSession) {
+    currentSession = readStoredSession();
+  }
+
   if (!currentSession) {
     return null;
   }
@@ -80,6 +107,7 @@ export function getSession() {
     teamForemanIds: matchedUser.teamForemanIds || [],
     assignedRig: matchedUser.assignedRig || currentSession?.assignedRig || null,
   };
+  persistSession(currentSession);
 
   return currentSession;
 }
@@ -94,9 +122,11 @@ export function createSession(user = TEST_USER) {
     teamForemanIds: user.teamForemanIds || [],
     assignedRig: user.assignedRig || null,
   };
+  persistSession(currentSession);
   return currentSession;
 }
 
 export function clearSession() {
   currentSession = null;
+  persistSession(null);
 }

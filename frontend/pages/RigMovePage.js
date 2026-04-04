@@ -13,9 +13,21 @@ import { persistMoveSession } from "../features/rigMoves/storage.js";
 const { useDeferredValue, useEffect, useMemo, useRef, useState } = React;
 
 function normalizeTruckTypeKey(type) {
-  return String(type || "")
+  const normalized = String(type || "")
     .toLowerCase()
     .replace(/[^a-z]/g, "");
+
+  if (normalized.includes("flatbed")) {
+    return "flatbed";
+  }
+  if (normalized.includes("lowbed") || normalized.includes("support")) {
+    return "lowbed";
+  }
+  if (normalized.includes("heavyhaul")) {
+    return "heavyhauler";
+  }
+
+  return normalized;
 }
 
 function normalizeTruckTypeLabel(type) {
@@ -72,56 +84,6 @@ function getFleetCapacityForType(availableFleet, truckType) {
   return Math.max(0, Number.parseInt(matched?.available ?? matched?.count, 10) || 0);
 }
 
-function normalizeWorkerRoleDraft(availableWorkers, workerRoles = []) {
-  const configuredRoles = availableWorkers?.roles || {};
-  const roleDefinitions = workerRoles.length
-    ? workerRoles
-    : Object.keys(configuredRoles).map((roleId) => ({ id: roleId, label: getWorkerRoleLabel(roleId) }));
-
-  return roleDefinitions.reduce((roles, roleDefinition) => {
-    const roleId = roleDefinition.id;
-    const configuredRole = configuredRoles[roleId] || {};
-    roles[roleId] = {
-      count: Math.max(0, Number.parseInt(configuredRole?.count, 10) || 0),
-      hourlyCost: Math.max(0, Number(configuredRole?.hourlyCost) || 0),
-      label: roleDefinition.label || configuredRole?.label || getWorkerRoleLabel(roleId),
-    };
-    return roles;
-  }, {});
-}
-
-function getWorkerRoleLabel(roleId) {
-  return String(roleId || "")
-    .split("_")
-    .filter(Boolean)
-    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
-    .join(" ");
-}
-
-function getWorkerRoleShortLabel(roleId, fallbackLabel = "") {
-  const label = fallbackLabel || getWorkerRoleLabel(roleId);
-  const shortLabels = {
-    assistant_driller: "Asst Drlr",
-    bop_tech: "BOP Tech",
-    camp_foreman: "Camp Frm",
-    crane_operator: "Crane Op",
-    derrickman: "Derrick",
-    driller: "Driller",
-    electrician: "Elec",
-    floorman: "Floor",
-    forklift_crane_operator: "FLT/Crane",
-    mechanic: "Mech",
-    operator: "Oper",
-    pumpman_mechanic: "Pump/Mech",
-    rigger: "Rigger",
-    roustabout: "Rstb",
-    welder: "Welder",
-    yard_foreman: "Yd Frm",
-  };
-
-  return shortLabels[roleId] || label;
-}
-
 function formatProgressDuration(ms = 0) {
   const totalSeconds = Math.max(0, Math.round((Number(ms) || 0) / 1000));
   if (totalSeconds < 60) {
@@ -131,63 +93,6 @@ function formatProgressDuration(ms = 0) {
   const minutes = Math.floor(totalSeconds / 60);
   const seconds = totalSeconds % 60;
   return seconds ? `${minutes}m ${seconds}s` : `${minutes}m`;
-}
-
-function buildWorkerAvailabilityOverride(workerRoleDraft) {
-  const roles = Object.entries(workerRoleDraft || {}).reduce((result, [roleId, role]) => {
-    result[roleId] = {
-      count: Math.max(0, Number.parseInt(role?.count, 10) || 0),
-      hourlyCost: Math.max(0, Number(role?.hourlyCost) || 0),
-    };
-    return result;
-  }, {});
-  const total = Object.values(roles).reduce((sum, role) => sum + role.count, 0);
-  const dayShift = Math.ceil(total / 2);
-  const nightShift = Math.max(0, total - dayShift);
-  const totalHourlyCost = Object.values(roles).reduce((sum, role) => sum + (role.count * role.hourlyCost), 0);
-
-  return {
-    total,
-    available: total,
-    dayShift,
-    nightShift,
-    roles,
-    averageHourlyCost: total > 0 ? totalHourlyCost / total : 0,
-  };
-}
-
-function buildWorkerRoleSummaryRows(playback, availableWorkers, workerRoles = []) {
-  const configuredRoles = availableWorkers?.roles || {};
-  const assignments = playback?.workerAssignments || [];
-  const usedByRole = assignments.reduce((result, assignment) => {
-    const roleId = assignment?.roleId;
-    const workerId = assignment?.workerId;
-    if (!roleId || !workerId) {
-      return result;
-    }
-    if (!result[roleId]) {
-      result[roleId] = new Set();
-    }
-    result[roleId].add(workerId);
-    return result;
-  }, {});
-  const roleDefinitions = workerRoles.length
-    ? workerRoles
-    : Object.keys(configuredRoles).map((roleId) => ({ id: roleId, label: getWorkerRoleLabel(roleId) }));
-  const roleEntries = roleDefinitions.map((roleDefinition) => {
-    const configuredRole = configuredRoles[roleDefinition.id] || {};
-    return {
-      id: roleDefinition.id,
-      label: roleDefinition.label || configuredRole?.label || getWorkerRoleLabel(roleDefinition.id),
-      available: Math.max(0, Number.parseInt(configuredRole?.count, 10) || 0),
-      used: usedByRole[roleDefinition.id]?.size || 0,
-    };
-  });
-
-  if (!roleEntries.length) {
-    return [];
-  }
-  return roleEntries;
 }
 
 function normalizeTruckSetup(move, availableFleet = []) {
@@ -291,7 +196,7 @@ function ScenarioBreakdown({ scenarios, activeScenarioName, onSelect, disabled =
         h(
           "p",
           { className: "muted-copy" },
-          `${formatTruckMixSummary(scenario.allocatedTruckSetup || scenario.truckSetup || [])} - ${scenario.workerCount} workers`,
+          formatTruckMixSummary(scenario.allocatedTruckSetup || scenario.truckSetup || []),
         ),
       ),
     ),
@@ -440,6 +345,29 @@ function formatCurrency(value) {
     currency: "USD",
     maximumFractionDigits: 0,
   }).format(Math.max(0, value));
+}
+
+function getTaskToneClass(task) {
+  const phaseToneMap = {
+    rig_down: "scene-timeline-segment-down",
+    move: "scene-timeline-segment-move",
+    pickup_load: "scene-timeline-segment-truck-lowbed",
+    haul: "scene-timeline-segment-move",
+    unload_drop: "scene-timeline-segment-truck-flatbed",
+    rig_up: "scene-timeline-segment-up",
+  };
+
+  return phaseToneMap[task?.phase] || "scene-timeline-segment-move";
+}
+
+function getSourceKindLabel(sourceKind) {
+  if (sourceKind === "startup") {
+    return "Support";
+  }
+  if (sourceKind === "system") {
+    return "System";
+  }
+  return "Rig";
 }
 
 function getPlaybackTasks(playback) {
@@ -604,8 +532,6 @@ function getEffectiveCriticalTasks(playback) {
 function getPlanDashboardStats(scenario, move) {
   const playback = scenario?.bestVariant?.playback;
   const trips = playback?.trips || [];
-  const assignments = playback?.workerAssignments || [];
-  const uniqueAssignedWorkers = new Set(assignments.map((assignment) => assignment.workerId).filter(Boolean)).size;
   const criticalTasks = getEffectiveCriticalTasks(playback);
   const criticalLoadIds = new Set(criticalTasks.map((task) => task.loadId));
   const totalMinutes = Math.max(scenario?.totalMinutes || 0, 1);
@@ -617,14 +543,9 @@ function getPlanDashboardStats(scenario, move) {
       Number.parseInt(scenario?.allocatedTruckCount, 10) ||
       usedTruckCount,
   );
-  const workerCount = Math.max(1, uniqueAssignedWorkers || Number.parseInt(scenario?.workerCount, 10) || 1);
-  const dayShiftCapacity = Math.max(1, Number.parseInt(scenario?.workerShifts?.dayShift, 10) || workerCount);
-  const nightShiftCapacity = Math.max(1, Number.parseInt(scenario?.workerShifts?.nightShift, 10) || workerCount);
   const utilization = Math.max(0, Number.parseInt(scenario?.utilization, 10) || 0);
   const truckUtilization = Math.max(0, Number.parseInt(scenario?.truckUtilization, 10) || utilization);
-  const workerUtilization = Math.max(0, Number.parseInt(scenario?.workerUtilization, 10) || 0);
   const idleMinutes = Math.max(0, Number.parseInt(scenario?.idleMinutes, 10) || 0);
-  const workerIdleMinutes = Math.max(0, Number.parseInt(scenario?.workerIdleMinutes, 10) || 0);
   const costEstimate = Math.max(0, Number(scenario?.costEstimate) || 0);
 
   return {
@@ -632,8 +553,6 @@ function getPlanDashboardStats(scenario, move) {
     utilization: `${utilization}%`,
     truckUtilizationValue: truckUtilization,
     truckUtilization: `${truckUtilization}%`,
-    workerUtilizationValue: workerUtilization,
-    workerUtilization: `${workerUtilization}%`,
     rawCostEstimate: costEstimate,
     costEstimate: formatCurrency(costEstimate),
     usedTruckCount,
@@ -641,18 +560,97 @@ function getPlanDashboardStats(scenario, move) {
     truckUsageLabel: `${usedTruckCount}/${allocatedTruckCount}`,
     loadsPerTruck: (trips.length / usedTruckCount).toFixed(1),
     loadsPerAllocatedTruck: (trips.length / allocatedTruckCount).toFixed(1),
-    crewHours: String(Math.round((workerCount * totalMinutes) / 60)),
-    workerCount,
-    dayShiftCapacity,
-    nightShiftCapacity,
     idleMinutes,
     idleHours: (idleMinutes / 60).toFixed(1),
-    workerIdleMinutes,
-    workerIdleHours: (workerIdleMinutes / 60).toFixed(1),
     criticalTaskCount: criticalTasks.length,
     criticalLoadCount: criticalLoadIds.size,
     criticalPathHours: (criticalTasks.reduce((sum, task) => sum + Math.max(0, task.endMinute - task.startMinute), 0) / 60).toFixed(1),
   };
+}
+
+function getTaskActivityLabel(task) {
+  return task?.activityCode || task?.activityLabel || task?.phase || "Task";
+}
+
+function buildCriticalPathChain(playback) {
+  return getEffectiveCriticalTasks(playback)
+    .sort((left, right) => left.startMinute - right.startMinute || left.endMinute - right.endMinute)
+    .map((task) => ({
+      key: task.id,
+      loadCode: task.loadCode || `#${task.loadId}`,
+      activity: getTaskActivityLabel(task),
+      sourceKind: task.sourceKind || "rig",
+    }));
+}
+
+function buildCriticalScheduleRows(playback, limit = 10) {
+  return getEffectiveCriticalTasks(playback)
+    .sort((left, right) => left.startMinute - right.startMinute || left.endMinute - right.endMinute)
+    .slice(0, limit)
+    .map((task) => ({
+      key: task.id,
+      loadCode: task.loadCode || `#${task.loadId}`,
+      activity: getTaskActivityLabel(task),
+      sourceKind: task.sourceKind || "rig",
+      start: Math.max(0, Math.round(task.startMinute || 0)),
+      finish: Math.max(0, Math.round(task.endMinute || 0)),
+      duration: Math.max(0, Math.round((task.endMinute || 0) - (task.startMinute || 0))),
+      slack: Math.max(0, Math.round(task.slack || 0)),
+    }));
+}
+
+function buildPlannerScheduleRows(playback, limit = 18) {
+  return getPlaybackTasks(playback)
+    .filter((task) => task.phase !== "start" && task.phase !== "finish")
+    .sort((left, right) => (left.earliestStart ?? left.startMinute ?? 0) - (right.earliestStart ?? right.startMinute ?? 0) || left.loadId - right.loadId)
+    .slice(0, limit)
+    .map((task) => ({
+      key: task.id,
+      loadCode: task.loadCode || `#${task.loadId}`,
+      activity: getTaskActivityLabel(task),
+      sourceKind: task.sourceKind || "rig",
+      es: Math.max(0, Math.round(task.earliestStart ?? task.startMinute ?? 0)),
+      ef: Math.max(0, Math.round(task.earliestFinish ?? task.endMinute ?? 0)),
+      ls: Math.max(0, Math.round(task.latestStart ?? task.startMinute ?? 0)),
+      lf: Math.max(0, Math.round(task.latestFinish ?? task.endMinute ?? 0)),
+      slack: Math.max(0, Math.round(task.slack || 0)),
+      critical: Boolean(task.isCritical),
+    }));
+}
+
+function buildPlannerCostRows(scenario, playback, move, limit = 8) {
+  const journeys = playback?.journeys?.length ? playback.journeys : (playback?.trips || []);
+  const configuredRates = new Map(
+    (scenario?.allocatedTruckSetup || scenario?.truckSetup || []).map((truck) => [
+      normalizeTruckTypeKey(truck?.type),
+      Math.max(0, Number(truck?.hourlyCost) || 0),
+    ]),
+  );
+  const routeKm = Math.max(0, Number(move?.routeKm) || Number(scenario?.routeDistanceKm) || 0);
+
+  return journeys
+    .map((journey, index) => {
+      const truckRate = configuredRates.get(normalizeTruckTypeKey(journey.truckType)) || 0;
+      const activeMinutes = Math.max(
+        0,
+        ((journey.moveStart || journey.dispatchStart || 0) - (journey.dispatchStart || 0)) +
+        ((journey.returnStart || journey.arrivalAtDestination || 0) - (journey.moveStart || 0)) +
+        ((journey.returnToSource || journey.returnStart || 0) - (journey.returnStart || 0)),
+      );
+      const tripCost = Math.round((activeMinutes / 60) * truckRate);
+
+      return {
+        key: journey.id || `cost-${index}`,
+        label: journey.description || `Truck ${journey.truckId}`,
+        truckType: journey.truckType || "Truck",
+        truckId: journey.truckId,
+        distanceKm: Math.round(routeKm * Math.max((journey.loadIds || []).length || 1, 1)),
+        activeMinutes,
+        tripCost,
+      };
+    })
+    .sort((left, right) => right.tripCost - left.tripCost || right.activeMinutes - left.activeMinutes)
+    .slice(0, limit);
 }
 
 function getPlanComparisonStats(scenarios, selectedScenario, move, currentMinute = 0) {
@@ -973,55 +971,6 @@ function buildTruckScheduleRows(playback) {
   });
 }
 
-function buildWorkerScheduleRows(playback) {
-  const assignments = playback?.workerAssignments || [];
-  const totalMinutes = Math.max(playback?.totalMinutes || 1, 1);
-  const rowsByWorker = new Map();
-
-  assignments.forEach((assignment, index) => {
-    if (!rowsByWorker.has(assignment.workerId)) {
-      rowsByWorker.set(assignment.workerId, {
-        key: assignment.workerId,
-        workerId: assignment.workerId,
-        roleId: assignment.roleId,
-        label: assignment.workerLabel || getWorkerRoleLabel(assignment.roleId),
-        items: [],
-      });
-    }
-
-    rowsByWorker.get(assignment.workerId).items.push({
-      key: `${assignment.workerId}-${assignment.phase}-${assignment.loadId}-${index}`,
-      loadId: assignment.loadId,
-      startMinute: assignment.startMinute,
-      endMinute: assignment.endMinute,
-      left: (assignment.startMinute / totalMinutes) * 100,
-      width: ((assignment.endMinute - assignment.startMinute) / totalMinutes) * 100,
-      toneClass: assignment.phase === "rig-down" ? "scene-timeline-segment-down" : "scene-timeline-segment-up",
-      label: getLoadDisplayLabel(assignment),
-      count: 1,
-    });
-  });
-
-  const rows = [...rowsByWorker.values()]
-    .map((row) => ({
-      ...row,
-      items: row.items.sort((left, right) => left.startMinute - right.startMinute),
-    }))
-    .sort((left, right) =>
-      getWorkerRoleLabel(left.roleId).localeCompare(getWorkerRoleLabel(right.roleId)) ||
-      String(left.workerId || "").localeCompare(String(right.workerId || "")),
-    );
-
-  const roleCounters = new Map();
-  rows.forEach((row) => {
-    const nextIndex = (roleCounters.get(row.roleId) || 0) + 1;
-    roleCounters.set(row.roleId, nextIndex);
-    row.label = `${getWorkerRoleLabel(row.roleId)} ${nextIndex}`;
-  });
-
-  return rows;
-}
-
 function buildLoadScheduleRows(playback) {
   const trips = playback?.trips || [];
   const totalMinutes = Math.max(playback?.totalMinutes || 1, 1);
@@ -1029,6 +978,8 @@ function buildLoadScheduleRows(playback) {
   return trips
     .map((trip, index) => {
       const items = [];
+      const sourceKind = trip.sourceKind || "rig";
+      const sourceLabel = getSourceKindLabel(sourceKind);
 
       if ((trip.rigDownFinish ?? 0) > (trip.rigDownStart ?? trip.loadStart ?? 0)) {
         items.push({
@@ -1104,6 +1055,8 @@ function buildLoadScheduleRows(playback) {
         key: `load-row-${trip.loadId}-${index}`,
         loadId: trip.loadId,
         label: `${getLoadDisplayLabel(trip)} · ${trip.description || `Load ${getLoadDisplayLabel(trip)}`}`,
+        subLabel: `${sourceLabel} load · ${items.length} task segment${items.length === 1 ? "" : "s"}`,
+        sourceKind,
         items,
       };
     })
@@ -1139,16 +1092,16 @@ function buildCriticalPathRows(playback) {
       });
     }
 
-    rowsByLoad.get(task.loadId).items.push({
+      rowsByLoad.get(task.loadId).items.push({
       key: `${task.id}-${index}`,
       loadId: task.loadId,
-      description: `${task.description} ${phaseLabelMap[task.phase] || task.phase}`,
+      description: `${task.description} ${task.activityLabel || phaseLabelMap[task.phase] || task.phase}`,
       startMinute: task.startMinute,
       endMinute: task.endMinute,
       left: (task.startMinute / totalMinutes) * 100,
       width: ((task.endMinute - task.startMinute) / totalMinutes) * 100,
       toneClass: phaseToneMap[task.phase] || "scene-timeline-segment-move",
-      label: phaseLabelMap[task.phase] || task.phase,
+      label: task.activityCode || phaseLabelMap[task.phase] || task.phase,
     });
   });
 
@@ -1160,12 +1113,60 @@ function buildCriticalPathRows(playback) {
     .sort((left, right) => left.items[0].startMinute - right.items[0].startMinute || left.loadId - right.loadId);
 }
 
+function buildCpmScheduleRows(playback) {
+  const plannerTasks = getPlaybackTasks(playback)
+    .filter((task) => task.phase !== "start" && task.phase !== "finish")
+    .sort((left, right) =>
+      (left.startMinute - right.startMinute) ||
+      (left.endMinute - right.endMinute) ||
+      (left.loadId - right.loadId),
+    );
+  const totalMinutes = Math.max(playback?.totalMinutes || 1, 1);
+  const rowsByLoad = new Map();
+
+  plannerTasks.forEach((task, index) => {
+    if (!rowsByLoad.has(task.loadId)) {
+      rowsByLoad.set(task.loadId, {
+        key: `cpm-load-${task.loadId}`,
+        loadId: task.loadId,
+        label: `${task.loadCode || task.description || `#${task.loadId}`} · ${task.description || "Planner task"}`,
+        subLabel: `${getSourceKindLabel(task.sourceKind)} load`,
+        sourceKind: task.sourceKind || "rig",
+        items: [],
+      });
+    }
+
+    rowsByLoad.get(task.loadId).items.push({
+      key: `${task.id}-${index}`,
+      loadId: task.loadId,
+      description: `${task.description} ${task.activityLabel || task.phase || "Task"}`,
+      startMinute: task.startMinute,
+      endMinute: task.endMinute,
+      left: (task.startMinute / totalMinutes) * 100,
+      width: ((task.endMinute - task.startMinute) / totalMinutes) * 100,
+      toneClass: getTaskToneClass(task),
+      label: task.activityCode || task.activityLabel || task.phase,
+      sourceKind: task.sourceKind || "rig",
+      critical: Boolean(task.isCritical),
+    });
+  });
+
+  return [...rowsByLoad.values()]
+    .map((row) => ({
+      ...row,
+      subLabel: `${row.subLabel} · ${row.items.length} planner task${row.items.length === 1 ? "" : "s"}${row.items.some((item) => item.critical) ? " · critical path active" : ""}`,
+      items: row.items.sort((left, right) => left.startMinute - right.startMinute),
+    }))
+    .sort((left, right) => left.items[0].startMinute - right.items[0].startMinute || left.loadId - right.loadId);
+}
+
 function buildCriticalPathNetwork(playback, zoom = 1) {
   const tasks = getPlaybackTasks(playback);
   const criticalTaskIds = new Set(getEffectiveCriticalTasks(playback).map((task) => task.id));
   const taskMap = new Map(tasks.map((task) => [task.id, task]));
   const phaseRank = {
     rig_down: 0,
+    move: 1,
     pickup_load: 1,
     haul: 2,
     unload_drop: 3,
@@ -1389,10 +1390,10 @@ function CPMNetworkDiagram({ playback, zoom = 1 }) {
                       textAlign: "center",
                     },
                   },
-                  h("strong", { style: { fontSize: `${(isMidCompactView ? 0.72 : 0.84) * Math.max(0.85, Math.min(numericZoom, 1.8))}rem`, lineHeight: 1.2 } }, `${node.loadCode || `#${node.loadId}`} · ${node.phase.replace("_", " ")}`),
+                  h("strong", { style: { fontSize: `${(isMidCompactView ? 0.72 : 0.84) * Math.max(0.85, Math.min(numericZoom, 1.8))}rem`, lineHeight: 1.2 } }, `${node.loadCode || `#${node.loadId}`} · ${node.activityCode || node.phase.replace("_", " ")}`),
                   isMidCompactView
                     ? null
-                    : h("span", { className: "muted-copy", style: { fontSize: `${0.72 * Math.max(0.85, Math.min(numericZoom, 1.8))}rem` } }, node.description),
+                    : h("span", { className: "muted-copy", style: { fontSize: `${0.72 * Math.max(0.85, Math.min(numericZoom, 1.8))}rem` } }, node.activityLabel || node.description),
                 ),
                 h(
                   "div",
@@ -1522,11 +1523,7 @@ function LoadScheduleTable({ playback, currentMinute }) {
   );
 }
 
-function FullScreenTimeline({ playback, currentMinute, zoom = 1, rowType = "truck", gapMinutes = 8 * 60 }) {
-  if (rowType === "cpm") {
-    return h(CPMNetworkDiagram, { playback, zoom });
-  }
-
+function FullScreenTimeline({ playback, currentMinute, zoom = 1, gapMinutes = 8 * 60 }) {
   const headerScrollRef = useRef(null);
   const bodyScrollRef = useRef(null);
   const fixedBodyRef = useRef(null);
@@ -1534,53 +1531,8 @@ function FullScreenTimeline({ playback, currentMinute, zoom = 1, rowType = "truc
   const syncingBodyRef = useRef(false);
   const [hoverCard, setHoverCard] = useState(null);
   const totalMinutes = Math.max(playback?.totalMinutes || 1, 1);
-  const trips = playback?.trips || [];
-  const buildPhaseItems = (phaseKey, toneClass, getRange) =>
-    trips
-      .map((trip, index) => {
-        const [startMinute, endMinute] = getRange(trip);
-        return {
-          key: `${phaseKey}-${trip.truckId}-${trip.loadId}-${index}`,
-          loadId: trip.loadId,
-          startMinute,
-          endMinute,
-          left: (startMinute / totalMinutes) * 100,
-          width: ((endMinute - startMinute) / totalMinutes) * 100,
-      title: `${phaseKey} | ${getLoadDisplayLabel(trip)} | ${formatMinutes(Math.round(startMinute))} -> ${formatMinutes(Math.round(endMinute))}`,
-          toneClass,
-          label: getLoadDisplayLabel(trip),
-        };
-      })
-      .filter((item) => item.endMinute > item.startMinute)
-      .sort((left, right) => left.startMinute - right.startMinute);
-  const rows = useMemo(
-    () => rowType === "phase"
-      ? [
-          {
-            key: "rig-down",
-            label: "Rig Down",
-            items: buildPhaseItems("Rig Down", "scene-timeline-segment-down", (trip) => [trip.rigDownStart ?? trip.loadStart, trip.rigDownFinish]),
-          },
-          {
-            key: "move",
-            label: "Move",
-            items: buildPhaseItems("Move", "scene-timeline-segment-move", (trip) => [trip.moveStart ?? trip.pickupLoadFinish ?? trip.rigDownFinish, trip.arrivalAtDestination]),
-          },
-          {
-            key: "rig-up",
-            label: "Rig Up",
-            items: buildPhaseItems("Rig Up", "scene-timeline-segment-up", (trip) => [trip.rigUpStart ?? trip.unloadDropFinish ?? trip.arrivalAtDestination, trip.rigUpFinish]),
-          },
-        ]
-      : rowType === "worker"
-        ? buildWorkerScheduleRows(playback)
-        : rowType === "load"
-          ? buildLoadScheduleRows(playback)
-          : rowType === "cpm"
-            ? buildCriticalPathRows(playback)
-          : buildTruckScheduleRows(playback),
-    [playback, rowType],
-  );
+  const rowType = "cpm";
+  const rows = useMemo(() => buildCpmScheduleRows(playback), [playback]);
   const tickStepMinutes = Math.max(30, gapMinutes);
   const tickCount = Math.max(1, Math.ceil(totalMinutes / tickStepMinutes));
   const ticks = useMemo(
@@ -1688,7 +1640,7 @@ function FullScreenTimeline({ playback, currentMinute, zoom = 1, rowType = "truc
       h(
         "div",
         { className: "scene-timeline-header-copy" },
-        h("span", null, rowType === "phase" ? "Phase" : rowType === "worker" ? "Worker" : rowType === "load" ? "Load" : rowType === "cpm" ? "CPM" : "Truck"),
+        h("span", null, rowType === "phase" ? "Phase" : rowType === "load" ? "Load" : rowType === "cpm" ? "CPM" : "Truck"),
         h("strong", null, "Schedule"),
       ),
       h(
@@ -1698,19 +1650,19 @@ function FullScreenTimeline({ playback, currentMinute, zoom = 1, rowType = "truc
           h(
             "div",
             { key: `timeline-copy-${row.key || row.truckId}`, className: "scene-timeline-row-copy" },
-            h("strong", null, rowType === "phase" ? row.label : rowType === "worker" ? row.label : rowType === "load" ? row.label : rowType === "cpm" ? row.label : `Truck ${row.truckId}`),
+            h("strong", null, rowType === "phase" ? row.label : rowType === "load" ? row.label : rowType === "cpm" ? row.label : `Truck ${row.truckId}`),
             h(
               "span",
               null,
-              rowType === "phase"
+              row.subLabel
+                ? row.subLabel
+                : rowType === "phase"
                 ? `${row.items.length} active window${row.items.length === 1 ? "" : "s"}`
-                : rowType === "worker"
-                  ? `${row.items.length} assignments`
-                  : rowType === "load"
-                    ? `${row.items.length} task segment${row.items.length === 1 ? "" : "s"}`
+                : rowType === "load"
+                  ? `${row.items.length} task segment${row.items.length === 1 ? "" : "s"}`
                   : rowType === "cpm"
-                    ? `${row.items.length} critical task${row.items.length === 1 ? "" : "s"}`
-                  : `${row.loadCount || row.items.length} road segment${(row.loadCount || row.items.length) === 1 ? "" : "s"}`,
+                    ? `${row.items.length} planner task${row.items.length === 1 ? "" : "s"}`
+                    : `${row.loadCount || row.items.length} road segment${(row.loadCount || row.items.length) === 1 ? "" : "s"}`,
             ),
           ),
         ),
@@ -1778,15 +1730,15 @@ function FullScreenTimeline({ playback, currentMinute, zoom = 1, rowType = "truc
             const rowKey = row.key || row.truckId;
             const rowTrips = (row.items || row.trips || []).map((trip) => {
               const tripStartMinute =
-                rowType === "phase" || rowType === "worker" || rowType === "load" || rowType === "cpm"
+                rowType === "phase" || rowType === "load" || rowType === "cpm"
                   ? trip.startMinute
                   : trip.startMinute ?? trip.dispatchStart ?? trip.loadStart;
               const tripEndMinute =
-                rowType === "phase" || rowType === "worker" || rowType === "load" || rowType === "cpm"
+                rowType === "phase" || rowType === "load" || rowType === "cpm"
                   ? trip.endMinute
                   : trip.endMinute ?? trip.returnToSource ?? trip.rigUpFinish;
               const tripWidthPercent =
-                rowType === "phase" || rowType === "worker" || rowType === "load" || rowType === "cpm"
+                rowType === "phase" || rowType === "load" || rowType === "cpm"
                   ? trip.width
                   : trip.width ?? ((((trip.returnToSource ?? trip.rigUpFinish) - (trip.dispatchStart ?? trip.loadStart)) / totalMinutes) * 100);
               const tripWidthPx = (tripWidthPercent / 100) * timelineWidth;
@@ -1797,26 +1749,22 @@ function FullScreenTimeline({ playback, currentMinute, zoom = 1, rowType = "truc
                 : 0;
               const toneClass = trip.toneClass || row.toneClass || "scene-timeline-segment-truck-heavyhaul";
               const leftPercent =
-                rowType === "phase" || rowType === "worker" || rowType === "load" || rowType === "cpm"
+                rowType === "phase" || rowType === "load" || rowType === "cpm"
                   ? trip.left
                   : trip.left ?? (((trip.dispatchStart ?? trip.loadStart) / totalMinutes) * 100);
               const labelText = rowType === "phase"
                 ? trip.label
-                : rowType === "worker"
-                  ? `${formatTimelineClock(trip.startMinute)} to ${formatTimelineClock(trip.endMinute)}`
-                  : rowType === "load"
+                : rowType === "load"
                     ? trip.label
                   : rowType === "cpm"
-                    ? trip.label
-                  : `${formatTimelineClock(tripStartMinute)} to ${formatTimelineClock(tripEndMinute)}`;
+                    ? `${trip.label}${trip.critical ? " *" : ""}`
+                    : `${formatTimelineClock(tripStartMinute)} to ${formatTimelineClock(tripEndMinute)}`;
               const hoverText = rowType === "phase"
                 ? `${row.label} | ${getLoadDisplayLabel(trip)} | ${formatTimelineClock(tripStartMinute)} -> ${formatTimelineClock(tripEndMinute)}`
-                : rowType === "worker"
-                  ? `${row.label} | ${getLoadDisplayLabel(trip)} | ${formatTimelineClock(tripStartMinute)} -> ${formatTimelineClock(tripEndMinute)}`
-                  : rowType === "load"
+                : rowType === "load"
                     ? `${row.label} | ${trip.label} | ${formatTimelineClock(tripStartMinute)} -> ${formatTimelineClock(tripEndMinute)}`
                   : rowType === "cpm"
-                    ? `${row.label} | Critical ${trip.label} | ${formatTimelineClock(tripStartMinute)} -> ${formatTimelineClock(tripEndMinute)}`
+                    ? `${row.label} | ${trip.description || trip.label} | ${trip.critical ? "Critical path | " : ""}${formatTimelineClock(tripStartMinute)} -> ${formatTimelineClock(tripEndMinute)}`
                   : `Truck ${row.truckId} | ${getLoadDisplayLabel(trip)} | ${formatTimelineClock(tripStartMinute)} -> ${formatTimelineClock(tripEndMinute)}`;
 
               return h(
@@ -1856,7 +1804,7 @@ function FullScreenTimeline({ playback, currentMinute, zoom = 1, rowType = "truc
                   h(
                     "span",
                     { className: "scene-timeline-trip-pill" },
-                    rowType === "phase" ? row.label : rowType === "worker" ? "Crew" : rowType === "load" ? trip.label : rowType === "cpm" ? "CPM" : trip.label,
+                    rowType === "phase" ? row.label : rowType === "load" ? trip.label : rowType === "cpm" ? (trip.sourceKind === "startup" ? "SUP" : "CPM") : trip.label,
                   ),
                   h(
                     "span",
@@ -1885,6 +1833,171 @@ function FullScreenTimeline({ playback, currentMinute, zoom = 1, rowType = "truc
             );
           }),
         ),
+      ),
+    ),
+  );
+}
+
+function PlannerCanvas({
+  playback,
+  zoom = 1,
+  criticalPathChain = [],
+  criticalScheduleRows = [],
+  plannerScheduleRows = [],
+  plannerCostRows = [],
+  operatingSnapshot,
+  drillingReadinessPercent,
+  activePlanDashboard,
+  planComparisonStats,
+}) {
+  return h(
+    "section",
+    { className: "scene-planner-canvas" },
+    h(
+      Card,
+      { className: "scene-planner-canvas-card scene-planner-network-card" },
+      h("span", { className: "scene-panel-kicker" }, "Planner Network"),
+      h(CPMNetworkDiagram, { playback, zoom }),
+    ),
+    h(
+      "div",
+      { className: "scene-planner-grid" },
+      h(
+        Card,
+        { className: "scene-planner-canvas-card" },
+        h("span", { className: "scene-panel-kicker" }, "CPM Chain"),
+        h(
+          "div",
+          { className: "scene-cpm-chain" },
+          criticalPathChain.length
+            ? criticalPathChain.map((task) =>
+                h(
+                  "span",
+                  {
+                    key: task.key,
+                    className: `scene-cpm-chain-node${task.sourceKind === "startup" ? " is-support" : ""}`,
+                  },
+                  `${task.loadCode} ${task.activity}`,
+                ),
+              )
+            : h("span", { className: "muted-copy" }, "No critical chain available."),
+        ),
+      ),
+      h(
+        Card,
+        { className: "scene-planner-canvas-card" },
+        h("span", { className: "scene-panel-kicker" }, "Support Loads"),
+        h(
+          "div",
+          { className: "scene-dashboard-pair" },
+          h("div", { className: "scene-dashboard-inline scene-dashboard-pair-item" }, h("span", { className: "scene-dashboard-label" }, "Needed"), h("strong", null, String(operatingSnapshot.startupSummary.totalUnits))),
+          h("div", { className: "scene-dashboard-inline scene-dashboard-pair-item" }, h("span", { className: "scene-dashboard-label" }, "Sourced"), h("strong", null, String(operatingSnapshot.startupSummary.coveredUnits))),
+        ),
+        h(
+          "div",
+          { className: "scene-dashboard-pair" },
+          h("div", { className: "scene-dashboard-inline scene-dashboard-pair-item" }, h("span", { className: "scene-dashboard-label" }, "Missing"), h("strong", null, String(operatingSnapshot.startupSummary.missingUnits))),
+          h("div", { className: "scene-dashboard-inline scene-dashboard-pair-item" }, h("span", { className: "scene-dashboard-label" }, "Readiness"), h("strong", null, `${drillingReadinessPercent}%`)),
+        ),
+      ),
+    ),
+    h(
+      Card,
+      { className: "scene-planner-canvas-card" },
+      h("span", { className: "scene-panel-kicker" }, "Critical Schedule"),
+      h(
+        "div",
+        { className: "scene-cpm-table" },
+        h(
+          "div",
+          { className: "scene-cpm-table-head" },
+          h("span", null, "Act"),
+          h("span", null, "Load"),
+          h("span", null, "Start"),
+          h("span", null, "Finish"),
+          h("span", null, "Slack"),
+        ),
+        criticalScheduleRows.length
+          ? criticalScheduleRows.map((task) =>
+              h(
+                "div",
+                { key: task.key, className: `scene-cpm-table-row${task.sourceKind === "startup" ? " is-support" : ""}` },
+                h("span", { className: "scene-cpm-activity" }, task.activity),
+                h("span", null, task.loadCode),
+                h("span", null, formatMinutes(task.start)),
+                h("span", null, formatMinutes(task.finish)),
+                h("span", null, `${task.slack}m`),
+              ),
+            )
+          : h("div", { className: "scene-cpm-table-empty muted-copy" }, "No critical tasks available."),
+      ),
+    ),
+    h(
+      Card,
+      { className: "scene-planner-canvas-card" },
+      h("span", { className: "scene-panel-kicker" }, "CPM Table"),
+      h(
+        "div",
+        { className: "scene-cpm-table scene-cpm-table-wide" },
+        h(
+          "div",
+          { className: "scene-cpm-table-head scene-cpm-table-head-wide" },
+          h("span", null, "Act"),
+          h("span", null, "Load"),
+          h("span", null, "ES"),
+          h("span", null, "EF"),
+          h("span", null, "LS"),
+          h("span", null, "LF"),
+          h("span", null, "Float"),
+        ),
+        plannerScheduleRows.length
+          ? plannerScheduleRows.map((task) =>
+              h(
+                "div",
+                {
+                  key: task.key,
+                  className: `scene-cpm-table-row scene-cpm-table-row-wide${task.sourceKind === "startup" ? " is-support" : ""}${task.critical ? " is-critical" : ""}`,
+                },
+                h("span", { className: "scene-cpm-activity" }, task.activity),
+                h("span", null, task.loadCode),
+                h("span", null, formatMinutes(task.es)),
+                h("span", null, formatMinutes(task.ef)),
+                h("span", null, formatMinutes(task.ls)),
+                h("span", null, formatMinutes(task.lf)),
+                h("span", null, `${task.slack}m`),
+              ),
+            )
+          : h("div", { className: "scene-cpm-table-empty muted-copy" }, "No schedule rows available."),
+      ),
+    ),
+    h(
+      Card,
+      { className: "scene-planner-canvas-card" },
+      h("span", { className: "scene-panel-kicker" }, "Cost Breakdown"),
+      h(
+        "div",
+        { className: "scene-cpm-cost-list" },
+        plannerCostRows.length
+          ? plannerCostRows.map((row) =>
+              h(
+                "div",
+                { key: row.key, className: "scene-cpm-cost-row" },
+                h(
+                  "div",
+                  { className: "scene-cpm-cost-copy" },
+                  h("strong", null, row.label),
+                  h("span", { className: "muted-copy" }, `${row.truckType} · ${row.distanceKm} km · ${formatMinutes(row.activeMinutes)}`),
+                ),
+                h("strong", { className: "scene-cpm-cost-value" }, formatCurrency(row.tripCost)),
+              ),
+            )
+          : h("div", { className: "scene-cpm-table-empty muted-copy" }, "No cost rows available."),
+      ),
+      h(
+        "div",
+        { className: "scene-dashboard-pair" },
+        h("div", { className: "scene-dashboard-inline scene-dashboard-pair-item" }, h("span", { className: "scene-dashboard-label" }, "Plan Cost"), h("strong", null, activePlanDashboard.costEstimate)),
+        h("div", { className: "scene-dashboard-inline scene-dashboard-pair-item" }, h("span", { className: "scene-dashboard-label" }, "Cost / Load"), h("strong", null, planComparisonStats.costPerLoad)),
       ),
     ),
   );
@@ -1929,18 +2042,6 @@ function getTimelineWorkingMinutes(playback, rowType) {
 
       return sum + merged.reduce((phaseSum, item) => phaseSum + (item.end - item.start), 0);
     }, 0);
-  }
-
-  if (rowType === "worker") {
-    return trips.reduce(
-      (sum, trip) =>
-        sum +
-        (Math.max(0, trip.rigDownFinish - (trip.rigDownStart ?? trip.loadStart)) * Math.max(0, Number.parseInt(trip.rigDownWorkerCount, 10) || 0)) +
-        (Math.max(0, (trip.pickupLoadFinish ?? 0) - (trip.pickupLoadStart ?? trip.rigDownFinish ?? 0)) * Math.max(0, Number.parseInt(trip.pickupLoadWorkerCount, 10) || 0)) +
-        (Math.max(0, (trip.unloadDropFinish ?? 0) - (trip.unloadDropStart ?? trip.arrivalAtDestination ?? 0)) * Math.max(0, Number.parseInt(trip.unloadDropWorkerCount, 10) || 0)) +
-        (Math.max(0, trip.rigUpFinish - (trip.rigUpStart ?? trip.unloadDropFinish ?? trip.arrivalAtDestination)) * Math.max(0, Number.parseInt(trip.rigUpWorkerCount, 10) || 0)),
-      0,
-    );
   }
 
   if (rowType === "load") {
@@ -2422,8 +2523,6 @@ export function RigMovePage({
   currentUser,
   readOnly = false,
   availableFleet = [],
-  availableWorkers = 0,
-  workerRoles = [],
   truckSpecs = [],
   executionState = "planning",
   operatingState = "standby",
@@ -2448,11 +2547,10 @@ export function RigMovePage({
     executionState === "completed" ? "operations" : executionState === "active" ? "execution" : "planning",
   );
   const [timelineZoom, setTimelineZoom] = useState(move?.timelineZoom || 0.5);
-  const [timelineRowType, setTimelineRowType] = useState(move?.timelineRowType || "truck");
+  const [timelineRowType, setTimelineRowType] = useState(move?.timelineRowType || "cpm");
   const [timelineGapMinutes, setTimelineGapMinutes] = useState(move?.timelineGapMinutes || 3 * 60);
   const [planningStartDate, setPlanningStartDate] = useState(normalizePlanningDate(move?.planningStartDate, move?.createdAt));
   const planningStartTime = "06:00";
-  const [workerRoleDraft, setWorkerRoleDraft] = useState(() => normalizeWorkerRoleDraft(availableWorkers, workerRoles));
   const [focusTarget, setFocusTarget] = useState(null);
   const [isSpeedDropdownOpen, setIsSpeedDropdownOpen] = useState(false);
   const [isDeleteConfirmOpen, setIsDeleteConfirmOpen] = useState(false);
@@ -2523,7 +2621,6 @@ export function RigMovePage({
     setHasSceneInitialized(Boolean(sceneAssetsReady));
     if (isNewMove) {
       setTruckSetup(normalizeTruckSetup(move, availableFleet));
-      setWorkerRoleDraft(normalizeWorkerRoleDraft(availableWorkers, workerRoles));
     }
     if (isNewMove) {
       setActiveScenarioName(move?.simulation?.preferredScenarioName || "");
@@ -2553,7 +2650,7 @@ export function RigMovePage({
         move?.previousSceneMode || (move?.sceneMode === "2d" || move?.sceneMode === "3d" ? move.sceneMode : "2d"),
       );
       setTimelineZoom(move?.timelineZoom || 0.5);
-      setTimelineRowType(move?.timelineRowType || "truck");
+      setTimelineRowType(move?.timelineRowType || "cpm");
       setTimelineGapMinutes(move?.timelineGapMinutes || 3 * 60);
       setPlanningStartDate(normalizePlanningDate(move?.planningStartDate, move?.createdAt));
       setActiveStageKey(
@@ -2565,7 +2662,7 @@ export function RigMovePage({
     if (isNewMove) {
       setFocusTarget(null);
     }
-  }, [move?.id, move?.updatedAt, workerRoles, availableFleet, availableWorkers, activeScenarioName, move?.simulation]);
+  }, [move?.id, move?.updatedAt, availableFleet, activeScenarioName, move?.simulation]);
 
   useEffect(() => {
     setFocusTarget(null);
@@ -2600,68 +2697,70 @@ export function RigMovePage({
     };
   }, [move?.id, activeView, sceneMode, previousSceneMode, timelineZoom, timelineRowType, timelineGapMinutes, planningStartDate, planningStartTime]);
 
-  if (isLoadingMove) {
-    return h(
-      AppLayout,
-      {
-        title: "Loading rig move",
-        subtitle: "Restoring the saved move from the database.",
-        currentUser,
-        onLogout,
-        onBack,
-      },
-      h(Card, { className: "empty-state" }, h("h2", null, "Loading move"), h("p", { className: "muted-copy" }, "Rebuilding the scene after refresh.")),
-    );
-  }
-
-  if (!move) {
-    return h(
-      AppLayout,
-      {
-        title: "Rig move not found",
-        subtitle: "The selected move is no longer available.",
-        currentUser,
-        onLogout,
-        onBack,
-      },
-      h(Card, { className: "empty-state" }, h("h2", null, "Move unavailable"), h("p", { className: "muted-copy" }, "Return to the dashboard and choose another rig move.")),
-    );
-  }
-
-  if (!move.simulation?.scenarioPlans?.length) {
-    return h(
-      AppLayout,
-      {
-        title: move.name,
-        subtitle: move.createdLabel,
-        currentUser,
-        onLogout,
-        onBack,
-        fullBleed: true,
-      },
-      h(
-        Card,
-        { className: "empty-state" },
-        h("h2", null, "Move unavailable"),
-        h("p", { className: "muted-copy" }, "Open the dashboard and start execution after setting the fleet plan."),
-      ),
-    );
-  }
-
-  const baseScenarioPlans = move.simulation.scenarioPlans || [];
+  const fallbackPlayback = {
+    totalMinutes: 0,
+    journeys: [],
+    trips: [],
+    steps: [],
+    tasks: [],
+    planningAnalysis: { criticalTaskIds: [], projectFinish: 0 },
+  };
+  const totalTrucks = truckSetup.reduce((sum, item) => sum + (Number.parseInt(item.count, 10) || 0), 0);
+  const safeMove = move || {
+    id: null,
+    name: "Rig move",
+    createdLabel: "",
+    startLabel: "",
+    endLabel: "",
+    startPoint: null,
+    endPoint: null,
+    routeKm: 0,
+    routeTime: "",
+    simulation: {
+      routeMinutes: 0,
+      routeDistanceKm: 0,
+      routeGeometry: [],
+      routeSource: "Preview route",
+      supportRoutes: [],
+      scenarioPlans: [],
+    },
+    executionProgress: {},
+  };
+  const hasScenarioPlans = Boolean(move?.simulation?.scenarioPlans?.length);
+  const fallbackScenario = {
+    name: "",
+    truckCount: Math.max(totalTrucks, 1),
+    allocatedTruckCount: Math.max(totalTrucks, 1),
+    allocatedTruckSetup: truckSetup,
+    truckSetup,
+    routeGeometry: safeMove.simulation?.routeGeometry || [],
+    routeMinutes: safeMove.simulation?.routeMinutes || 0,
+    totalMinutes: 0,
+    utilization: 0,
+    truckUtilization: 0,
+    idleMinutes: 0,
+    costEstimate: 0,
+    bestVariant: {
+      name: "",
+      routeMinutes: safeMove.simulation?.routeMinutes || 0,
+      processingMinutes: 0,
+      totalMinutes: 0,
+      playback: fallbackPlayback,
+    },
+  };
+  const baseScenarioPlans = hasScenarioPlans ? safeMove.simulation.scenarioPlans : [];
   const baseActiveScenario =
     baseScenarioPlans.find((scenario) => scenario.name === activeScenarioName) ||
-    baseScenarioPlans[0];
-  const totalTrucks = truckSetup.reduce((sum, item) => sum + (Number.parseInt(item.count, 10) || 0), 0);
+    baseScenarioPlans[0] ||
+    fallbackScenario;
   const isCustomizeActive = !readOnly && activePlanKey === "customize";
-  const customAvailableWorkers = isCustomizeActive ? buildWorkerAvailabilityOverride(workerRoleDraft) : availableWorkers;
   const deferredTruckSetup = useDeferredValue(truckSetup);
   const deferredTotalTrucks = deferredTruckSetup.reduce((sum, item) => sum + (Number.parseInt(item.count, 10) || 0), 0);
   const planningRouteData = {
-    minutes: move.simulation?.routeMinutes || baseActiveScenario?.routeMinutes || 0,
-    distanceKm: move.simulation?.routeDistanceKm || baseActiveScenario?.routeDistanceKm || move.routeKm || 0,
-    geometry: move.simulation?.routeGeometry || baseActiveScenario?.routeGeometry || [],
-    source: move.simulation?.routeSource || baseActiveScenario?.routeSource || "Preview route",
+    minutes: safeMove.simulation?.routeMinutes || baseActiveScenario?.routeMinutes || 0,
+    distanceKm: safeMove.simulation?.routeDistanceKm || baseActiveScenario?.routeDistanceKm || safeMove.routeKm || 0,
+    geometry: safeMove.simulation?.routeGeometry || baseActiveScenario?.routeGeometry || [],
+    source: safeMove.simulation?.routeSource || baseActiveScenario?.routeSource || "Preview route",
   };
   const scenarioPlans = baseScenarioPlans;
   const activeScenario =
@@ -2688,8 +2787,7 @@ export function RigMovePage({
 
   const displaySimulation = useMemo(
     () => ({
-      ...move.simulation,
-      workerCount: selectedScenario.workerCount,
+      ...(safeMove.simulation || {}),
       truckCount: selectedScenario.truckCount,
       bestPlan: selectedScenario.bestVariant,
       bestScenario: selectedScenario,
@@ -2697,7 +2795,7 @@ export function RigMovePage({
       routeMinutes: selectedScenario.routeMinutes,
       truckSetup: effectiveTruckSetup,
     }),
-    [move.simulation, selectedScenario, effectiveTruckSetup],
+    [safeMove.simulation, selectedScenario, effectiveTruckSetup],
   );
 
   const totalMinutes = displaySimulation.bestPlan.totalMinutes;
@@ -2721,13 +2819,8 @@ export function RigMovePage({
     [selectedScenario],
   );
   const activePlanDashboard = useMemo(
-    () => getPlanDashboardStats(selectedScenario, move),
-    [selectedScenario, move],
-  );
-  const workerRoleSummaryRows = buildWorkerRoleSummaryRows(
-    displaySimulation.bestPlan.playback,
-    customAvailableWorkers?.roles ? customAvailableWorkers : availableWorkers,
-    workerRoles,
+    () => getPlanDashboardStats(selectedScenario, safeMove),
+    [selectedScenario, safeMove],
   );
   const displayedTruckCounts = useMemo(
     () => buildDisplayedTruckCounts(effectiveTruckSetup, effectiveTruckCount),
@@ -2737,48 +2830,64 @@ export function RigMovePage({
     () =>
       getRigInsightStats({
         side: focusTarget?.kind === "rig" ? focusTarget.side : null,
-        move,
+        move: safeMove,
         playback: displaySimulation.bestPlan.playback,
         currentMinute: visibleMinute,
         totalMinutes,
       }),
-    [focusTarget, move, displaySimulation, visibleMinute, totalMinutes],
+    [focusTarget, safeMove, displaySimulation, visibleMinute, totalMinutes],
   );
   const focusedTruckStats = useMemo(
     () =>
       getTruckFocusStats({
         truckId: focusTarget?.kind === "truck" ? focusTarget.truckId : null,
-        move,
+        move: safeMove,
         playback: displaySimulation.bestPlan.playback,
         currentMinute: visibleMinute,
         totalMinutes,
       }),
-    [focusTarget, move, displaySimulation, visibleMinute, totalMinutes],
+    [focusTarget, safeMove, displaySimulation, visibleMinute, totalMinutes],
   );
   const planComparisonStats = useMemo(
-    () => getPlanComparisonStats(scenarioPlans, selectedScenario, move, visibleMinute),
-    [scenarioPlans, selectedScenario, move, visibleMinute],
+    () => getPlanComparisonStats(scenarioPlans, selectedScenario, safeMove, visibleMinute),
+    [scenarioPlans, selectedScenario, safeMove, visibleMinute],
+  );
+  const criticalPathChain = useMemo(
+    () => buildCriticalPathChain(displaySimulation.bestPlan.playback),
+    [displaySimulation.bestPlan.playback],
+  );
+  const criticalScheduleRows = useMemo(
+    () => buildCriticalScheduleRows(displaySimulation.bestPlan.playback),
+    [displaySimulation.bestPlan.playback],
+  );
+  const plannerScheduleRows = useMemo(
+    () => buildPlannerScheduleRows(displaySimulation.bestPlan.playback),
+    [displaySimulation.bestPlan.playback],
+  );
+  const plannerCostRows = useMemo(
+    () => buildPlannerCostRows(selectedScenario, displaySimulation.bestPlan.playback, safeMove),
+    [selectedScenario, displaySimulation.bestPlan.playback, safeMove],
   );
   const isPlaybackActiveState = isPlaybackRunning || isPlaybackPaused;
   const operatingSnapshot = useMemo(
     () =>
       buildOperatingSnapshot({
-        move,
+        move: safeMove,
         teamMoves,
         logicalLoads,
         startupRequirements,
       }),
-    [move, teamMoves, logicalLoads, startupRequirements],
+    [safeMove, teamMoves, logicalLoads, startupRequirements],
   );
   const drillingReadinessPercent = operatingSnapshot.startupSummary.totalUnits
     ? Math.round((operatingSnapshot.startupSummary.coveredUnits / operatingSnapshot.startupSummary.totalUnits) * 100)
     : 0;
   const startupTransferSchedule = useMemo(
     () =>
-      move?.simulation?.supportRoutes?.length
-        ? move.simulation.supportRoutes
-        : buildStartupTransferSchedule(operatingSnapshot.startupLoads, formatLocationLabel(move?.endLabel, "Destination")),
-    [move?.simulation?.supportRoutes, operatingSnapshot, move?.endLabel],
+      safeMove?.simulation?.supportRoutes?.length
+        ? safeMove.simulation.supportRoutes
+        : buildStartupTransferSchedule(operatingSnapshot.startupLoads, formatLocationLabel(safeMove?.endLabel, "Destination")),
+    [safeMove?.simulation?.supportRoutes, operatingSnapshot, safeMove?.endLabel],
   );
   const focusedTruckOverviewTitle = !isPlaybackActiveState
     ? "Truck Overview"
@@ -2844,28 +2953,22 @@ export function RigMovePage({
   );
   const isTimelineMode = sceneMode === "timeline";
   const canEditPlan = !readOnly && executionState === "planning" && !isPlaybackRunning && !isPlaybackPaused;
-  const workerTimelineRows = useMemo(
-    () => (isTimelineMode && timelineRowType === "worker" ? buildWorkerScheduleRows(displaySimulation.bestPlan.playback) : []),
-    [isTimelineMode, timelineRowType, displaySimulation.bestPlan.playback],
-  );
   const loadTimelineRows = useMemo(
     () => (isTimelineMode && timelineRowType === "load" ? buildLoadScheduleRows(displaySimulation.bestPlan.playback) : []),
     [isTimelineMode, timelineRowType, displaySimulation.bestPlan.playback],
   );
-  const criticalPathTimelineRows = useMemo(
-    () => (isTimelineMode && timelineRowType === "cpm" ? buildCriticalPathRows(displaySimulation.bestPlan.playback) : []),
+  const cpmTimelineRows = useMemo(
+    () => (isTimelineMode && timelineRowType === "cpm" ? buildCpmScheduleRows(displaySimulation.bestPlan.playback) : []),
     [isTimelineMode, timelineRowType, displaySimulation.bestPlan.playback],
   );
   const timelineRowsCount = !isTimelineMode
     ? 0
     : timelineRowType === "phase"
       ? 3
-      : timelineRowType === "worker"
-        ? Math.max(workerTimelineRows.length, 1)
-        : timelineRowType === "load"
+      : timelineRowType === "load"
           ? Math.max(loadTimelineRows.length, 1)
           : timelineRowType === "cpm"
-            ? Math.max(criticalPathTimelineRows.length, 1)
+            ? Math.max(cpmTimelineRows.length, 1)
           : effectiveTruckCount;
   const timelineWorkingMinutes = useMemo(
     () => (isTimelineMode ? getTimelineWorkingMinutes(displaySimulation.bestPlan.playback, timelineRowType) : 0),
@@ -2874,10 +2977,6 @@ export function RigMovePage({
   const truckTimelineWorkingMinutes = useMemo(
     () => (isTimelineMode ? getTimelineWorkingMinutes(displaySimulation.bestPlan.playback, "truck") : 0),
     [isTimelineMode, displaySimulation.bestPlan.playback],
-  );
-  const workerTimelineWorkingMinutes = useMemo(
-    () => (isTimelineMode && timelineRowType === "worker" ? getTimelineWorkingMinutes(displaySimulation.bestPlan.playback, "worker") : 0),
-    [isTimelineMode, timelineRowType, displaySimulation.bestPlan.playback],
   );
   const loadTimelineWorkingMinutes = useMemo(
     () => (isTimelineMode && timelineRowType === "load" ? getTimelineWorkingMinutes(displaySimulation.bestPlan.playback, "load") : 0),
@@ -2890,14 +2989,11 @@ export function RigMovePage({
   const timelineWorkingMinutesPerTruck = Math.round(
     truckTimelineWorkingMinutes / Math.max(effectiveTruckCount, 1),
   );
-  const timelineWorkingMinutesPerWorkerRole = Math.round(
-    workerTimelineWorkingMinutes / Math.max(workerTimelineRows.length, 1),
-  );
   const timelineWorkingMinutesPerLoad = Math.round(
     loadTimelineWorkingMinutes / Math.max(loadTimelineRows.length, 1),
   );
   const timelineWorkingMinutesPerCriticalLoad = Math.round(
-    criticalPathTimelineWorkingMinutes / Math.max(criticalPathTimelineRows.length, 1),
+    criticalPathTimelineWorkingMinutes / Math.max(cpmTimelineRows.length, 1),
   );
   const timelineUtilizationPercent = Math.min(
     100,
@@ -2965,7 +3061,7 @@ export function RigMovePage({
         },
         h("span", { className: "scene-panel-kicker" }, "Planning Engine"),
         h("strong", { style: { fontSize: "1.15rem" } }, simulationProgress?.message || "Building execution plan"),
-          h("p", { className: "muted-copy", style: { margin: 0 } }, simulationProgress?.detail || "The planner is still running. Large fleets and worker combinations can take longer."),
+          h("p", { className: "muted-copy", style: { margin: 0 } }, simulationProgress?.detail || "The planner is still running. Large fleet comparisons can take longer."),
           h(ProgressBar, { value: progressPercent }),
           h(
             "div",
@@ -3061,6 +3157,54 @@ export function RigMovePage({
         ),
       )
     : null;
+
+  if (isLoadingMove) {
+    return h(
+      AppLayout,
+      {
+        title: "Loading rig move",
+        subtitle: "Restoring the saved move from the database.",
+        currentUser,
+        onLogout,
+        onBack,
+      },
+      h(Card, { className: "empty-state" }, h("h2", null, "Loading move"), h("p", { className: "muted-copy" }, "Rebuilding the scene after refresh.")),
+    );
+  }
+
+  if (!move) {
+    return h(
+      AppLayout,
+      {
+        title: "Rig move not found",
+        subtitle: "The selected move is no longer available.",
+        currentUser,
+        onLogout,
+        onBack,
+      },
+      h(Card, { className: "empty-state" }, h("h2", null, "Move unavailable"), h("p", { className: "muted-copy" }, "Return to the dashboard and choose another rig move.")),
+    );
+  }
+
+  if (!hasScenarioPlans) {
+    return h(
+      AppLayout,
+      {
+        title: move.name,
+        subtitle: move.createdLabel,
+        currentUser,
+        onLogout,
+        onBack,
+        fullBleed: true,
+      },
+      h(
+        Card,
+        { className: "empty-state" },
+        h("h2", null, "Move unavailable"),
+        h("p", { className: "muted-copy" }, "Open the dashboard and start execution after setting the fleet plan."),
+      ),
+    );
+  }
 
   function handleFocusChange(nextFocusTarget) {
     setFocusTarget(nextFocusTarget || null);
@@ -3255,12 +3399,17 @@ export function RigMovePage({
           ? h(
               "section",
               { className: "scene-timeline-layout" },
-              h(FullScreenTimeline, {
+              h(PlannerCanvas, {
                 playback: displaySimulation.bestPlan.playback,
-                currentMinute: visibleMinute,
                 zoom: timelineZoom,
-                rowType: timelineRowType,
-                gapMinutes: timelineGapMinutes,
+                criticalPathChain,
+                criticalScheduleRows,
+                plannerScheduleRows,
+                plannerCostRows,
+                operatingSnapshot,
+                drillingReadinessPercent,
+                activePlanDashboard,
+                planComparisonStats,
               }),
               h(
                 "aside",
@@ -3272,54 +3421,7 @@ export function RigMovePage({
                     "div",
                     { className: "scene-timeline-sidebar-section" },
                     h("span", { className: "scene-panel-kicker" }, "Stats"),
-                    timelineRowType === "phase"
-                      ? [
-                          h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Completion"), h("strong", null, `${completion}%`)),
-                          h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Current Time"), h("strong", null, formatMinutes(Math.round(visibleMinute)))),
-                          h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Time Left"), h("strong", null, formatMinutes(Math.max(0, Math.round(totalMinutes - visibleMinute))))),
-                          h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Phase Rows"), h("strong", null, "3")),
-                          h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Gap"), h("strong", null, `${timelineGapMinutes / 60}h`)),
-                          h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Loads"), h("strong", null, String(activePlanSummary.totalLoads))),
-                          h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "At Source"), h("strong", null, String(rigLoads.sourceCount))),
-                          h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Rig Down"), h("strong", null, `${Math.round(phases.down)}%`)),
-                          h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Move"), h("strong", null, `${Math.round(phases.move)}%`)),
-                          h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Rig Up"), h("strong", null, `${Math.round(phases.up)}%`)),
-                          h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Round Trips"), h("strong", null, String(activePlanSummary.roundTrips))),
-                          h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Total Time"), h("strong", null, formatMinutes(activePlanSummary.totalMinutes))),
-                          h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Phase Utilization"), h("strong", null, `${timelineUtilizationPercent}%`)),
-                        ]
-                      : timelineRowType === "worker"
-                        ? [
-                            h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Completion"), h("strong", null, `${completion}%`)),
-                            h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Current Time"), h("strong", null, formatMinutes(Math.round(visibleMinute)))),
-                            h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Time Left"), h("strong", null, formatMinutes(Math.max(0, Math.round(totalMinutes - visibleMinute))))),
-                            h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Rows"), h("strong", null, String(timelineRowsCount))),
-                            h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Row Mode"), h("strong", null, "Worker")),
-                            h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Gap"), h("strong", null, `${timelineGapMinutes / 60}h`)),
-                            h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Workers Used"), h("strong", null, String(activePlanDashboard.workerCount))),
-                            h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Day / Night"), h("strong", null, `${activePlanDashboard.dayShiftCapacity}/${activePlanDashboard.nightShiftCapacity}`)),
-                            h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Worker Utilization"), h("strong", null, activePlanDashboard.workerUtilization)),
-                            h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Worker Idle Hours"), h("strong", null, activePlanDashboard.workerIdleHours)),
-                            h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Avg / Role"), h("strong", null, formatMinutes(timelineWorkingMinutesPerWorkerRole))),
-                            h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Combined Utilization"), h("strong", null, `${timelineUtilizationPercent}%`)),
-                          ]
-                        : timelineRowType === "load"
-                          ? [
-                              h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Completion"), h("strong", null, `${completion}%`)),
-                              h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Current Time"), h("strong", null, formatMinutes(Math.round(visibleMinute)))),
-                              h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Time Left"), h("strong", null, formatMinutes(Math.max(0, Math.round(totalMinutes - visibleMinute))))),
-                              h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Rows"), h("strong", null, String(timelineRowsCount))),
-                              h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Row Mode"), h("strong", null, "Load")),
-                              h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Gap"), h("strong", null, `${timelineGapMinutes / 60}h`)),
-                              h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Loads"), h("strong", null, String(activePlanSummary.totalLoads))),
-                              h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "At Source"), h("strong", null, String(rigLoads.sourceCount))),
-                              h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Moving"), h("strong", null, String(rigLoads.movingCount))),
-                              h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Completed"), h("strong", null, String(rigLoads.destinationCount))),
-                              h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Avg / Load"), h("strong", null, formatMinutes(timelineWorkingMinutesPerLoad))),
-                              h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Utilization"), h("strong", null, `${timelineUtilizationPercent}%`)),
-                            ]
-                        : timelineRowType === "cpm"
-                          ? [
+                    [
                               h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Completion"), h("strong", null, `${completion}%`)),
                               h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Current Time"), h("strong", null, formatMinutes(Math.round(visibleMinute)))),
                               h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Time Left"), h("strong", null, formatMinutes(Math.max(0, Math.round(totalMinutes - visibleMinute))))),
@@ -3331,21 +3433,6 @@ export function RigMovePage({
                               h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Critical Path"), h("strong", null, `${activePlanDashboard.criticalPathHours}h`)),
                               h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Avg / Critical Load"), h("strong", null, formatMinutes(timelineWorkingMinutesPerCriticalLoad))),
                               h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Utilization"), h("strong", null, `${timelineUtilizationPercent}%`)),
-                            ]
-                        : [
-                          h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Completion"), h("strong", null, `${completion}%`)),
-                          h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Current Time"), h("strong", null, formatMinutes(Math.round(visibleMinute)))),
-                          h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Time Left"), h("strong", null, formatMinutes(Math.max(0, Math.round(totalMinutes - visibleMinute))))),
-                          h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Rows"), h("strong", null, String(timelineRowsCount))),
-                          h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Row Mode"), h("strong", null, "Truck")),
-                          h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Gap"), h("strong", null, `${timelineGapMinutes / 60}h`)),
-                          h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Loads"), h("strong", null, String(activePlanSummary.totalLoads))),
-                          h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Moving Now"), h("strong", null, String(rigLoads.movingCount))),
-                          h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Completed"), h("strong", null, String(rigLoads.destinationCount))),
-                          h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Round Trips"), h("strong", null, String(activePlanSummary.roundTrips))),
-                          h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Total Time"), h("strong", null, formatMinutes(activePlanSummary.totalMinutes))),
-                          h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Avg / Truck"), h("strong", null, formatMinutes(timelineWorkingMinutesPerTruck))),
-                          h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Utilization"), h("strong", null, `${timelineUtilizationPercent}%`)),
                         ],
                   ),
                   h(
@@ -3420,25 +3507,142 @@ export function RigMovePage({
                       ),
                     ),
                     h(
-                      "div",
-                      { className: "scene-timeline-type-controls" },
-                      h(
-                        "div",
-                        { className: "scene-timeline-compact-switcher" },
-                        ["truck", "worker", "load", "phase", "cpm"].map((type) =>
+                          "div",
+                          { className: "scene-timeline-sidebar-section" },
+                          h("span", { className: "scene-panel-kicker" }, "CPM Chain"),
                           h(
-                            "button",
-                            {
-                              key: `timeline-row-type-${type}`,
-                              type: "button",
-                              className: `scene-dimension-toggle${timelineRowType === type ? " is-active" : ""}`,
-                              onClick: () => setTimelineRowType(type),
-                            },
-                            type === "truck" ? "Truck" : type === "worker" ? "Worker" : type === "load" ? "Load" : type === "cpm" ? "CPM" : "Phase",
+                            "div",
+                            { className: "scene-cpm-chain" },
+                            criticalPathChain.length
+                              ? criticalPathChain.map((task) =>
+                                  h(
+                                    "span",
+                                    {
+                                      key: task.key,
+                                      className: `scene-cpm-chain-node${task.sourceKind === "startup" ? " is-support" : ""}`,
+                                    },
+                                    `${task.loadCode} ${task.activity}`,
+                                  ),
+                                )
+                              : h("span", { className: "muted-copy" }, "No critical chain available."),
                           ),
                         ),
-                      ),
-                    ),
+                    h(
+                          "div",
+                          { className: "scene-timeline-sidebar-section" },
+                          h("span", { className: "scene-panel-kicker" }, "Critical Schedule"),
+                          h(
+                            "div",
+                            { className: "scene-cpm-table" },
+                            h(
+                              "div",
+                              { className: "scene-cpm-table-head" },
+                              h("span", null, "Act"),
+                              h("span", null, "Load"),
+                              h("span", null, "Start"),
+                              h("span", null, "Finish"),
+                              h("span", null, "Slack"),
+                            ),
+                            criticalScheduleRows.length
+                              ? criticalScheduleRows.map((task) =>
+                                  h(
+                                    "div",
+                                    { key: task.key, className: `scene-cpm-table-row${task.sourceKind === "startup" ? " is-support" : ""}` },
+                                    h("span", { className: "scene-cpm-activity" }, task.activity),
+                                    h("span", null, task.loadCode),
+                                    h("span", null, formatMinutes(task.start)),
+                                    h("span", null, formatMinutes(task.finish)),
+                                    h("span", null, `${task.slack}m`),
+                                  ),
+                                )
+                              : h("div", { className: "scene-cpm-table-empty muted-copy" }, "No critical tasks available."),
+                          ),
+                        ),
+                    h(
+                          "div",
+                          { className: "scene-timeline-sidebar-section" },
+                          h("span", { className: "scene-panel-kicker" }, "CPM Table"),
+                          h(
+                            "div",
+                            { className: "scene-cpm-table scene-cpm-table-wide" },
+                            h(
+                              "div",
+                              { className: "scene-cpm-table-head scene-cpm-table-head-wide" },
+                              h("span", null, "Act"),
+                              h("span", null, "Load"),
+                              h("span", null, "ES"),
+                              h("span", null, "EF"),
+                              h("span", null, "LS"),
+                              h("span", null, "LF"),
+                              h("span", null, "Float"),
+                            ),
+                            plannerScheduleRows.length
+                              ? plannerScheduleRows.map((task) =>
+                                  h(
+                                    "div",
+                                    {
+                                      key: task.key,
+                                      className: `scene-cpm-table-row scene-cpm-table-row-wide${task.sourceKind === "startup" ? " is-support" : ""}${task.critical ? " is-critical" : ""}`,
+                                    },
+                                    h("span", { className: "scene-cpm-activity" }, task.activity),
+                                    h("span", null, task.loadCode),
+                                    h("span", null, formatMinutes(task.es)),
+                                    h("span", null, formatMinutes(task.ef)),
+                                    h("span", null, formatMinutes(task.ls)),
+                                    h("span", null, formatMinutes(task.lf)),
+                                    h("span", null, `${task.slack}m`),
+                                  ),
+                                )
+                              : h("div", { className: "scene-cpm-table-empty muted-copy" }, "No schedule rows available."),
+                          ),
+                        ),
+                    h(
+                          "div",
+                          { className: "scene-timeline-sidebar-section" },
+                          h("span", { className: "scene-panel-kicker" }, "Support Loads"),
+                          h(
+                            "div",
+                            { className: "scene-dashboard-pair" },
+                            h("div", { className: "scene-dashboard-inline scene-dashboard-pair-item" }, h("span", { className: "scene-dashboard-label" }, "Needed"), h("strong", null, String(operatingSnapshot.startupSummary.totalUnits))),
+                            h("div", { className: "scene-dashboard-inline scene-dashboard-pair-item" }, h("span", { className: "scene-dashboard-label" }, "Sourced"), h("strong", null, String(operatingSnapshot.startupSummary.coveredUnits))),
+                          ),
+                          h(
+                            "div",
+                            { className: "scene-dashboard-pair" },
+                            h("div", { className: "scene-dashboard-inline scene-dashboard-pair-item" }, h("span", { className: "scene-dashboard-label" }, "Missing"), h("strong", null, String(operatingSnapshot.startupSummary.missingUnits))),
+                            h("div", { className: "scene-dashboard-inline scene-dashboard-pair-item" }, h("span", { className: "scene-dashboard-label" }, "Readiness"), h("strong", null, `${drillingReadinessPercent}%`)),
+                          ),
+                        ),
+                    h(
+                          "div",
+                          { className: "scene-timeline-sidebar-section" },
+                          h("span", { className: "scene-panel-kicker" }, "Cost Breakdown"),
+                          h(
+                            "div",
+                            { className: "scene-cpm-cost-list" },
+                            plannerCostRows.length
+                              ? plannerCostRows.map((row) =>
+                                  h(
+                                    "div",
+                                    { key: row.key, className: "scene-cpm-cost-row" },
+                                    h(
+                                      "div",
+                                      { className: "scene-cpm-cost-copy" },
+                                      h("strong", null, row.label),
+                                      h("span", { className: "muted-copy" }, `${row.truckType} · ${row.distanceKm} km · ${formatMinutes(row.activeMinutes)}`),
+                                    ),
+                                    h("strong", { className: "scene-cpm-cost-value" }, formatCurrency(row.tripCost)),
+                                  ),
+                                )
+                              : h("div", { className: "scene-cpm-table-empty muted-copy" }, "No cost rows available."),
+                          ),
+                          h(
+                            "div",
+                            { className: "scene-dashboard-pair" },
+                            h("div", { className: "scene-dashboard-inline scene-dashboard-pair-item" }, h("span", { className: "scene-dashboard-label" }, "Plan Cost"), h("strong", null, activePlanDashboard.costEstimate)),
+                            h("div", { className: "scene-dashboard-inline scene-dashboard-pair-item" }, h("span", { className: "scene-dashboard-label" }, "Cost / Load"), h("strong", null, planComparisonStats.costPerLoad)),
+                          ),
+                        ),
                   ),
                   h(
                     "div",
@@ -3636,7 +3840,7 @@ export function RigMovePage({
                   canEditPlan
                     ? h(
                         "div",
-                        { className: "worker-slider-grid" },
+                        { className: "truck-slider-grid" },
                         truckSetup.map((truck) =>
                           h(
                             "label",
@@ -3680,41 +3884,6 @@ export function RigMovePage({
                   canEditPlan
                     ? h(
                         "div",
-                        { className: "worker-slider-grid" },
-                        Object.entries(workerRoleDraft).map(([roleId, role]) =>
-                          h(
-                            "label",
-                            { key: `worker-${roleId}`, className: "truck-slider-card truck-slider-card-compact" },
-                            h(
-                              "div",
-                              { className: "truck-slider-head truck-slider-head-compact" },
-                              h("span", { title: role.label || getWorkerRoleLabel(roleId) }, getWorkerRoleShortLabel(roleId, role.label)),
-                              h("strong", null, String(role.count)),
-                            ),
-                            h("input", {
-                              className: "truck-slider-input",
-                              type: "range",
-                              min: "0",
-                              max: String(Math.max(12, role.count + 6)),
-                              step: "1",
-                              value: role.count,
-                              style: { "--truck-slider-progress": `${Math.min(100, (role.count / Math.max(12, role.count + 6)) * 100)}%` },
-                              onInput: (event) =>
-                                setWorkerRoleDraft((current) => ({
-                                  ...current,
-                                  [roleId]: {
-                                    ...current[roleId],
-                                    count: Math.max(0, Number.parseInt(event.target.value, 10) || 0),
-                                  },
-                                })),
-                            }),
-                          ),
-                        ),
-                      )
-                    : null,
-                  canEditPlan
-                    ? h(
-                        "div",
                         { className: "truck-time-controls" },
                         h(
                           "label",
@@ -3747,7 +3916,7 @@ export function RigMovePage({
                         isRunning: isPlaybackRunning,
                         isBusy: isSimulating,
                         isPaused: isPlaybackPaused,
-                        onRun: () => onRunCustomPlan({ moveId: move.id, truckSetup, availableWorkers: customAvailableWorkers }),
+                        onRun: () => onRunCustomPlan({ moveId: move.id, truckSetup }),
                         onEnd: onEndPlayback,
                         onPauseToggle: onPausePlayback,
                         label: canResumePlayback ? "Resume Simulation" : "Run Simulation",
@@ -3780,33 +3949,19 @@ export function RigMovePage({
                     ? [
                         h(
                           "div",
-                          { className: "worker-slider-grid scene-passive-overlay" },
-                          [
-                            ...displayedTruckCounts.map((truck) =>
+                          { className: "truck-slider-grid scene-passive-overlay" },
+                          displayedTruckCounts.map((truck) =>
+                            h(
+                              "div",
+                              { key: `summary-${truck.id}`, className: "truck-slider-card truck-slider-card-compact" },
                               h(
                                 "div",
-                                { key: `summary-${truck.id}`, className: "truck-slider-card truck-slider-card-compact" },
-                                h(
-                                  "div",
-                                  { className: "truck-slider-head truck-slider-head-compact" },
-                                  h("span", { title: truck.type || "Truck" }, getTruckShortLabel(truck.type)),
-                                  h("strong", null, `${truck.count}/${getFleetCapacityForType(availableFleet, truck.type)}`),
-                                ),
+                                { className: "truck-slider-head truck-slider-head-compact" },
+                                h("span", { title: truck.type || "Truck" }, getTruckShortLabel(truck.type)),
+                                h("strong", null, `${truck.count}/${getFleetCapacityForType(availableFleet, truck.type)}`),
                               ),
                             ),
-                            ...workerRoleSummaryRows.map((role) =>
-                              h(
-                                "div",
-                                { key: `summary-worker-${role.id}`, className: "truck-slider-card truck-slider-card-compact" },
-                                h(
-                                  "div",
-                                  { className: "truck-slider-head truck-slider-head-compact" },
-                                  h("span", { title: role.label }, getWorkerRoleShortLabel(role.id, role.label)),
-                                  h("strong", null, `${role.used}/${role.available}`),
-                                ),
-                              ),
-                            ),
-                          ],
+                          ),
                         ),
                         h(
                           "div",
@@ -4019,12 +4174,7 @@ export function RigMovePage({
                   h("div", { className: "scene-dashboard-inline scene-dashboard-pair-item" }, h("span", { className: "scene-dashboard-label" }, "Utilization"), h("strong", null, activePlanDashboard.utilization)),
                   h("div", { className: "scene-dashboard-inline scene-dashboard-pair-item" }, h("span", { className: "scene-dashboard-label" }, "Truck Utilization"), h("strong", null, activePlanDashboard.truckUtilization)),
                 ),
-                h(
-                  "div",
-                  { className: "scene-dashboard-pair" },
-                  h("div", { className: "scene-dashboard-inline scene-dashboard-pair-item" }, h("span", { className: "scene-dashboard-label" }, "Worker Utilization"), h("strong", null, activePlanDashboard.workerUtilization)),
-                  h("div", { className: "scene-dashboard-inline scene-dashboard-pair-item" }, h("span", { className: "scene-dashboard-label" }, " "), h("strong", null, " ")),
-                ),
+                null,
               ),
             ) : null,
         !readOnly && executionState === "planning" && !isTimelineMode && !isPlaybackRunning && !isPlaybackPaused
@@ -4099,14 +4249,6 @@ export function RigMovePage({
                           h("strong", null, `${truck.count}/${getFleetCapacityForType(availableFleet, truck.type)}`),
                         ),
                       ),
-                      ...workerRoleSummaryRows.map((role) =>
-                        h(
-                          "div",
-                          { key: `worker-${role.id}`, className: "truck-count-row" },
-                          h("span", null, role.label),
-                          h("strong", null, `${role.used}/${role.available}`),
-                        ),
-                      ),
                       h(
                         "div",
                         { key: "planning-start-date", className: "truck-count-row" },
@@ -4140,7 +4282,7 @@ export function RigMovePage({
                       isRunning: isPlaybackRunning,
                       isBusy: isSimulating,
                       isPaused: isPlaybackPaused,
-                      onRun: () => onRunCustomPlan({ moveId: move.id, truckSetup, availableWorkers: customAvailableWorkers }),
+                      onRun: () => onRunCustomPlan({ moveId: move.id, truckSetup }),
                       onEnd: onEndPlayback,
                       onPauseToggle: onPausePlayback,
                       label: canResumePlayback ? "Resume Simulation" : "Run Simulation",

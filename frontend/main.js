@@ -1,7 +1,6 @@
 import { React, createRoot, h } from "./lib/react.js";
 import { useHashRoute, navigateTo } from "./lib/router.js";
 import {
-  DEFAULT_MOVE_SETTINGS,
   DEFAULT_TRUCK_SETUP,
 } from "./lib/constants.js";
 import { fetchLoads, fetchLocationLabel } from "./features/rigMoves/api.js";
@@ -18,6 +17,7 @@ import {
 import {
   readMoves,
   hydrateMoves,
+  fetchMove,
   createMoveRecord,
   upsertMove,
   persistMoveSession,
@@ -26,11 +26,8 @@ import {
 import {
   hydrateManagerResources,
   readManagerFleet,
-  readManagerWorkers,
   writeManagerFleet,
-  writeManagerWorkers,
   buildFleetAvailability,
-  buildWorkerAvailability,
   getAvailabilityValidationError,
   sumTruckCounts,
 } from "./features/resources/storage.js";
@@ -39,7 +36,9 @@ import { LoginPage } from "./pages/LoginPage.js";
 import { DashboardPage } from "./pages/DashboardPage.js";
 import { ManagerDashboardPage } from "./pages/ManagerDashboardPage.js";
 import { RigMovePage } from "./pages/RigMovePage.js";
-import { formatCoordinate, formatMinutes } from "./lib/format.js";
+import { Card } from "./components/ui/Card.js";
+import { AppLayout } from "./layouts/AppLayout.js";
+import { formatCoordinate, formatDate, formatMinutes } from "./lib/format.js";
 
 const { useEffect, useRef, useState } = React;
 
@@ -108,7 +107,7 @@ function summarizeScenarioFailures(scenarioPlans) {
         .join(", ");
       const fleetText = truckSetupLabel ? ` Fleet: ${truckSetupLabel}.` : "";
 
-      return `${scenarioFailure.name}: ${firstFailure.message} Workers: ${firstFailure.workerCount}. Trucks: ${firstFailure.truckCount}.${fleetText}`;
+      return `${scenarioFailure.name}: ${firstFailure.message} Trucks: ${firstFailure.truckCount}.${fleetText}`;
     })
     .slice(0, 3)
     .join(" ");
@@ -135,6 +134,14 @@ function hasMultiTruckPlans(move) {
   );
 
   return scenarioPlans.length >= 3 && distinctPlanNames.size >= 3;
+}
+
+function isMoveDetailLoaded(move) {
+  return Boolean(
+    move?.simulation?.scenarioPlans?.length ||
+    move?.simulation?.bestPlan?.playback?.trips?.length ||
+    move?.simulation?.routeGeometry?.length,
+  );
 }
 
 function getSessionManagerId(session) {
@@ -212,16 +219,15 @@ function App() {
   const [loads, setLoads] = useState([]);
   const [startupRequirements, setStartupRequirements] = useState([]);
   const [truckSpecs, setTruckSpecs] = useState([]);
-  const [workerRoles, setWorkerRoles] = useState([]);
   const [isLoadingLoads, setIsLoadingLoads] = useState(true);
   const [loadsError, setLoadsError] = useState("");
   const [moves, setMoves] = useState([]);
   const [rigInventoryRevision, setRigInventoryRevision] = useState(0);
   const [areMovesHydrated, setAreMovesHydrated] = useState(false);
+  const [isActiveMoveHydrated, setIsActiveMoveHydrated] = useState(false);
   const [createError, setCreateError] = useState("");
   const [isCreatingMove, setIsCreatingMove] = useState(false);
   const [managerFleet, setManagerFleet] = useState([]);
-  const [managerWorkers, setManagerWorkers] = useState(0);
   const [isSimulatingMove, setIsSimulatingMove] = useState(false);
   const [simulationProgress, setSimulationProgress] = useState(
     createSimulationProgressState({ percent: 0, message: "" }),
@@ -263,7 +269,6 @@ function App() {
           setLoads(dataset.rigLoads || []);
           setStartupRequirements(dataset.startupLoads || []);
           setTruckSpecs(dataset.truckSpecs || []);
-          setWorkerRoles(dataset.workerRoles || []);
         }
       } catch (error) {
         if (!cancelled) {
@@ -423,12 +428,6 @@ function App() {
     moves: managerScopedMoves,
     currentMoveId: activeMove?.id || null,
   });
-  const availableWorkers = buildWorkerAvailability({
-    totalWorkers: managerWorkers,
-    moves: managerScopedMoves,
-    currentMoveId: activeMove?.id || null,
-    managerId,
-  });
   const managerFleetSignature = JSON.stringify(
     (managerFleet || []).map((truck) => ({
       id: truck.id,
@@ -437,7 +436,6 @@ function App() {
       hourlyCost: truck.hourlyCost,
     })),
   );
-  const managerWorkersSignature = JSON.stringify(managerWorkers || {});
   const foremanRigContext =
     session?.role === "Foreman"
       ? buildForemanRigContext({
@@ -457,7 +455,6 @@ function App() {
       if (!managerId) {
         setMoves([]);
         setManagerFleet([]);
-        setManagerWorkers(0);
         setAreMovesHydrated(true);
         return;
       }
@@ -465,20 +462,18 @@ function App() {
       setAreMovesHydrated(false);
       try {
         const [hydratedMoves, resources] = await Promise.all([
-          hydrateMoves(managerId),
+          hydrateMoves(managerId, { summary: session?.role === "Manager" }),
           hydrateManagerResources(managerId),
         ]);
         if (!cancelled) {
           setMoves(hydratedMoves);
           setManagerFleet(resources.fleet || readManagerFleet(managerId));
-          setManagerWorkers(resources.workers || readManagerWorkers(managerId));
           setAreMovesHydrated(true);
         }
       } catch {
         if (!cancelled) {
           setMoves(readMoves());
           setManagerFleet(readManagerFleet(managerId));
-          setManagerWorkers(readManagerWorkers(managerId));
           setAreMovesHydrated(true);
         }
       }
@@ -489,7 +484,46 @@ function App() {
     return () => {
       cancelled = true;
     };
-  }, [managerId]);
+  }, [managerId, session?.role]);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    async function hydrateActiveMove() {
+      if (route.page !== "move" || !route.moveId) {
+        setIsActiveMoveHydrated(false);
+        return;
+      }
+
+      if (activeMove && isMoveDetailLoaded(activeMove)) {
+        setIsActiveMoveHydrated(true);
+        return;
+      }
+
+      setIsActiveMoveHydrated(false);
+
+      try {
+        const hydratedMove = await fetchMove(route.moveId);
+        if (!cancelled) {
+          setMoves((current) => {
+            const remaining = current.filter((move) => move.id !== hydratedMove.id);
+            return [hydratedMove, ...remaining];
+          });
+          setIsActiveMoveHydrated(true);
+        }
+      } catch {
+        if (!cancelled) {
+          setIsActiveMoveHydrated(Boolean(activeMove && isMoveDetailLoaded(activeMove)));
+        }
+      }
+    }
+
+    hydrateActiveMove();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [route.page, route.moveId, activeMove?.id, activeMove?.updatedAt]);
 
   useEffect(() => {
     let cancelled = false;
@@ -613,22 +647,16 @@ function App() {
           currentMoveId: activeMove.id,
         });
       const refreshedMove = await buildMoveWithSimulation({
-          name: activeMove.name,
-          startPoint: activeMove.startPoint,
-          endPoint: activeMove.endPoint,
-          loadCount: logicalLoads.length,
-          logicalLoads,
-          truckSetup: activeMove.truckSetup || activeMove.simulation?.truckSetup || DEFAULT_TRUCK_SETUP,
-          previousMove: activeMove,
-          availability: refreshedAvailability,
-          availableWorkers: buildWorkerAvailability({
-            totalWorkers: managerWorkers,
-            moves: managerScopedMoves,
-            currentMoveId: activeMove.id,
-            managerId,
-          }),
-          scenarioTruckSetup: refreshedAvailability,
-        });
+        name: activeMove.name,
+        startPoint: activeMove.startPoint,
+        endPoint: activeMove.endPoint,
+        loadCount: logicalLoads.length,
+        logicalLoads,
+        truckSetup: activeMove.truckSetup || activeMove.simulation?.truckSetup || DEFAULT_TRUCK_SETUP,
+        previousMove: activeMove,
+        availability: refreshedAvailability,
+        scenarioTruckSetup: refreshedAvailability,
+      });
 
         if (!cancelled) {
           setMoves(await upsertMove(refreshedMove));
@@ -643,7 +671,7 @@ function App() {
     return () => {
       cancelled = true;
     };
-  }, [route.page, activeMove?.id, activeMove?.updatedAt, logicalLoads.length, managerFleetSignature, managerWorkersSignature, managerScopedMoves.length, truckSpecs.length, startupRequirements.length]);
+  }, [route.page, activeMove?.id, activeMove?.updatedAt, logicalLoads.length, managerFleetSignature, managerScopedMoves.length, truckSpecs.length, startupRequirements.length]);
 
   useEffect(() => {
     if (!session && (route.page === "dashboard" || route.page === "move")) {
@@ -787,7 +815,6 @@ function App() {
         logicalLoads,
         truckSetup: availableTruckSetup,
         availability: availableFleet,
-        availableWorkers,
         scenarioTruckSetup: availableFleet,
         onProgress: ({
           percent = 0,
@@ -838,7 +865,7 @@ function App() {
     }
   }
 
-  async function buildMoveWithSimulation({ name, startPoint, endPoint, startLabel: providedStartLabel, endLabel: providedEndLabel, loadCount, logicalLoads, truckSetup, previousMove, availability = [], availableWorkers = DEFAULT_MOVE_SETTINGS.workerCount, scenarioTruckSetup = null, enforceExactFleet = false, onProgress = null }) {
+  async function buildMoveWithSimulation({ name, startPoint, endPoint, startLabel: providedStartLabel, endLabel: providedEndLabel, loadCount, logicalLoads, truckSetup, previousMove, availability = [], scenarioTruckSetup = null, enforceExactFleet = false, onProgress = null }) {
     const availabilityByType = new Map(
       (availability || []).map((item) => [String(item.type || "").trim().toLowerCase(), item]),
     );
@@ -864,10 +891,7 @@ function App() {
       throw new Error("Add at least one truck before running the simulation.");
     }
     const truckCount = requestedTruckCount;
-    const workerCount = Math.max(
-      4,
-      Number.parseInt(availableWorkers?.available ?? availableWorkers?.total ?? availableWorkers, 10) || DEFAULT_MOVE_SETTINGS.workerCount,
-    );
+    const planningCrewBaseline = 4;
 
     let routeData = fallbackRouteData(startPoint, endPoint);
     let routeMode = "estimated";
@@ -993,7 +1017,7 @@ function App() {
     onProgress?.({
       percent: 38,
       message: "Preparing scenarios",
-      detail: "Stage 6 of 8. Building feasible truck and worker scenario candidates.",
+      detail: "Stage 6 of 8. Building feasible truck scenarios.",
       completedStages: 6,
       totalStages: 8,
     });
@@ -1009,11 +1033,11 @@ function App() {
         hourlyCost: Math.max(0, Number(item.hourlyCost) || 0),
       }))
       .filter((item) => item.type?.trim() && item.count > 0);
-    const scenarioPlans = await buildScenarioPlans(planningLoads, routeData, workerCount, truckCount, normalizedScenarioTruckSetup, truckSpecs, {
-      dayShift: availableWorkers?.dayShift ?? workerCount,
-      nightShift: availableWorkers?.nightShift ?? workerCount,
-      roles: availableWorkers?.roles || {},
-      averageHourlyCost: availableWorkers?.averageHourlyCost ?? 0,
+    const scenarioPlans = await buildScenarioPlans(planningLoads, routeData, planningCrewBaseline, truckCount, normalizedScenarioTruckSetup, truckSpecs, {
+      dayShift: planningCrewBaseline,
+      nightShift: planningCrewBaseline,
+      roles: {},
+      averageHourlyCost: 0,
       startHour: Number.parseInt((previousMove?.planningStartTime || "06:00").split(":")[0], 10) || 6,
       startMinute: Number.parseInt((previousMove?.planningStartTime || "06:00").split(":")[1], 10) || 0,
       enforceExactFleet,
@@ -1038,7 +1062,6 @@ function App() {
     const simulation = {
       startPoint,
       endPoint,
-      workerCount: bestScenario.workerCount,
       truckCount: bestScenario.truckCount,
       truckSetup: sanitizedTruckSetup,
       routeDistanceKm: routeData.distanceKm,
@@ -1094,7 +1117,7 @@ function App() {
     };
   }
 
-  async function handleRunMoveSimulation({ moveId, truckSetup, availableWorkers: overrideAvailableWorkers = null, enforceExactFleet = false }) {
+  async function handleRunMoveSimulation({ moveId, truckSetup, enforceExactFleet = false }) {
     setMoveSimulationError("");
 
     if (!logicalLoads.length) {
@@ -1150,7 +1173,6 @@ function App() {
         truckSetup,
         previousMove: targetMove,
         availability: moveAvailability,
-        availableWorkers: overrideAvailableWorkers || availableWorkers,
         enforceExactFleet,
         onProgress: ({
           percent = 0,
@@ -1331,15 +1353,6 @@ function App() {
     setManagerFleet(savedFleet);
   }
 
-  async function handleSaveManagerWorkers(nextWorkers) {
-    if (!managerId) {
-      return;
-    }
-
-    const savedWorkers = await writeManagerWorkers(managerId, nextWorkers);
-    setManagerWorkers(savedWorkers);
-  }
-
   async function handleSaveRigInventory(rigId, adjustments) {
     if (!rigId) {
       return;
@@ -1358,11 +1371,10 @@ function App() {
     });
   }
 
-  async function handleRunCustomPlan({ moveId, truckSetup, availableWorkers: overrideAvailableWorkers = null }) {
+  async function handleRunCustomPlan({ moveId, truckSetup }) {
     const didUpdateMove = await handleRunMoveSimulation({
       moveId,
       truckSetup,
-      availableWorkers: overrideAvailableWorkers,
       enforceExactFleet: true,
     });
     if (!didUpdateMove) {
@@ -1449,18 +1461,42 @@ function App() {
   }
 
   if (route.page === "dashboard" && session) {
+    if (!areMovesHydrated) {
+      return h(
+        AppLayout,
+        {
+          title: "Loading dashboard",
+          subtitle: formatDate(new Date()),
+          currentUser: session,
+          onLogout: handleLogout,
+          fullBleed: true,
+        },
+        h(
+          "div",
+          { className: "workspace-grid dashboard-grid" },
+          h(
+            "section",
+            { className: "dashboard-column dashboard-column-wide" },
+            h(
+              Card,
+              { className: "empty-state" },
+              h("h2", null, "Loading live data"),
+              h("p", { className: "muted-copy" }, "Waiting for the latest moves and resources from the backend."),
+            ),
+          ),
+        ),
+      );
+    }
+
     if (session.role === "Manager") {
       return h(ManagerDashboardPage, {
         moves: visibleMoves,
         foremen: getManagedForemen(session.id),
         managerFleet,
-        managerWorkers,
         currentUser: session,
         currentDate: new Date(),
-        workerRoles,
         onOpenMove: handleOpenMove,
         onSaveFleet: handleSaveManagerFleet,
-        onSaveWorkers: handleSaveManagerWorkers,
         onLogout: handleLogout,
       });
     }
@@ -1485,19 +1521,16 @@ function App() {
     });
   }
 
-  if (route.page === "move" && session && areMovesHydrated && !activeMove) {
+  if (route.page === "move" && session && areMovesHydrated && isActiveMoveHydrated && !activeMove) {
     if (session.role === "Manager") {
       return h(ManagerDashboardPage, {
         moves: visibleMoves,
         foremen: getManagedForemen(session.id),
         managerFleet,
-        managerWorkers,
         currentUser: session,
         currentDate: new Date(),
-        workerRoles,
         onOpenMove: handleOpenMove,
         onSaveFleet: handleSaveManagerFleet,
-        onSaveWorkers: handleSaveManagerWorkers,
         onLogout: handleLogout,
       });
     }
@@ -1535,7 +1568,7 @@ function App() {
   if (route.page === "move" && session) {
     return h(RigMovePage, {
       move: activeMove,
-      isLoadingMove: !areMovesHydrated,
+      isLoadingMove: !areMovesHydrated || !isActiveMoveHydrated,
       currentMinute,
       sceneAssetsReady: areSceneAssetsReady,
       onScenePlaybackReadyChange: setIsScenePlaybackReady,
@@ -1561,8 +1594,6 @@ function App() {
       currentUser: session,
       readOnly: session.role === "Manager",
       availableFleet,
-      availableWorkers,
-      workerRoles,
       truckSpecs,
       executionState: activeExecutionState,
       operatingState: activeMove?.operatingState || "standby",

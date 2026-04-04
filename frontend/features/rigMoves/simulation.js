@@ -55,9 +55,21 @@ function getLoadDurationMinutes(loadId, fallbackMinutes = null) {
 }
 
 function normalizeTruckTypeKey(type) {
-  return String(type || "")
+  const normalized = String(type || "")
     .toLowerCase()
     .replace(/[^a-z]/g, "");
+
+  if (normalized.includes("flatbed")) {
+    return "flatbed";
+  }
+  if (normalized.includes("lowbed") || normalized.includes("support")) {
+    return "lowbed";
+  }
+  if (normalized.includes("heavyhaul")) {
+    return "heavyhauler";
+  }
+
+  return normalized;
 }
 
 function normalizeTruckTypeLabel(type) {
@@ -166,7 +178,8 @@ function buildWorkbookLogicalLoads(rawLoads) {
   let nextLogicalId = 1;
 
   (rawLoads || []).forEach((load) => {
-    const loadCount = Math.max(1, Number.parseInt(load.load_count, 10) || 1);
+    const isExpandedWorkbookRow = /-(?:L|LOAD)\d+$/i.test(String(load.code || "").trim());
+    const loadCount = isExpandedWorkbookRow ? 1 : Math.max(1, Number.parseInt(load.load_count, 10) || 1);
 
     for (let index = 0; index < loadCount; index += 1) {
       const minimumCrewRoles = {
@@ -492,6 +505,23 @@ function estimateTravelMinutes(distanceKm, fallbackMinutes, load, truckSpec) {
   return Math.max(1, Math.round((distanceKm / effectiveSpeed) * 60));
 }
 
+function isSpecialPermitLoad(load, truck) {
+  if (!load || !truck) {
+    return false;
+  }
+
+  const truckType = normalizeTruckTypeKey(truck.type);
+  const eligibleTypes = new Set((load.truck_options || []).map((type) => normalizeTruckTypeKey(type)));
+  const maxWeightTons = Number(truck.spec?.max_weight_tons) || 0;
+  const loadWeightTons = Math.max(0, Number(load.weight_tons) || 0);
+
+  return (
+    eligibleTypes.has(truckType) &&
+    truckType.includes("heavy") &&
+    (maxWeightTons <= 0 || loadWeightTons <= maxWeightTons)
+  );
+}
+
 function fitsTruckToLoad(load, truck) {
   if (!truck) {
     return false;
@@ -511,14 +541,13 @@ function fitsTruckToLoad(load, truck) {
 
   const truckDimensions = truck.spec?.dimensions || {};
   const loadDimensions = load.dimensions || {};
-  if (Number(truckDimensions.length) > 0 && Number(loadDimensions.length) > Number(truckDimensions.length)) {
-    return false;
-  }
-  if (Number(truckDimensions.width) > 0 && Number(loadDimensions.width) > Number(truckDimensions.width)) {
-    return false;
-  }
-  if (Number(truckDimensions.height) > 0 && Number(loadDimensions.height) > Number(truckDimensions.height)) {
-    return false;
+  const exceedsDimensions =
+    (Number(truckDimensions.length) > 0 && Number(loadDimensions.length) > Number(truckDimensions.length)) ||
+    (Number(truckDimensions.width) > 0 && Number(loadDimensions.width) > Number(truckDimensions.width)) ||
+    (Number(truckDimensions.height) > 0 && Number(loadDimensions.height) > Number(truckDimensions.height));
+
+  if (exceedsDimensions) {
+    return isSpecialPermitLoad(load, truck);
   }
 
   return true;
@@ -540,13 +569,13 @@ function canTruckCarryLoadBundle(loads, truck) {
     return false;
   }
   if ((Number(truckDimensions.length) || 0) > 0 && totalLength > Number(truckDimensions.length)) {
-    return false;
+    return loads.length === 1 && isSpecialPermitLoad(loads[0], truck);
   }
   if ((Number(truckDimensions.width) || 0) > 0 && maxWidth > Number(truckDimensions.width)) {
-    return false;
+    return loads.length === 1 && isSpecialPermitLoad(loads[0], truck);
   }
   if ((Number(truckDimensions.height) || 0) > 0 && maxHeight > Number(truckDimensions.height)) {
-    return false;
+    return loads.length === 1 && isSpecialPermitLoad(loads[0], truck);
   }
 
   return true;
@@ -1356,13 +1385,28 @@ function buildPlanningTaskGraph(loads = [], routeData = {}) {
   const taskMap = new Map();
   const outgoing = new Map();
   const indegree = new Map();
+  const loadCodeToIds = new Map();
   const phaseOrder = new Map([
+    ["start", 0],
     ["rig_down", 1],
+    ["move", 2],
     ["pickup_load", 2],
     ["haul", 3],
     ["unload_drop", 4],
     ["rig_up", 5],
+    ["finish", 6],
   ]);
+
+  (loads || []).forEach((load) => {
+    const code = String(load?.code || "").trim().toUpperCase();
+    if (!code) {
+      return;
+    }
+    if (!loadCodeToIds.has(code)) {
+      loadCodeToIds.set(code, []);
+    }
+    loadCodeToIds.get(code).push(load.id);
+  });
 
   function compareTaskOrder(left, right) {
     return (
@@ -1383,6 +1427,9 @@ function buildPlanningTaskGraph(loads = [], routeData = {}) {
       latestFinish: 0,
       slack: 0,
       isCritical: false,
+      activityCode: task.activityCode || "",
+      activityLabel: task.activityLabel || "",
+      sourceKind: task.sourceKind || "rig",
     };
     tasks.push(record);
     taskMap.set(record.id, record);
@@ -1390,61 +1437,150 @@ function buildPlanningTaskGraph(loads = [], routeData = {}) {
     indegree.set(record.id, 0);
   }
 
+  function resolveDependencyTaskIds(rawDependencies = [], phase = "rig_down") {
+    const suffix = phase === "rig_up" ? "rig_up" : "rig_down";
+
+    return [...new Set(
+      (rawDependencies || []).flatMap((dependency) => {
+        if (Number.isFinite(Number(dependency))) {
+          return [`${dependency}:${suffix}`];
+        }
+
+        const normalized = String(dependency || "").trim().toUpperCase();
+        if (!normalized) {
+          return [];
+        }
+
+        if (loadCodeToIds.has(normalized)) {
+          return (loadCodeToIds.get(normalized) || []).map((loadId) => `${loadId}:${suffix}`);
+        }
+
+        return [];
+      }),
+    )];
+  }
+
   (loads || []).forEach((load) => {
-    const routeMinutes = Math.max(1, Number(routeData?.minutes) || 1);
+    const routeMinutes = Math.max(1, Number(load?.routeMinutes) || Number(routeData?.minutes) || 1);
     const pickupMinutes = estimateHandlingMinutes(load, "pickup");
     const unloadMinutes = estimateHandlingMinutes(load, "unload");
-    const rigDownDeps = (load.rig_down_dependency_ids || load.dependency_ids || []).map((dependencyId) => `${dependencyId}:rig_down`);
-    const rigUpDeps = (load.rig_up_dependency_ids || []).map((dependencyId) => `${dependencyId}:rig_up`);
-    const chain = [
-      {
-        id: `${load.id}:rig_down`,
-        loadId: load.id,
-        loadCode: load.code || `#${load.id}`,
-        description: load.description,
-        phase: "rig_down",
-        durationMinutes: Math.max(1, Number(load.rig_down_duration) || 1),
-        predecessorIds: rigDownDeps,
-      },
-      {
-        id: `${load.id}:pickup_load`,
-        loadId: load.id,
-        loadCode: load.code || `#${load.id}`,
-        description: load.description,
-        phase: "pickup_load",
-        durationMinutes: pickupMinutes,
-        predecessorIds: [`${load.id}:rig_down`],
-      },
-      {
-        id: `${load.id}:haul`,
-        loadId: load.id,
-        loadCode: load.code || `#${load.id}`,
-        description: load.description,
-        phase: "haul",
-        durationMinutes: routeMinutes,
-        predecessorIds: [`${load.id}:pickup_load`],
-      },
-      {
-        id: `${load.id}:unload_drop`,
-        loadId: load.id,
-        loadCode: load.code || `#${load.id}`,
-        description: load.description,
-        phase: "unload_drop",
-        durationMinutes: unloadMinutes,
-        predecessorIds: [`${load.id}:haul`],
-      },
-      {
-        id: `${load.id}:rig_up`,
-        loadId: load.id,
-        loadCode: load.code || `#${load.id}`,
-        description: load.description,
-        phase: "rig_up",
-        durationMinutes: Math.max(1, Number(load.rig_up_duration) || 1),
-        predecessorIds: [`${load.id}:unload_drop`, ...rigUpDeps],
-      },
-    ];
+    const rigDownDeps = resolveDependencyTaskIds([
+      ...(load.rig_down_dependency_ids || []),
+      ...(load.dependency_ids || []),
+      ...(load.rig_down_dependency_codes || []),
+    ], "rig_down");
+    const rigUpDeps = resolveDependencyTaskIds([
+      ...(load.rig_up_dependency_ids || []),
+      ...(load.rig_up_dependency_codes || []),
+    ], "rig_up");
+    const sourceKind = load?.source_kind || "rig";
+    const moveDurationMinutes = Math.max(1, pickupMinutes + routeMinutes + unloadMinutes);
+    const chain = sourceKind === "startup"
+      ? [
+          {
+            id: `${load.id}:move`,
+            loadId: load.id,
+            loadCode: load.code || `#${load.id}`,
+            description: load.description,
+            phase: "move",
+            activityCode: "RM",
+            activityLabel: "Rig Moving",
+            sourceKind,
+            durationMinutes: moveDurationMinutes,
+            predecessorIds: ["START"],
+          },
+          {
+            id: `${load.id}:rig_up`,
+            loadId: load.id,
+            loadCode: load.code || `#${load.id}`,
+            description: load.description,
+            phase: "rig_up",
+            activityCode: "RU",
+            activityLabel: "Rig Up",
+            sourceKind,
+            durationMinutes: Math.max(1, Number(load.rig_up_duration) || 1),
+            predecessorIds: [`${load.id}:move`, ...rigUpDeps],
+          },
+        ]
+      : [
+          {
+            id: `${load.id}:rig_down`,
+            loadId: load.id,
+            loadCode: load.code || `#${load.id}`,
+            description: load.description,
+            phase: "rig_down",
+            activityCode: "RD",
+            activityLabel: "Rig Down",
+            sourceKind,
+            durationMinutes: Math.max(1, Number(load.rig_down_duration) || 1),
+            predecessorIds: rigDownDeps,
+          },
+          {
+            id: `${load.id}:move`,
+            loadId: load.id,
+            loadCode: load.code || `#${load.id}`,
+            description: load.description,
+            phase: "move",
+            activityCode: "RM",
+            activityLabel: "Rig Moving",
+            sourceKind,
+            durationMinutes: moveDurationMinutes,
+            predecessorIds: [`${load.id}:rig_down`],
+          },
+          {
+            id: `${load.id}:rig_up`,
+            loadId: load.id,
+            loadCode: load.code || `#${load.id}`,
+            description: load.description,
+            phase: "rig_up",
+            activityCode: "RU",
+            activityLabel: "Rig Up",
+            sourceKind,
+            durationMinutes: Math.max(1, Number(load.rig_up_duration) || 1),
+            predecessorIds: [`${load.id}:move`, ...rigUpDeps],
+          },
+        ];
     chain.forEach(addTask);
   });
+
+  addTask({
+    id: "START",
+    loadId: 0,
+    loadCode: "START",
+    description: "Project start",
+    phase: "start",
+    activityCode: "START",
+    activityLabel: "Start",
+    sourceKind: "system",
+    durationMinutes: 0,
+    predecessorIds: [],
+  });
+  addTask({
+    id: "FINISH",
+    loadId: Number.MAX_SAFE_INTEGER,
+    loadCode: "FINISH",
+    description: "Project finish",
+    phase: "finish",
+    activityCode: "FINISH",
+    activityLabel: "Finish",
+    sourceKind: "system",
+    durationMinutes: 0,
+    predecessorIds: [],
+  });
+
+  tasks
+    .filter((task) => task.phase === "rig_down" && task.id !== "START" && task.id !== "FINISH")
+    .forEach((task) => {
+      if (!task.predecessorIds.length) {
+        task.predecessorIds.push("START");
+      }
+    });
+
+  const rigUpTaskIds = tasks
+    .filter((task) => task.phase === "rig_up" && task.id !== "FINISH")
+    .map((task) => task.id);
+  const finishTask = taskMap.get("FINISH");
+  finishTask.predecessorIds = rigUpTaskIds;
 
   tasks.forEach((task) => {
     task.predecessorIds.forEach((predecessorId) => {
@@ -1569,13 +1705,22 @@ function scheduleCrewTask({
   startClockMinutes,
   allowedShiftTypes = null,
 }) {
-  const minimumRoleRequirements = load?.minimum_crew_roles?.[phase.replace("-", "_")] || {};
-  const optimalRoleRequirements = load?.optimal_crew_roles?.[phase.replace("-", "_")] || {};
-  const minWorkers = Math.max(1, sumRoleRequirements(minimumRoleRequirements) || Number(load?.min_worker_count) || 1);
-  const maxPreferredWorkers = Math.max(
-    minWorkers,
-    sumRoleRequirements(optimalRoleRequirements) || Number(load?.optimal_worker_count) || minWorkers,
-  );
+  const hasRoleRoster = Object.keys(workerShiftConfig?.roles || {}).length > 0;
+  const minimumRoleRequirements = hasRoleRoster
+    ? (load?.minimum_crew_roles?.[phase.replace("-", "_")] || {})
+    : {};
+  const optimalRoleRequirements = hasRoleRoster
+    ? (load?.optimal_crew_roles?.[phase.replace("-", "_")] || {})
+    : {};
+  const minWorkers = hasRoleRoster
+    ? Math.max(1, sumRoleRequirements(minimumRoleRequirements) || Number(load?.min_worker_count) || 1)
+    : 1;
+  const maxPreferredWorkers = hasRoleRoster
+    ? Math.max(
+        minWorkers,
+        sumRoleRequirements(optimalRoleRequirements) || Number(load?.optimal_worker_count) || minWorkers,
+      )
+    : 1;
   const preferredWorkers = objective === "cheapest" ? minWorkers : maxPreferredWorkers;
   let attempt = Math.max(0, Math.floor(earliestStart || 0));
 
@@ -2111,6 +2256,7 @@ export async function buildPlayback(
         loadId: entry.load.id,
         loadCode: entry.load.code || `#${entry.load.id}`,
         description: entry.load.description,
+        sourceKind: entry.load.source_kind || "rig",
         sourceLabel: entry.load.sourceLabel || null,
         destinationLabel: entry.load.destinationLabel || null,
         dispatchStart: chosen.dispatchStart,
@@ -2143,8 +2289,10 @@ export async function buildPlayback(
 
       const nominalTasks = planningAnalysis.tasks.filter((task) => task.loadId === entry.load.id);
       const nominalTaskMap = new Map(nominalTasks.map((task) => [task.phase, task]));
-      actualTasks.push(
-        {
+      const moveNominalTask = nominalTaskMap.get("move") || nominalTaskMap.get("haul") || nominalTaskMap.get("pickup_load");
+      const actualLoadTasks = [];
+      if ((entry.load?.source_kind || "rig") !== "startup") {
+        actualLoadTasks.push({
           id: `${entry.load.id}:rig_down`,
           loadId: entry.load.id,
           loadCode: entry.load.code || `#${entry.load.id}`,
@@ -2159,54 +2307,29 @@ export async function buildPlayback(
           latestFinish: nominalTaskMap.get("rig_down")?.latestFinish ?? entry.rigDownTask.endMinute,
           slack: nominalTaskMap.get("rig_down")?.slack || 0,
           isCritical: Boolean(nominalTaskMap.get("rig_down")?.isCritical),
-        },
-        {
-          id: `${entry.load.id}:pickup_load`,
+          activityCode: nominalTaskMap.get("rig_down")?.activityCode || "RD",
+          activityLabel: nominalTaskMap.get("rig_down")?.activityLabel || "Rig Down",
+          sourceKind: nominalTaskMap.get("rig_down")?.sourceKind || entry.load?.source_kind || "rig",
+        });
+      }
+      actualLoadTasks.push({
+          id: `${entry.load.id}:move`,
           loadId: entry.load.id,
           loadCode: entry.load.code || `#${entry.load.id}`,
           description: entry.load.description,
-          phase: "pickup_load",
-          predecessorIds: [...(nominalTaskMap.get("pickup_load")?.predecessorIds || [])],
+          phase: "move",
+          predecessorIds: [...(moveNominalTask?.predecessorIds || [])],
           startMinute: entry.pickupLoadTask.startMinute,
-          endMinute: entry.pickupLoadTask.endMinute,
-          earliestStart: nominalTaskMap.get("pickup_load")?.earliestStart ?? entry.pickupLoadTask.startMinute,
-          earliestFinish: nominalTaskMap.get("pickup_load")?.earliestFinish ?? entry.pickupLoadTask.endMinute,
-          latestStart: nominalTaskMap.get("pickup_load")?.latestStart ?? entry.pickupLoadTask.startMinute,
-          latestFinish: nominalTaskMap.get("pickup_load")?.latestFinish ?? entry.pickupLoadTask.endMinute,
-          slack: nominalTaskMap.get("pickup_load")?.slack || 0,
-          isCritical: Boolean(nominalTaskMap.get("pickup_load")?.isCritical),
-        },
-        {
-          id: `${entry.load.id}:haul`,
-          loadId: entry.load.id,
-          loadCode: entry.load.code || `#${entry.load.id}`,
-          description: entry.load.description,
-          phase: "haul",
-          predecessorIds: [...(nominalTaskMap.get("haul")?.predecessorIds || [])],
-          startMinute: chosen.moveStart,
-          endMinute: chosen.arrivalAtDestination,
-          earliestStart: nominalTaskMap.get("haul")?.earliestStart ?? chosen.moveStart,
-          earliestFinish: nominalTaskMap.get("haul")?.earliestFinish ?? chosen.arrivalAtDestination,
-          latestStart: nominalTaskMap.get("haul")?.latestStart ?? chosen.moveStart,
-          latestFinish: nominalTaskMap.get("haul")?.latestFinish ?? chosen.arrivalAtDestination,
-          slack: nominalTaskMap.get("haul")?.slack || 0,
-          isCritical: Boolean(nominalTaskMap.get("haul")?.isCritical),
-        },
-        {
-          id: `${entry.load.id}:unload_drop`,
-          loadId: entry.load.id,
-          loadCode: entry.load.code || `#${entry.load.id}`,
-          description: entry.load.description,
-          phase: "unload_drop",
-          predecessorIds: [...(nominalTaskMap.get("unload_drop")?.predecessorIds || [])],
-          startMinute: entry.unloadDropTask.startMinute,
           endMinute: entry.unloadDropTask.endMinute,
-          earliestStart: nominalTaskMap.get("unload_drop")?.earliestStart ?? entry.unloadDropTask.startMinute,
-          earliestFinish: nominalTaskMap.get("unload_drop")?.earliestFinish ?? entry.unloadDropTask.endMinute,
-          latestStart: nominalTaskMap.get("unload_drop")?.latestStart ?? entry.unloadDropTask.startMinute,
-          latestFinish: nominalTaskMap.get("unload_drop")?.latestFinish ?? entry.unloadDropTask.endMinute,
-          slack: nominalTaskMap.get("unload_drop")?.slack || 0,
-          isCritical: Boolean(nominalTaskMap.get("unload_drop")?.isCritical),
+          earliestStart: moveNominalTask?.earliestStart ?? entry.pickupLoadTask.startMinute,
+          earliestFinish: moveNominalTask?.earliestFinish ?? entry.unloadDropTask.endMinute,
+          latestStart: moveNominalTask?.latestStart ?? entry.pickupLoadTask.startMinute,
+          latestFinish: moveNominalTask?.latestFinish ?? entry.unloadDropTask.endMinute,
+          slack: moveNominalTask?.slack || 0,
+          isCritical: Boolean(moveNominalTask?.isCritical),
+          activityCode: moveNominalTask?.activityCode || "RM",
+          activityLabel: moveNominalTask?.activityLabel || "Rig Moving",
+          sourceKind: moveNominalTask?.sourceKind || entry.load?.source_kind || "rig",
         },
         {
           id: `${entry.load.id}:rig_up`,
@@ -2223,8 +2346,12 @@ export async function buildPlayback(
           latestFinish: nominalTaskMap.get("rig_up")?.latestFinish ?? entry.rigUpTask.endMinute,
           slack: nominalTaskMap.get("rig_up")?.slack || 0,
           isCritical: Boolean(nominalTaskMap.get("rig_up")?.isCritical),
+          activityCode: nominalTaskMap.get("rig_up")?.activityCode || "RU",
+          activityLabel: nominalTaskMap.get("rig_up")?.activityLabel || "Rig Up",
+          sourceKind: nominalTaskMap.get("rig_up")?.sourceKind || entry.load?.source_kind || "rig",
         },
       );
+      actualTasks.push(...actualLoadTasks);
 
       steps.push({
         type: "rig-down-start",
@@ -2356,11 +2483,14 @@ export async function buildScenarioPlans(
 ) {
   const workerHourlyCost = getAverageWorkerHourlyCost(workerShiftConfig);
   const planningAnalysis = buildPlanningTaskGraph(logicalLoads, routeData);
+  const hasConfiguredWorkerRoster = Object.keys(workerShiftConfig?.roles || {}).length > 0;
   const maxShiftWorkers = Math.max(
-    4,
-    Number.parseInt(workerShiftConfig?.dayShift, 10) || 0,
-    Number.parseInt(workerShiftConfig?.nightShift, 10) || 0,
+    hasConfiguredWorkerRoster ? 4 : 8,
+    hasConfiguredWorkerRoster ? (Number.parseInt(workerShiftConfig?.dayShift, 10) || 0) : 0,
+    hasConfiguredWorkerRoster ? (Number.parseInt(workerShiftConfig?.nightShift, 10) || 0) : 0,
     Number(workerCount) || 0,
+    hasConfiguredWorkerRoster ? 0 : logicalLoads.length,
+    hasConfiguredWorkerRoster ? 0 : truckCount,
   );
   const candidateTruckSetups = buildScenarioResourceProfiles(
     truckSetup,
@@ -2414,7 +2544,9 @@ export async function buildScenarioPlans(
   const workerCountCandidatesByObjective = new Map(
     scenarioDefinitions.map((definition) => [
       definition.objective,
-      buildCandidateWorkerCounts(logicalLoads, maxShiftWorkers, definition.objective),
+      hasConfiguredWorkerRoster
+        ? buildCandidateWorkerCounts(logicalLoads, maxShiftWorkers, definition.objective)
+        : [maxShiftWorkers],
     ]),
   );
   const totalScenarioEvaluations = Math.max(
@@ -2466,6 +2598,10 @@ export async function buildScenarioPlans(
     for (const profileWorkerCount of profileWorkerCounts) {
       for (const candidateTruckSetup of orderedCandidateTruckSetups) {
         completedEvaluations += 1;
+        const scenarioTruckCount = Math.max(1, candidateTruckSetup.reduce((sum, truck) => sum + truck.count, 0) || truckCount || 1);
+        const scenarioWorkerCapacity = hasConfiguredWorkerRoster
+          ? profileWorkerCount
+          : Math.max(maxShiftWorkers, scenarioTruckCount, logicalLoads.length);
         if (reportProgress) {
           const completedWorkUnits = ((completedEvaluations - 1) * loadsPerEvaluation) + 1;
           reportProgress({
@@ -2480,9 +2616,8 @@ export async function buildScenarioPlans(
         await yieldToBrowser();
 
         try {
-          const scenarioTruckCount = Math.max(1, candidateTruckSetup.reduce((sum, truck) => sum + truck.count, 0) || truckCount || 1);
           const truckCostByType = buildTruckCostMap(candidateTruckSetup);
-          const waves = buildSchedules(logicalLoads, scenarioTruckCount, profileWorkerCount, definition.objective, truckCostByType);
+          const waves = buildSchedules(logicalLoads, scenarioTruckCount, scenarioWorkerCapacity, definition.objective, truckCostByType);
           const playback = await buildPlayback(
             {
               routeMinutes: routeData.minutes,
@@ -2495,7 +2630,7 @@ export async function buildScenarioPlans(
             candidateTruckSetup,
             truckSpecs,
             definition.objective,
-            profileWorkerCount,
+            scenarioWorkerCapacity,
             workerShiftConfig,
             {
               onProgress: reportProgress,
@@ -2520,8 +2655,8 @@ export async function buildScenarioPlans(
         const candidateScenario = {
           name: definition.name,
           objective: definition.objective,
-          workerCount: profileWorkerCount,
-          workerShifts: splitShiftCapacity(profileWorkerCount),
+          workerCount: scenarioWorkerCapacity,
+          workerShifts: splitShiftCapacity(scenarioWorkerCapacity),
           truckCount: usedTruckCount,
           allocatedTruckCount: usedTruckCount,
           capacity: usedTruckCount,
@@ -2555,8 +2690,8 @@ export async function buildScenarioPlans(
         } catch (error) {
           definitionFailures.push({
             message: error instanceof Error ? error.message : String(error),
-            workerCount: profileWorkerCount,
-            truckCount: Math.max(1, candidateTruckSetup.reduce((sum, truck) => sum + truck.count, 0) || truckCount || 1),
+            workerCount: hasConfiguredWorkerRoster ? profileWorkerCount : scenarioWorkerCapacity,
+            truckCount: scenarioTruckCount,
             truckSetup: candidateTruckSetup.map((truck) => ({
               type: truck.type,
               count: truck.count,

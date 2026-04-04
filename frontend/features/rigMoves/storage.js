@@ -1,7 +1,39 @@
 import { clampPercentage, formatCoordinate, formatMinutes, formatShortDate } from "../../lib/format.js";
 import { haversineKilometers } from "./simulation.js";
+import { MOVES_STORAGE_KEY } from "../../lib/constants.js";
 
 let movesCache = [];
+
+function loadMovesCache() {
+  if (movesCache.length) {
+    return movesCache;
+  }
+
+  try {
+    const stored = window.localStorage.getItem(MOVES_STORAGE_KEY);
+    if (!stored) {
+      return movesCache;
+    }
+
+    movesCache = sortMoves((JSON.parse(stored) || []).map(normalizeStoredMove).filter(Boolean));
+  } catch {
+    movesCache = [];
+  }
+
+  return movesCache;
+}
+
+function persistMovesCache(nextMoves) {
+  movesCache = sortMoves((nextMoves || []).map(normalizeStoredMove).filter(Boolean));
+
+  try {
+    window.localStorage.setItem(MOVES_STORAGE_KEY, JSON.stringify(movesCache));
+  } catch {
+    // Ignore storage failures and keep runtime cache.
+  }
+
+  return movesCache;
+}
 
 function roundCoordinate(value) {
   return Math.round(value * 100000) / 100000;
@@ -73,29 +105,13 @@ function compactPlayback(playback) {
       rigDownFinish: trip.rigDownFinish,
       pickupLoadStart: trip.pickupLoadStart ?? trip.rigDownFinish,
       pickupLoadFinish: trip.pickupLoadFinish ?? trip.moveStart ?? trip.rigDownFinish,
-      rigDownWorkerCount: trip.rigDownWorkerCount || 0,
-      rigDownWorkerRoles: trip.rigDownWorkerRoles || {},
       arrivalAtDestination: trip.arrivalAtDestination,
       unloadDropStart: trip.unloadDropStart ?? trip.arrivalAtDestination,
       unloadDropFinish: trip.unloadDropFinish ?? trip.arrivalAtDestination,
       rigUpStart: trip.rigUpStart ?? trip.arrivalAtDestination,
       rigUpFinish: trip.rigUpFinish,
-      rigUpWorkerCount: trip.rigUpWorkerCount || 0,
-      rigUpWorkerRoles: trip.rigUpWorkerRoles || {},
       returnStart: trip.returnStart ?? trip.arrivalAtDestination,
       returnToSource: trip.returnToSource,
-    })),
-    workerAssignments: (playback.workerAssignments || []).map((assignment) => ({
-      workerId: assignment.workerId,
-      workerLabel: assignment.workerLabel,
-      roleId: assignment.roleId,
-      shiftType: assignment.shiftType,
-      phase: assignment.phase,
-      loadId: assignment.loadId,
-      loadCode: assignment.loadCode || null,
-      description: assignment.description,
-      startMinute: assignment.startMinute,
-      endMinute: assignment.endMinute,
     })),
     steps: (playback.steps || []).map((step) => ({
       type: step.type,
@@ -109,6 +125,9 @@ function compactPlayback(playback) {
       loadCode: task.loadCode || null,
       description: task.description,
       phase: task.phase,
+      activityCode: task.activityCode || "",
+      activityLabel: task.activityLabel || "",
+      sourceKind: task.sourceKind || "rig",
       predecessorIds: [...(task.predecessorIds || [])],
       startMinute: task.startMinute,
       endMinute: task.endMinute,
@@ -135,7 +154,6 @@ function compactScenarioPlan(plan) {
 
   return {
     name: plan.name,
-    workerCount: plan.workerCount,
     truckCount: plan.truckCount,
     capacity: plan.capacity,
     routeDistanceKm: plan.routeDistanceKm,
@@ -143,16 +161,13 @@ function compactScenarioPlan(plan) {
     routeSource: plan.routeSource,
     routeGeometry: compactGeometry(plan.routeGeometry || []),
     totalMinutes: plan.totalMinutes,
-    workerShifts: plan.workerShifts || null,
     truckSetup: plan.truckSetup || [],
     allocatedTruckSetup: plan.allocatedTruckSetup || [],
     usedTruckSetup: plan.usedTruckSetup || [],
     allocatedTruckCount: plan.allocatedTruckCount,
     utilization: plan.utilization,
     truckUtilization: plan.truckUtilization,
-    workerUtilization: plan.workerUtilization,
     idleMinutes: plan.idleMinutes,
-    workerIdleMinutes: plan.workerIdleMinutes,
     costEstimate: plan.costEstimate,
     bestVariant: plan.bestVariant
       ? {
@@ -181,7 +196,6 @@ function compactSimulation(simulation) {
   return {
     startPoint: simulation.startPoint,
     endPoint: simulation.endPoint,
-    workerCount: simulation.workerCount,
     truckCount: simulation.truckCount,
     truckSetup: simulation.truckSetup || [],
     routeDistanceKm: simulation.routeDistanceKm,
@@ -278,32 +292,42 @@ async function saveMoveRemote(move) {
   return normalizeStoredMove(await response.json());
 }
 
-export async function hydrateMoves(managerId) {
+export async function hydrateMoves(managerId, { summary = false } = {}) {
   if (!managerId) {
-    movesCache = [];
+    persistMovesCache([]);
     return [];
   }
 
-  const params = new URLSearchParams({ managerId });
+  const params = new URLSearchParams({ managerId, summary: summary ? "1" : "0" });
   const response = await fetch(`/api/moves?${params.toString()}`);
   if (!response.ok) {
     throw new Error(`Moves request failed with ${response.status}`);
   }
 
   const payload = await response.json();
-  movesCache = sortMoves((payload || []).map(normalizeStoredMove).filter(Boolean));
-  return movesCache;
+  return persistMovesCache(payload || []);
+}
+
+export async function fetchMove(moveId) {
+  const response = await fetch(`/api/moves/${encodeURIComponent(moveId)}`);
+  if (!response.ok) {
+    throw new Error(`Move request failed with ${response.status}`);
+  }
+
+  const payload = normalizeStoredMove(await response.json());
+  const current = readMoves().filter((item) => item.id !== payload.id);
+  persistMovesCache([payload, ...current]);
+  return payload;
 }
 
 export function readMoves() {
-  return sortMoves(movesCache);
+  return sortMoves(loadMovesCache());
 }
 
 export async function upsertMove(move) {
   const savedMove = await saveMoveRemote(move);
   const current = readMoves().filter((item) => item.id !== savedMove.id);
-  movesCache = sortMoves([savedMove, ...current]);
-  return movesCache;
+  return persistMovesCache([savedMove, ...current]);
 }
 
 export async function removeMove(moveId) {
@@ -315,8 +339,7 @@ export async function removeMove(moveId) {
     throw new Error(`Move delete failed with ${response.status}`);
   }
 
-  movesCache = readMoves().filter((move) => move.id !== moveId);
-  return movesCache;
+  return persistMovesCache(readMoves().filter((move) => move.id !== moveId));
 }
 
 export function updateMoveProgress(moveId, progressMinute) {
@@ -338,8 +361,7 @@ export function updateMoveProgress(moveId, progressMinute) {
     };
   });
 
-  movesCache = nextMoves;
-  return nextMoves;
+  return persistMovesCache(nextMoves);
 }
 
 export async function persistMoveSession(moveId, sessionState) {

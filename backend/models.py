@@ -164,6 +164,7 @@ class MoveRecord(Base):
     id: Mapped[str] = mapped_column(String, primary_key=True)
     manager_id: Mapped[str] = mapped_column(String, nullable=False, index=True)
     created_by_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
+    summary_payload: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     payload: Mapped[dict] = mapped_column(JSON, nullable=False)
 
 
@@ -172,7 +173,6 @@ class ManagerResourceState(Base):
 
     manager_id: Mapped[str] = mapped_column(String, primary_key=True)
     fleet: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
-    workers: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
 
 
 class RigInventoryState(Base):

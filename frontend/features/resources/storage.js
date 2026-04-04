@@ -1,4 +1,5 @@
 import { DEFAULT_TRUCK_SETUP } from "../../lib/constants.js";
+import { MANAGER_RESOURCES_STORAGE_KEY } from "../../lib/constants.js";
 
 const DEFAULT_MANAGER_FLEETS = {
   "manager-nasser": [
@@ -8,37 +9,25 @@ const DEFAULT_MANAGER_FLEETS = {
   ],
 };
 
-const DEFAULT_MANAGER_WORKERS = {
-  "manager-nasser": {
-    assistant_driller: { count: 1, hourlyCost: 28 },
-    bop_tech: { count: 1, hourlyCost: 34 },
-    camp_foreman: { count: 1, hourlyCost: 24 },
-    crane_operator: { count: 2, hourlyCost: 30 },
-    derrickman: { count: 1, hourlyCost: 26 },
-    driller: { count: 1, hourlyCost: 32 },
-    electrician: { count: 3, hourlyCost: 34 },
-    floorman: { count: 8, hourlyCost: 20 },
-    forklift_crane_operator: { count: 2, hourlyCost: 28 },
-    mechanic: { count: 3, hourlyCost: 36 },
-    operator: { count: 1, hourlyCost: 24 },
-    pumpman_mechanic: { count: 1, hourlyCost: 36 },
-    rigger: { count: 4, hourlyCost: 22 },
-    roustabout: { count: 8, hourlyCost: 18 },
-    welder: { count: 2, hourlyCost: 32 },
-    yard_foreman: { count: 2, hourlyCost: 26 },
-  },
-};
-
-const LEGACY_WORKER_ROLE_ALIASES = {
-  floor_men: "floorman",
-  floormen: "floorman",
-  roustabouts: "roustabout",
-  electricians: "electrician",
-  mechanics: "mechanic",
-  welders: "welder",
-};
-
 const managerResourceCache = new Map();
+
+function readStoredManagerResources() {
+  try {
+    const stored = window.localStorage.getItem(MANAGER_RESOURCES_STORAGE_KEY);
+    return stored ? JSON.parse(stored) : {};
+  } catch {
+    return {};
+  }
+}
+
+function persistManagerResources() {
+  try {
+    const serialized = Object.fromEntries(managerResourceCache.entries());
+    window.localStorage.setItem(MANAGER_RESOURCES_STORAGE_KEY, JSON.stringify(serialized));
+  } catch {
+    // Ignore storage failures and keep runtime cache.
+  }
+}
 
 function getDefaultTruckHourlyCost(type) {
   const normalizedType = String(type || "").trim().toLowerCase();
@@ -65,94 +54,25 @@ function normalizeFleet(fleet) {
   return (fleet || []).map(normalizeFleetEntry).filter((entry) => entry.type);
 }
 
-function normalizeWorkerCount(count) {
-  return Math.max(0, Number.parseInt(count, 10) || 0);
-}
-
-function normalizeHourlyCost(cost) {
-  return Math.max(0, Number.parseFloat(cost) || 0);
-}
-
-function normalizeWorkerRoleEntry(value, defaults = {}) {
-  if (value && typeof value === "object" && !Array.isArray(value)) {
-    const parsedHourlyCost = normalizeHourlyCost(value.hourlyCost ?? defaults.hourlyCost);
-    return {
-      count: normalizeWorkerCount(value.count ?? value.available ?? defaults.count),
-      hourlyCost: parsedHourlyCost > 0 ? parsedHourlyCost : normalizeHourlyCost(defaults.hourlyCost),
-    };
-  }
-
-  return {
-    count: normalizeWorkerCount(value ?? defaults.count),
-    hourlyCost: normalizeHourlyCost(defaults.hourlyCost),
-  };
-}
-
-function normalizeWorkerRoles(value, managerId) {
-  const defaults = DEFAULT_MANAGER_WORKERS[managerId] || {
-    assistant_driller: { count: 1, hourlyCost: 28 },
-    bop_tech: { count: 1, hourlyCost: 34 },
-    camp_foreman: { count: 1, hourlyCost: 24 },
-    crane_operator: { count: 2, hourlyCost: 30 },
-    derrickman: { count: 1, hourlyCost: 26 },
-    driller: { count: 1, hourlyCost: 32 },
-    electrician: { count: 2, hourlyCost: 34 },
-    floorman: { count: 4, hourlyCost: 20 },
-    forklift_crane_operator: { count: 2, hourlyCost: 28 },
-    mechanic: { count: 2, hourlyCost: 36 },
-    operator: { count: 1, hourlyCost: 24 },
-    pumpman_mechanic: { count: 1, hourlyCost: 36 },
-    rigger: { count: 2, hourlyCost: 22 },
-    roustabout: { count: 4, hourlyCost: 18 },
-    welder: { count: 2, hourlyCost: 32 },
-    yard_foreman: { count: 1, hourlyCost: 26 },
-  };
-
-  if (value && typeof value === "object" && !Array.isArray(value)) {
-    const canonicalValue = Object.entries(value).reduce((roles, [roleId, roleValue]) => {
-      const normalizedRoleId = LEGACY_WORKER_ROLE_ALIASES[roleId] || roleId;
-      const existing = roles[normalizedRoleId] || {};
-      const current = normalizeWorkerRoleEntry(roleValue, defaults[normalizedRoleId] || {});
-      roles[normalizedRoleId] = {
-        count: (existing.count || 0) + current.count,
-        hourlyCost: current.hourlyCost || existing.hourlyCost || normalizeHourlyCost(defaults[normalizedRoleId]?.hourlyCost),
-      };
-      return roles;
-    }, {});
-
-    const normalized = Object.keys(defaults).reduce((roles, roleId) => {
-      roles[roleId] = normalizeWorkerRoleEntry(canonicalValue[roleId], defaults[roleId]);
-      return roles;
-    }, {});
-
-    if (Object.keys(normalized).some((roleId) => normalized[roleId].count > 0 || normalized[roleId].hourlyCost > 0)) {
-      return normalized;
-    }
-  }
-
-  const legacy = normalizeWorkerCount(value);
-  if (legacy > 0) {
-    return Object.keys(defaults).reduce((roles, roleId, index) => {
-      const baseline = defaults[roleId] || {};
-      roles[roleId] = {
-        count: index === 0 ? Math.max(legacy, normalizeWorkerCount(baseline.count)) : normalizeWorkerCount(baseline.count),
-        hourlyCost: normalizeHourlyCost(baseline.hourlyCost),
-      };
-      return roles;
-    }, {});
-  }
-
-  return Object.keys(defaults).reduce((roles, roleId) => {
-    roles[roleId] = normalizeWorkerRoleEntry(defaults[roleId], defaults[roleId]);
-    return roles;
-  }, {});
-}
-
 function normalizeManagerResources(managerId, resources = {}) {
   return {
     fleet: normalizeFleet(resources.fleet || DEFAULT_MANAGER_FLEETS[managerId] || DEFAULT_TRUCK_SETUP),
-    workers: normalizeWorkerRoles(resources.workers, managerId),
   };
+}
+
+function ensureManagerResourceCache(managerId) {
+  if (!managerId || managerResourceCache.has(managerId)) {
+    return managerResourceCache.get(managerId) || null;
+  }
+
+  const storedResources = readStoredManagerResources();
+  if (storedResources?.[managerId]) {
+    const normalized = normalizeManagerResources(managerId, storedResources[managerId]);
+    managerResourceCache.set(managerId, normalized);
+    return normalized;
+  }
+
+  return null;
 }
 
 function normalizeTypeKey(type) {
@@ -160,12 +80,12 @@ function normalizeTypeKey(type) {
 }
 
 export function getDefaultManagerFleet(managerId) {
-  return normalizeFleet(DEFAULT_MANAGER_FLETS[managerId] || DEFAULT_TRUCK_SETUP);
+  return normalizeFleet(DEFAULT_MANAGER_FLEETS[managerId] || DEFAULT_TRUCK_SETUP);
 }
 
 export async function hydrateManagerResources(managerId) {
   if (!managerId) {
-    return { fleet: [], workers: {} };
+    return { fleet: [] };
   }
 
   const response = await fetch(`/api/manager-resources/${encodeURIComponent(managerId)}`);
@@ -176,18 +96,17 @@ export async function hydrateManagerResources(managerId) {
   const payload = await response.json();
   const normalized = normalizeManagerResources(managerId, payload);
   managerResourceCache.set(managerId, normalized);
+  persistManagerResources();
   return normalized;
 }
 
 export function readManagerFleet(managerId) {
-  return managerResourceCache.get(managerId)?.fleet || getDefaultManagerFleet(managerId);
+  return ensureManagerResourceCache(managerId)?.fleet || getDefaultManagerFleet(managerId);
 }
 
 export async function writeManagerFleet(managerId, fleet) {
-  const current = managerResourceCache.get(managerId) || normalizeManagerResources(managerId, {});
   const normalized = {
     fleet: normalizeFleet(fleet),
-    workers: normalizeWorkerRoles(current.workers, managerId),
   };
 
   const response = await fetch(`/api/manager-resources/${encodeURIComponent(managerId)}`, {
@@ -203,6 +122,7 @@ export async function writeManagerFleet(managerId, fleet) {
   }
 
   managerResourceCache.set(managerId, normalized);
+  persistManagerResources();
   return normalized.fleet;
 }
 
@@ -247,60 +167,6 @@ export function buildFleetAvailability({ managerFleet, moves, currentMoveId = nu
   return [...remainingByType.values()];
 }
 
-export function readManagerWorkers(managerId) {
-  return managerResourceCache.get(managerId)?.workers || normalizeWorkerRoles(null, managerId);
-}
-
-export async function writeManagerWorkers(managerId, workers) {
-  const current = managerResourceCache.get(managerId) || normalizeManagerResources(managerId, {});
-  const normalized = {
-    fleet: normalizeFleet(current.fleet),
-    workers: normalizeWorkerRoles(workers, managerId),
-  };
-
-  const response = await fetch(`/api/manager-resources/${encodeURIComponent(managerId)}`, {
-    method: "PUT",
-    headers: {
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify(normalized),
-  });
-
-  if (!response.ok) {
-    throw new Error(`Manager workers save failed with ${response.status}`);
-  }
-
-  managerResourceCache.set(managerId, normalized);
-  return normalized.workers;
-}
-
-export function buildWorkerAvailability({ totalWorkers, moves, currentMoveId = null, managerId = "manager-nasser" }) {
-  const normalizedWorkers = normalizeWorkerRoles(totalWorkers, managerId);
-  const total = Object.values(normalizedWorkers).reduce((sum, role) => sum + normalizeWorkerCount(role.count), 0);
-  const dayShift = Math.ceil(total / 2);
-  const nightShift = Math.max(0, total - dayShift);
-  const totalHourlyCost = Object.values(normalizedWorkers).reduce(
-    (sum, role) => sum + (normalizeWorkerCount(role.count) * normalizeHourlyCost(role.hourlyCost)),
-    0,
-  );
-  const allocated = (moves || []).reduce((sum, move) => {
-    if (!move || move.id === currentMoveId || move.executionState !== "active") {
-      return sum;
-    }
-    return sum + Math.max(0, Number.parseInt(move.simulation?.workerCount, 10) || 0);
-  }, 0);
-
-  return {
-    total,
-    roles: normalizedWorkers,
-    dayShift,
-    nightShift,
-    averageHourlyCost: total > 0 ? totalHourlyCost / total : 0,
-    allocated,
-    available: Math.max(0, total - allocated),
-  };
-}
-
 export function getAvailabilityValidationError(truckSetup, availability) {
   const requestedByType = new Map();
 
@@ -319,7 +185,7 @@ export function getAvailabilityValidationError(truckSetup, availability) {
   for (const [typeKey, requested] of requestedByType.entries()) {
     const matched = (availability || []).find((resource) => normalizeTypeKey(resource.type) === typeKey);
     if (!matched && requested > 0) {
-      return `Requested truck type is not available in the manager fleet.`;
+      return "Requested truck type is not available in the manager fleet.";
     }
   }
 

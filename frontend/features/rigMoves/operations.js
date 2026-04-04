@@ -12,6 +12,16 @@ function normalizeTruckTypes(value) {
     .filter(Boolean);
 }
 
+function parseDependencyCodes(value) {
+  if (Array.isArray(value)) {
+    return value.map((item) => String(item || "").trim()).filter(Boolean);
+  }
+
+  return [...String(value || "").matchAll(/\b(?:RL|SU)-\d+(?:-L\d+)?\b/gi)]
+    .map((match) => String(match[0] || "").trim().toUpperCase())
+    .filter(Boolean);
+}
+
 function getRigLabel(move) {
   return move?.endLabel || move?.name || "Unnamed rig";
 }
@@ -81,6 +91,7 @@ export function buildStartupTransferLoads(startupLoads = [], supportRouteMap = {
 
         return {
           id: syntheticId,
+          code: `${load.id}-X${sourceIndex + 1}-${itemIndex + 1}`,
           key: `startup-transfer-${load.id}-${source.moveId}-${sourceIndex}-${itemIndex}`,
           supportRouteKey,
           description: `${load.description} transfer from ${source.rigLabel}`,
@@ -104,6 +115,9 @@ export function buildStartupTransferLoads(startupLoads = [], supportRouteMap = {
           routeMinutes: supportRoute?.routeMinutes || null,
           routeDistanceKm: supportRoute?.routeDistanceKm || null,
           routeGeometry: supportRoute?.geometry || null,
+          rig_down_dependency_codes: load.rig_down_dependency_codes || [],
+          rig_up_dependency_codes: load.rig_up_dependency_codes || [],
+          source_kind: "startup",
           dependency_ids: [],
         };
       }),
@@ -139,6 +153,8 @@ function normalizeStartupRequirements(startupRequirements = []) {
     dependencyLabel: load.dependencyLabel || "Standalone startup load",
     isReusable: Boolean(load.isReusable),
     avg_rig_up_minutes: Number.parseInt(load.avg_rig_up_minutes, 10) || null,
+    rig_down_dependency_codes: parseDependencyCodes(load.rig_down_dependency_codes || load.dependencyLabel),
+    rig_up_dependency_codes: parseDependencyCodes(load.rig_up_dependency_codes || load.dependencyLabel),
   }));
 }
 

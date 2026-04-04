@@ -1,9 +1,11 @@
 from pathlib import Path
+import time
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 from flask import Flask, jsonify, request, send_from_directory
+from sqlalchemy import text
 from sqlalchemy.orm import selectinload
 
 from database import SessionLocal
@@ -16,13 +18,18 @@ from models import (
     RigInventoryState,
     TruckSpec,
 )
-from planning_dataset import get_worker_roles
 
 
 FRONTEND_DIR = Path(__file__).resolve().parent.parent / "frontend"
 
 app = Flask(__name__, static_folder=str(FRONTEND_DIR), static_url_path="")
 STATE_TABLES_READY = False
+
+
+def log_timing(endpoint, started_at, **fields):
+    elapsed_ms = round((time.perf_counter() - started_at) * 1000, 1)
+    details = " ".join(f"{key}={value}" for key, value in fields.items())
+    print(f"[timing] endpoint={endpoint} elapsed_ms={elapsed_ms}{(' ' + details) if details else ''}", flush=True)
 
 
 def resolve_location_label(lat, lng):
@@ -221,6 +228,9 @@ def ensure_state_tables():
     from database import Base, engine
 
     Base.metadata.create_all(bind=engine)
+    with engine.begin() as connection:
+        connection.execute(text("ALTER TABLE move_records ADD COLUMN IF NOT EXISTS summary_payload JSON"))
+        connection.execute(text("ALTER TABLE manager_resource_states DROP COLUMN IF EXISTS workers"))
     STATE_TABLES_READY = True
 
 
@@ -229,42 +239,6 @@ def initialize_app_state_tables():
 
 
 def get_default_resource_state(manager_id):
-    default_worker_counts = {
-        "assistant_driller": 1,
-        "bop_tech": 1,
-        "camp_foreman": 1,
-        "crane_operator": 2,
-        "derrickman": 1,
-        "driller": 1,
-        "electrician": 3,
-        "floorman": 8,
-        "forklift_crane_operator": 2,
-        "mechanic": 3,
-        "operator": 1,
-        "pumpman_mechanic": 1,
-        "rigger": 4,
-        "roustabout": 8,
-        "welder": 2,
-        "yard_foreman": 2,
-    }
-    default_worker_rates = {
-        "assistant_driller": 28,
-        "bop_tech": 34,
-        "camp_foreman": 24,
-        "crane_operator": 30,
-        "derrickman": 26,
-        "driller": 32,
-        "electrician": 34,
-        "floorman": 20,
-        "forklift_crane_operator": 28,
-        "mechanic": 36,
-        "operator": 24,
-        "pumpman_mechanic": 36,
-        "rigger": 22,
-        "roustabout": 18,
-        "welder": 32,
-        "yard_foreman": 26,
-    }
     defaults = {
         "manager-nasser": {
             "fleet": [
@@ -272,16 +246,54 @@ def get_default_resource_state(manager_id):
                 {"id": "flatbed", "type": "Flat-bed", "count": 4, "hourlyCost": 105},
                 {"id": "low-bed", "type": "Low-bed", "count": 3, "hourlyCost": 155},
             ],
-            "workers": {
-                role["id"]: {
-                    "count": default_worker_counts.get(role["id"], 0),
-                    "hourlyCost": default_worker_rates.get(role["id"], 0),
-                }
-                for role in get_worker_roles()
-            },
         }
     }
-    return defaults.get(manager_id, {"fleet": [], "workers": {}})
+    return defaults.get(manager_id, {"fleet": []})
+
+
+def build_move_summary(payload):
+    simulation = payload.get("simulation") or {}
+    best_plan = simulation.get("bestPlan") or {}
+
+    return {
+        "id": payload.get("id"),
+        "name": payload.get("name"),
+        "createdAt": payload.get("createdAt"),
+        "updatedAt": payload.get("updatedAt"),
+        "createdBy": payload.get("createdBy") or {},
+        "routeMode": payload.get("routeMode"),
+        "loadCount": payload.get("loadCount") or 0,
+        "startPoint": payload.get("startPoint"),
+        "endPoint": payload.get("endPoint"),
+        "startLabel": payload.get("startLabel"),
+        "endLabel": payload.get("endLabel"),
+        "routeKm": payload.get("routeKm"),
+        "eta": payload.get("eta"),
+        "routeTime": payload.get("routeTime"),
+        "planningStartDate": payload.get("planningStartDate"),
+        "planningStartTime": payload.get("planningStartTime"),
+        "progressMinute": payload.get("progressMinute") or 0,
+        "completionPercentage": payload.get("completionPercentage") or 0,
+        "executionState": payload.get("executionState") or "planning",
+        "operatingState": payload.get("operatingState") or "standby",
+        "executionProgress": payload.get("executionProgress") or {},
+        "truckSetup": payload.get("truckSetup") or simulation.get("truckSetup") or [],
+        "simulation": {
+            "truckCount": simulation.get("truckCount") or best_plan.get("truckCount") or 0,
+            "truckSetup": simulation.get("truckSetup") or [],
+            "routeMinutes": simulation.get("routeMinutes"),
+            "preferredScenarioName": simulation.get("preferredScenarioName") or "",
+        },
+    }
+
+
+def ensure_record_summary(record):
+    if record.summary_payload:
+        return record.summary_payload
+
+    summary_payload = build_move_summary(record.payload or {})
+    record.summary_payload = summary_payload
+    return summary_payload
 
 
 @app.get("/api/dataset-status")
@@ -299,15 +311,50 @@ def get_dataset_status():
 
 @app.get("/api/moves")
 def get_moves():
+    started_at = time.perf_counter()
     manager_id = request.args.get("managerId", type=str)
+    summary = request.args.get("summary", default="0", type=str) == "1"
 
     session = SessionLocal()
     try:
         query = session.query(MoveRecord)
         if manager_id:
             query = query.filter(MoveRecord.manager_id == manager_id)
+        if summary:
+            summary_rows = query.with_entities(MoveRecord.id, MoveRecord.summary_payload).all()
+            missing_ids = [move_id for move_id, summary_payload in summary_rows if not summary_payload]
+            summary_by_id = {move_id: summary_payload for move_id, summary_payload in summary_rows if summary_payload}
+
+            if missing_ids:
+                missing_records = session.query(MoveRecord).filter(MoveRecord.id.in_(missing_ids)).all()
+                for record in missing_records:
+                    summary_by_id[record.id] = ensure_record_summary(record)
+                session.commit()
+
+            response = jsonify([summary_by_id.get(move_id) for move_id, _ in summary_rows if summary_by_id.get(move_id)])
+            log_timing("/api/moves", started_at, manager_id=manager_id, summary=1, records=len(summary_rows))
+            return response
+
         records = query.all()
-        return jsonify([record.payload for record in records])
+        response = jsonify([record.payload for record in records])
+        log_timing("/api/moves", started_at, manager_id=manager_id, summary=0, records=len(records))
+        return response
+    finally:
+        session.close()
+
+
+@app.get("/api/moves/<move_id>")
+def get_move(move_id):
+    started_at = time.perf_counter()
+    session = SessionLocal()
+    try:
+        record = session.get(MoveRecord, move_id)
+        if not record:
+            log_timing("/api/moves/<move_id>", started_at, move_id=move_id, found=0)
+            return jsonify({"error": "move not found"}), 404
+        response = jsonify(record.payload)
+        log_timing("/api/moves/<move_id>", started_at, move_id=move_id, found=1)
+        return response
     finally:
         session.close()
 
@@ -332,12 +379,14 @@ def put_move(move_id):
                 id=move_id,
                 manager_id=manager_id,
                 created_by_id=created_by.get("id"),
+                summary_payload=build_move_summary(move),
                 payload=move,
             )
             session.add(record)
         else:
             record.manager_id = manager_id
             record.created_by_id = created_by.get("id")
+            record.summary_payload = build_move_summary(move)
             record.payload = move
         session.commit()
         return jsonify(record.payload)
@@ -360,6 +409,7 @@ def delete_move(move_id):
 
 @app.get("/api/manager-resources/<manager_id>")
 def get_manager_resources(manager_id):
+    started_at = time.perf_counter()
     session = SessionLocal()
     try:
         record = session.get(ManagerResourceState, manager_id)
@@ -368,11 +418,17 @@ def get_manager_resources(manager_id):
             record = ManagerResourceState(
                 manager_id=manager_id,
                 fleet=defaults["fleet"],
-                workers=defaults["workers"],
             )
             session.add(record)
             session.commit()
-        return jsonify({"fleet": record.fleet or [], "workers": record.workers or {}})
+        response = jsonify({"fleet": record.fleet or []})
+        log_timing(
+            "/api/manager-resources/<manager_id>",
+            started_at,
+            manager_id=manager_id,
+            fleet=len(record.fleet or []),
+        )
+        return response
     finally:
         session.close()
 
@@ -381,21 +437,19 @@ def get_manager_resources(manager_id):
 def put_manager_resources(manager_id):
     payload = request.get_json(silent=True) or {}
     fleet = payload.get("fleet")
-    workers = payload.get("workers")
-    if not isinstance(fleet, list) or not isinstance(workers, dict):
-        return jsonify({"error": "fleet list and workers object are required"}), 400
+    if not isinstance(fleet, list):
+        return jsonify({"error": "fleet list is required"}), 400
 
     session = SessionLocal()
     try:
         record = session.get(ManagerResourceState, manager_id)
         if not record:
-            record = ManagerResourceState(manager_id=manager_id, fleet=fleet, workers=workers)
+            record = ManagerResourceState(manager_id=manager_id, fleet=fleet)
             session.add(record)
         else:
             record.fleet = fleet
-            record.workers = workers
         session.commit()
-        return jsonify({"fleet": record.fleet, "workers": record.workers})
+        return jsonify({"fleet": record.fleet})
     finally:
         session.close()
 
@@ -444,11 +498,6 @@ def get_startup_loads():
 @app.get("/api/truck-specs")
 def get_truck_specs():
     return jsonify(get_active_dataset()["truck_specs"])
-
-
-@app.get("/api/worker-roles")
-def get_worker_role_definitions():
-    return jsonify(get_worker_roles())
 
 
 @app.get("/api/location-label")
