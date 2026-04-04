@@ -5,34 +5,224 @@ import { Card, StatCard } from "../components/ui/Card.js";
 import { ProgressBar } from "../components/ui/ProgressBar.js";
 import { Field, TextInput } from "../components/ui/Field.js";
 import { Modal } from "../components/ui/Modal.js";
-import { SimulationScene3D } from "../components/map/SimulationScene3D.js";
-import { LeafletMap } from "../components/map/LeafletMap.js";
 import { formatLocationLabel, formatMinutes } from "../lib/format.js";
 import { buildScenarioPlans } from "../features/rigMoves/simulation.js";
+import { buildOperatingSnapshot, buildStartupTransferSchedule } from "../features/rigMoves/operations.js";
 import { persistMoveSession } from "../features/rigMoves/storage.js";
 
 const { useDeferredValue, useEffect, useMemo, useRef, useState } = React;
 
-function normalizeTruckTypeLabel(type) {
-  const normalized = String(type || "").trim().toLowerCase();
-  if (normalized === "support") {
-    return "Low bed";
-  }
-  return type || "Truck";
+function normalizeTruckTypeKey(type) {
+  return String(type || "")
+    .toLowerCase()
+    .replace(/[^a-z]/g, "");
 }
 
-function normalizeTruckSetup(move) {
-  const source = move?.truckSetup?.length ? move.truckSetup : move?.simulation?.truckSetup || [];
+function normalizeTruckTypeLabel(type) {
+  const normalized = normalizeTruckTypeKey(type);
+  if (normalized === "support" || normalized === "lowbed") {
+    return "Low-bed";
+  }
+  if (normalized === "flatbed") {
+    return "Flat-bed";
+  }
+  if (normalized === "heavyhaul" || normalized === "heavyhauler") {
+    return "Heavy Hauler";
+  }
+  return String(type || "").trim() || "Truck";
+}
 
-  if (source.length) {
-    return source.map((item, index) => ({
-      id: item.id || `truck-${index + 1}`,
-      type: normalizeTruckTypeLabel(item.type),
-      count: String(Math.max(1, Number.parseInt(item.count, 10) || 1)),
-    }));
+function getTruckShortLabel(type) {
+  const normalized = normalizeTruckTypeLabel(type);
+  if (normalized === "Heavy Hauler") {
+    return "HH";
+  }
+  if (normalized === "Flat-bed") {
+    return "Flat";
+  }
+  if (normalized === "Low-bed") {
+    return "Low";
+  }
+  return normalized;
+}
+
+function getLoadDisplayLabel(entity) {
+  const loadCode = entity?.loadCode || entity?.code;
+  if (loadCode) {
+    return String(loadCode);
+  }
+  const loadId = entity?.loadId ?? entity?.id;
+  return `#${loadId}`;
+}
+
+function formatTruckMixSummary(truckSetup = []) {
+  const parts = (truckSetup || [])
+    .filter((truck) => Math.max(0, Number.parseInt(truck?.count, 10) || 0) > 0)
+    .map((truck) => `${getTruckShortLabel(truck.type)} x${Math.max(0, Number.parseInt(truck.count, 10) || 0)}`);
+
+  return parts.join(", ") || "No trucks";
+}
+
+function getFleetCapacityForType(availableFleet, truckType) {
+  const normalizedTruckType = normalizeTruckTypeKey(truckType);
+  const matched = (availableFleet || []).find(
+    (truck) => normalizeTruckTypeKey(truck?.type) === normalizedTruckType,
+  );
+
+  return Math.max(0, Number.parseInt(matched?.available ?? matched?.count, 10) || 0);
+}
+
+function normalizeWorkerRoleDraft(availableWorkers, workerRoles = []) {
+  const configuredRoles = availableWorkers?.roles || {};
+  const roleDefinitions = workerRoles.length
+    ? workerRoles
+    : Object.keys(configuredRoles).map((roleId) => ({ id: roleId, label: getWorkerRoleLabel(roleId) }));
+
+  return roleDefinitions.reduce((roles, roleDefinition) => {
+    const roleId = roleDefinition.id;
+    const configuredRole = configuredRoles[roleId] || {};
+    roles[roleId] = {
+      count: Math.max(0, Number.parseInt(configuredRole?.count, 10) || 0),
+      hourlyCost: Math.max(0, Number(configuredRole?.hourlyCost) || 0),
+      label: roleDefinition.label || configuredRole?.label || getWorkerRoleLabel(roleId),
+    };
+    return roles;
+  }, {});
+}
+
+function getWorkerRoleLabel(roleId) {
+  return String(roleId || "")
+    .split("_")
+    .filter(Boolean)
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(" ");
+}
+
+function getWorkerRoleShortLabel(roleId, fallbackLabel = "") {
+  const label = fallbackLabel || getWorkerRoleLabel(roleId);
+  const shortLabels = {
+    assistant_driller: "Asst Drlr",
+    bop_tech: "BOP Tech",
+    camp_foreman: "Camp Frm",
+    crane_operator: "Crane Op",
+    derrickman: "Derrick",
+    driller: "Driller",
+    electrician: "Elec",
+    floorman: "Floor",
+    forklift_crane_operator: "FLT/Crane",
+    mechanic: "Mech",
+    operator: "Oper",
+    pumpman_mechanic: "Pump/Mech",
+    rigger: "Rigger",
+    roustabout: "Rstb",
+    welder: "Welder",
+    yard_foreman: "Yd Frm",
+  };
+
+  return shortLabels[roleId] || label;
+}
+
+function formatProgressDuration(ms = 0) {
+  const totalSeconds = Math.max(0, Math.round((Number(ms) || 0) / 1000));
+  if (totalSeconds < 60) {
+    return `${totalSeconds}s`;
   }
 
-  return [{ id: "fleet-default", type: "Heavy Haul", count: String(move?.simulation?.truckCount || 1) }];
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return seconds ? `${minutes}m ${seconds}s` : `${minutes}m`;
+}
+
+function buildWorkerAvailabilityOverride(workerRoleDraft) {
+  const roles = Object.entries(workerRoleDraft || {}).reduce((result, [roleId, role]) => {
+    result[roleId] = {
+      count: Math.max(0, Number.parseInt(role?.count, 10) || 0),
+      hourlyCost: Math.max(0, Number(role?.hourlyCost) || 0),
+    };
+    return result;
+  }, {});
+  const total = Object.values(roles).reduce((sum, role) => sum + role.count, 0);
+  const dayShift = Math.ceil(total / 2);
+  const nightShift = Math.max(0, total - dayShift);
+  const totalHourlyCost = Object.values(roles).reduce((sum, role) => sum + (role.count * role.hourlyCost), 0);
+
+  return {
+    total,
+    available: total,
+    dayShift,
+    nightShift,
+    roles,
+    averageHourlyCost: total > 0 ? totalHourlyCost / total : 0,
+  };
+}
+
+function buildWorkerRoleSummaryRows(playback, availableWorkers, workerRoles = []) {
+  const configuredRoles = availableWorkers?.roles || {};
+  const assignments = playback?.workerAssignments || [];
+  const usedByRole = assignments.reduce((result, assignment) => {
+    const roleId = assignment?.roleId;
+    const workerId = assignment?.workerId;
+    if (!roleId || !workerId) {
+      return result;
+    }
+    if (!result[roleId]) {
+      result[roleId] = new Set();
+    }
+    result[roleId].add(workerId);
+    return result;
+  }, {});
+  const roleDefinitions = workerRoles.length
+    ? workerRoles
+    : Object.keys(configuredRoles).map((roleId) => ({ id: roleId, label: getWorkerRoleLabel(roleId) }));
+  const roleEntries = roleDefinitions.map((roleDefinition) => {
+    const configuredRole = configuredRoles[roleDefinition.id] || {};
+    return {
+      id: roleDefinition.id,
+      label: roleDefinition.label || configuredRole?.label || getWorkerRoleLabel(roleDefinition.id),
+      available: Math.max(0, Number.parseInt(configuredRole?.count, 10) || 0),
+      used: usedByRole[roleDefinition.id]?.size || 0,
+    };
+  });
+
+  if (!roleEntries.length) {
+    return [];
+  }
+  return roleEntries;
+}
+
+function normalizeTruckSetup(move, availableFleet = []) {
+  const source = move?.truckSetup?.length ? move.truckSetup : move?.simulation?.truckSetup || [];
+  const configuredByType = new Map();
+
+  source.forEach((item, index) => {
+    const type = normalizeTruckTypeLabel(item.type);
+    configuredByType.set(normalizeTruckTypeKey(type), {
+      id: item.id || `truck-${index + 1}`,
+      type,
+      count: String(Math.max(0, Number.parseInt(item.count, 10) || 0)),
+      hourlyCost: Math.max(0, Number(item.hourlyCost) || 0),
+    });
+  });
+
+  (availableFleet || []).forEach((item, index) => {
+    const type = normalizeTruckTypeLabel(item.type);
+    const key = normalizeTruckTypeKey(type);
+    if (!configuredByType.has(key)) {
+      configuredByType.set(key, {
+        id: item.id || `fleet-${index + 1}`,
+        type,
+        count: "0",
+        hourlyCost: Math.max(0, Number(item.hourlyCost) || 0),
+      });
+    }
+  });
+
+  const normalized = [...configuredByType.values()].filter((truck) => truck.type.trim());
+  if (normalized.length) {
+    return normalized;
+  }
+
+  return [{ id: "fleet-default", type: "Heavy Hauler", count: String(Math.max(1, move?.simulation?.truckCount || 1)), hourlyCost: 0 }];
 }
 
 function TruckSetupEditor({ truckSetup, onChange, onAddRow, onRemoveRow }) {
@@ -58,7 +248,7 @@ function TruckSetupEditor({ truckSetup, onChange, onAddRow, onRemoveRow }) {
           { label: index === 0 ? "Count" : "" },
           h(TextInput, {
             type: "number",
-            min: "1",
+            min: "0",
             value: truck.count,
             onChange: (event) => onChange(truck.id, "count", event.target.value),
           }),
@@ -83,7 +273,7 @@ function TruckSetupEditor({ truckSetup, onChange, onAddRow, onRemoveRow }) {
   );
 }
 
-function ScenarioBreakdown({ scenarios, activeScenarioName, onSelect }) {
+function ScenarioBreakdown({ scenarios, activeScenarioName, onSelect, disabled = false }) {
   return h(
     "div",
     { className: "scenario-list" },
@@ -94,16 +284,21 @@ function ScenarioBreakdown({ scenarios, activeScenarioName, onSelect }) {
           key: scenario.name,
           type: "button",
           className: `scenario-card${scenario.name === activeScenarioName ? " scenario-card-active" : ""}`,
+          disabled,
           onClick: () => onSelect(scenario.name),
         },
-        h("div", { className: "scenario-head" }, h("strong", null, scenario.name), h("span", null, formatMinutes(scenario.totalMinutes))),
-        h("p", { className: "muted-copy" }, `${scenario.truckCount} trucks - ${scenario.bestVariant?.name || "Best route order"}`),
+        h("div", { className: "scenario-head" }, h("strong", null, scenario.name), h("span", null, formatDaysHours(scenario.totalMinutes))),
+        h(
+          "p",
+          { className: "muted-copy" },
+          `${formatTruckMixSummary(scenario.allocatedTruckSetup || scenario.truckSetup || [])} - ${scenario.workerCount} workers`,
+        ),
       ),
     ),
   );
 }
 
-function PlanSwitcher({ scenarios, activePlanKey, onSelect }) {
+function PlanSwitcher({ scenarios, activePlanKey, onSelect, includeCustomize = true, disabled = false }) {
   return h(
     "nav",
     { className: "plan-switcher", "aria-label": "Move plans" },
@@ -111,9 +306,9 @@ function PlanSwitcher({ scenarios, activePlanKey, onSelect }) {
       ...scenarios.map((scenario) => ({
         key: scenario.name,
         label: scenario.name,
-        meta: `${scenario.truckCount} trucks`,
+        meta: formatTruckMixSummary(scenario.allocatedTruckSetup || scenario.truckSetup || []),
       })),
-      { key: "customize", label: "Customize", meta: "Manual" },
+      ...(includeCustomize ? [{ key: "customize", label: "Customize", meta: "Manual" }] : []),
     ].map((item) =>
       h(
         "button",
@@ -121,6 +316,7 @@ function PlanSwitcher({ scenarios, activePlanKey, onSelect }) {
           key: item.key,
           type: "button",
           className: `plan-switcher-button${item.key === activePlanKey ? " active" : ""}`,
+          disabled,
           onClick: () => onSelect(item.key),
         },
         h("span", { className: "plan-switcher-label" }, item.label),
@@ -130,8 +326,99 @@ function PlanSwitcher({ scenarios, activePlanKey, onSelect }) {
   );
 }
 
+function StartupLoadsPanel({ startupLoads, title, emptyCopy }) {
+  if (!startupLoads?.length) {
+    return h("p", { className: "muted-copy" }, emptyCopy || "No startup loads are configured.");
+  }
+
+  return h(
+    "div",
+    { className: "manager-rig-list" },
+    startupLoads.map((load) =>
+      h(
+        "article",
+        {
+          key: load.id,
+          className: `manager-rig-card startup-load-card startup-load-card-${load.readiness}`,
+        },
+        h(
+          "div",
+          { className: "manager-rig-head" },
+          h(
+            "div",
+            null,
+            h("strong", null, load.description),
+            h("p", { className: "muted-copy" }, `${load.id} • ${load.count} loads needed`),
+          ),
+          h("span", { className: "section-pill" }, load.readiness === "covered" ? "Covered" : load.readiness === "partial" ? "Partial" : "Missing"),
+        ),
+        h(
+          "div",
+          { className: "manager-rig-stats" },
+          h("div", { className: "manager-rig-stat" }, h("span", null, "Sourced"), h("strong", null, String(load.coveredCount))),
+          h("div", { className: "manager-rig-stat" }, h("span", null, "Missing"), h("strong", null, String(load.missingCount))),
+          h("div", { className: "manager-rig-stat" }, h("span", null, "Priority"), h("strong", null, `P${load.priority}`)),
+          h("div", { className: "manager-rig-stat" }, h("span", null, "Truck"), h("strong", null, load.truckTypes.join(" / "))),
+        ),
+        h("p", { className: "muted-copy" }, load.dependencyLabel),
+        load.sourcingPlan?.length
+          ? h(
+              "div",
+              { className: "manager-note-list" },
+              h("p", { className: "muted-copy" }, "Suggested source rigs"),
+              ...load.sourcingPlan.map((source) =>
+                h(
+                  "div",
+                  { key: `${load.id}-${source.moveId}`, className: "truck-count-row" },
+                  h("span", null, source.rigLabel),
+                  h("strong", null, `${source.assigned}/${source.available}`),
+                ),
+              ),
+            )
+          : h("p", { className: "muted-copy" }, "No completed donor rig is available yet for this load."),
+      ),
+    ),
+  );
+}
+
+function ReusableLoadStockPanel({ reusableInventory }) {
+  if (!reusableInventory?.length) {
+    return h("p", { className: "muted-copy" }, "Reusable rig loads will appear here after the move data is ready.");
+  }
+
+  return h(
+    "div",
+    { className: "manager-rig-list" },
+    reusableInventory.map((item) =>
+      h(
+        "article",
+        { key: item.id, className: "manager-rig-card" },
+        h(
+          "div",
+          { className: "manager-rig-head" },
+          h(
+            "div",
+            null,
+            h("strong", null, item.description),
+            h("p", { className: "muted-copy" }, item.category),
+          ),
+          h("span", { className: "section-pill" }, `${item.count} loads`),
+        ),
+        h(
+          "div",
+          { className: "manager-rig-stats" },
+          h("div", { className: "manager-rig-stat" }, h("span", null, "Reusable"), h("strong", null, String(item.count))),
+          h("div", { className: "manager-rig-stat" }, h("span", null, "Truck"), h("strong", null, item.truckTypes.join(" / ") || "Assigned in plan")),
+          h("div", { className: "manager-rig-stat" }, h("span", null, "Critical"), h("strong", null, item.isCritical ? "Yes" : "No")),
+        ),
+      ),
+    ),
+  );
+}
+
 function countRoundTrips(playback) {
-  return (playback?.trips || []).filter((trip) => trip.returnToSource !== null).length;
+  const journeys = playback?.journeys?.length ? playback.journeys : (playback?.trips || []);
+  return journeys.filter((trip) => trip.returnToSource !== null).length;
 }
 
 function getPlanSummary(scenario) {
@@ -155,29 +442,216 @@ function formatCurrency(value) {
   }).format(Math.max(0, value));
 }
 
+function getPlaybackTasks(playback) {
+  const directTasks = playback?.tasks || [];
+  if (directTasks.length) {
+    return directTasks.map((task) => ({
+      ...task,
+      predecessorIds: [...(task.predecessorIds || [])],
+      earliestStart: task.earliestStart ?? task.startMinute ?? 0,
+      earliestFinish: task.earliestFinish ?? task.endMinute ?? 0,
+      latestStart: task.latestStart ?? ((task.startMinute ?? 0) + (task.slack ?? 0)),
+      latestFinish: task.latestFinish ?? ((task.endMinute ?? 0) + (task.slack ?? 0)),
+      slack: task.slack ?? 0,
+      isCritical: Boolean(task.isCritical),
+    }));
+  }
+
+  const trips = playback?.trips || [];
+  return trips.flatMap((trip) => {
+    const loadCode = trip.loadCode || `#${trip.loadId}`;
+    const description = trip.description || `Load ${loadCode}`;
+    const rigDownStart = trip.rigDownStart ?? trip.loadStart ?? 0;
+    const rigDownFinish = trip.rigDownFinish ?? rigDownStart;
+    const pickupLoadStart = trip.pickupLoadStart ?? rigDownFinish;
+    const pickupLoadFinish = trip.pickupLoadFinish ?? pickupLoadStart;
+    const moveStart = trip.moveStart ?? pickupLoadFinish;
+    const arrivalAtDestination = trip.arrivalAtDestination ?? moveStart;
+    const unloadDropStart = trip.unloadDropStart ?? arrivalAtDestination;
+    const unloadDropFinish = trip.unloadDropFinish ?? unloadDropStart;
+    const rigUpStart = trip.rigUpStart ?? unloadDropFinish;
+    const rigUpFinish = trip.rigUpFinish ?? rigUpStart;
+
+    return [
+      {
+        id: `${trip.loadId}:rig_down`,
+        loadId: trip.loadId,
+        loadCode,
+        description,
+        phase: "rig_down",
+        predecessorIds: [],
+        startMinute: rigDownStart,
+        endMinute: rigDownFinish,
+        earliestStart: rigDownStart,
+        earliestFinish: rigDownFinish,
+        latestStart: rigDownStart,
+        latestFinish: rigDownFinish,
+        slack: 0,
+        isCritical: false,
+      },
+      {
+        id: `${trip.loadId}:pickup_load`,
+        loadId: trip.loadId,
+        loadCode,
+        description,
+        phase: "pickup_load",
+        predecessorIds: [`${trip.loadId}:rig_down`],
+        startMinute: pickupLoadStart,
+        endMinute: pickupLoadFinish,
+        earliestStart: pickupLoadStart,
+        earliestFinish: pickupLoadFinish,
+        latestStart: pickupLoadStart,
+        latestFinish: pickupLoadFinish,
+        slack: 0,
+        isCritical: false,
+      },
+      {
+        id: `${trip.loadId}:haul`,
+        loadId: trip.loadId,
+        loadCode,
+        description,
+        phase: "haul",
+        predecessorIds: [`${trip.loadId}:pickup_load`],
+        startMinute: moveStart,
+        endMinute: arrivalAtDestination,
+        earliestStart: moveStart,
+        earliestFinish: arrivalAtDestination,
+        latestStart: moveStart,
+        latestFinish: arrivalAtDestination,
+        slack: 0,
+        isCritical: false,
+      },
+      {
+        id: `${trip.loadId}:unload_drop`,
+        loadId: trip.loadId,
+        loadCode,
+        description,
+        phase: "unload_drop",
+        predecessorIds: [`${trip.loadId}:haul`],
+        startMinute: unloadDropStart,
+        endMinute: unloadDropFinish,
+        earliestStart: unloadDropStart,
+        earliestFinish: unloadDropFinish,
+        latestStart: unloadDropStart,
+        latestFinish: unloadDropFinish,
+        slack: 0,
+        isCritical: false,
+      },
+      {
+        id: `${trip.loadId}:rig_up`,
+        loadId: trip.loadId,
+        loadCode,
+        description,
+        phase: "rig_up",
+        predecessorIds: [`${trip.loadId}:unload_drop`],
+        startMinute: rigUpStart,
+        endMinute: rigUpFinish,
+        earliestStart: rigUpStart,
+        earliestFinish: rigUpFinish,
+        latestStart: rigUpStart,
+        latestFinish: rigUpFinish,
+        slack: 0,
+        isCritical: false,
+      },
+    ];
+  });
+}
+
+function getEffectiveCriticalTasks(playback) {
+  const tasks = getPlaybackTasks(playback);
+  const criticalTaskIds = new Set(playback?.planningAnalysis?.criticalTaskIds || []);
+  let criticalTasks = tasks
+    .filter((task) => task.isCritical || criticalTaskIds.has(task.id))
+    .sort((left, right) => left.startMinute - right.startMinute || left.loadId - right.loadId);
+
+  if (criticalTasks.length || !tasks.length) {
+    return criticalTasks;
+  }
+
+  const tasksByLoad = new Map();
+  tasks.forEach((task) => {
+    if (!tasksByLoad.has(task.loadId)) {
+      tasksByLoad.set(task.loadId, []);
+    }
+    tasksByLoad.get(task.loadId).push(task);
+  });
+
+  const loadRows = [...tasksByLoad.entries()]
+    .map(([loadId, loadTasks]) => {
+      const orderedTasks = [...loadTasks].sort((left, right) => left.startMinute - right.startMinute || left.endMinute - right.endMinute);
+      const finishMinute = Math.max(...orderedTasks.map((task) => task.endMinute || 0), 0);
+      const startMinute = Math.min(...orderedTasks.map((task) => task.startMinute || 0));
+      return {
+        loadId,
+        startMinute: Number.isFinite(startMinute) ? startMinute : 0,
+        finishMinute,
+        tasks: orderedTasks,
+      };
+    })
+    .sort((left, right) => right.finishMinute - left.finishMinute || left.startMinute - right.startMinute || left.loadId - right.loadId);
+
+  const pivotLoad = loadRows[0];
+  if (!pivotLoad) {
+    return [];
+  }
+
+  return pivotLoad.tasks.map((task) => ({
+    ...task,
+    isCritical: true,
+  }));
+}
+
 function getPlanDashboardStats(scenario, move) {
   const playback = scenario?.bestVariant?.playback;
   const trips = playback?.trips || [];
+  const assignments = playback?.workerAssignments || [];
+  const uniqueAssignedWorkers = new Set(assignments.map((assignment) => assignment.workerId).filter(Boolean)).size;
+  const criticalTasks = getEffectiveCriticalTasks(playback);
+  const criticalLoadIds = new Set(criticalTasks.map((task) => task.loadId));
   const totalMinutes = Math.max(scenario?.totalMinutes || 0, 1);
-  const truckCount = Math.max(1, Number.parseInt(scenario?.truckCount, 10) || 1);
-  const workerCount = Math.max(1, Number.parseInt(scenario?.workerCount, 10) || 1);
-  const activeMinutes = trips.reduce(
-    (sum, trip) => sum + Math.max(0, (trip.returnToSource ?? trip.rigUpFinish ?? trip.arrivalAtDestination) - trip.loadStart),
-    0,
+  const allocatedTruckSetup = scenario?.allocatedTruckSetup || scenario?.truckSetup || [];
+  const usedTruckCount = Math.max(1, Number.parseInt(scenario?.truckCount, 10) || 1);
+  const allocatedTruckCount = Math.max(
+    usedTruckCount,
+    allocatedTruckSetup.reduce((sum, truck) => sum + Math.max(0, Number.parseInt(truck?.count, 10) || 0), 0) ||
+      Number.parseInt(scenario?.allocatedTruckCount, 10) ||
+      usedTruckCount,
   );
-  const utilization = Math.min(100, Math.round((activeMinutes / (truckCount * totalMinutes)) * 100));
-  const costEstimate =
-    (totalMinutes / 60) * truckCount * 185 +
-    (totalMinutes / 60) * workerCount * 34 +
-    (move?.routeKm || 0) * Math.max(1, countRoundTrips(playback)) * 2.4;
+  const workerCount = Math.max(1, uniqueAssignedWorkers || Number.parseInt(scenario?.workerCount, 10) || 1);
+  const dayShiftCapacity = Math.max(1, Number.parseInt(scenario?.workerShifts?.dayShift, 10) || workerCount);
+  const nightShiftCapacity = Math.max(1, Number.parseInt(scenario?.workerShifts?.nightShift, 10) || workerCount);
+  const utilization = Math.max(0, Number.parseInt(scenario?.utilization, 10) || 0);
+  const truckUtilization = Math.max(0, Number.parseInt(scenario?.truckUtilization, 10) || utilization);
+  const workerUtilization = Math.max(0, Number.parseInt(scenario?.workerUtilization, 10) || 0);
+  const idleMinutes = Math.max(0, Number.parseInt(scenario?.idleMinutes, 10) || 0);
+  const workerIdleMinutes = Math.max(0, Number.parseInt(scenario?.workerIdleMinutes, 10) || 0);
+  const costEstimate = Math.max(0, Number(scenario?.costEstimate) || 0);
 
   return {
     utilizationValue: utilization,
     utilization: `${utilization}%`,
+    truckUtilizationValue: truckUtilization,
+    truckUtilization: `${truckUtilization}%`,
+    workerUtilizationValue: workerUtilization,
+    workerUtilization: `${workerUtilization}%`,
     rawCostEstimate: costEstimate,
     costEstimate: formatCurrency(costEstimate),
-    loadsPerTruck: (trips.length / truckCount).toFixed(1),
+    usedTruckCount,
+    allocatedTruckCount,
+    truckUsageLabel: `${usedTruckCount}/${allocatedTruckCount}`,
+    loadsPerTruck: (trips.length / usedTruckCount).toFixed(1),
+    loadsPerAllocatedTruck: (trips.length / allocatedTruckCount).toFixed(1),
     crewHours: String(Math.round((workerCount * totalMinutes) / 60)),
+    workerCount,
+    dayShiftCapacity,
+    nightShiftCapacity,
+    idleMinutes,
+    idleHours: (idleMinutes / 60).toFixed(1),
+    workerIdleMinutes,
+    workerIdleHours: (workerIdleMinutes / 60).toFixed(1),
+    criticalTaskCount: criticalTasks.length,
+    criticalLoadCount: criticalLoadIds.size,
+    criticalPathHours: (criticalTasks.reduce((sum, task) => sum + Math.max(0, task.endMinute - task.startMinute), 0) / 60).toFixed(1),
   };
 }
 
@@ -196,11 +670,12 @@ function getPlanComparisonStats(scenarios, selectedScenario, move, currentMinute
   const planDashboard = getPlanDashboardStats(selectedScenario, move);
   const activeTruckIds = new Set(
     trips
-      .filter((trip) => currentMinute >= trip.loadStart && currentMinute < (trip.returnToSource ?? trip.rigUpFinish))
+      .filter((trip) => currentMinute >= (trip.dispatchStart ?? trip.pickupLoadStart ?? trip.loadStart) && currentMinute < (trip.returnToSource ?? trip.unloadDropFinish ?? trip.rigUpFinish))
       .map((trip) => trip.truckId),
   );
   const routeKm = Number(move?.routeKm) || 0;
   const costEstimate = planDashboard.rawCostEstimate || 0;
+  const criticalTaskCount = getEffectiveCriticalTasks(playback).length;
 
   return {
     averageMinutes,
@@ -211,6 +686,7 @@ function getPlanComparisonStats(scenarios, selectedScenario, move, currentMinute
     activeFleet: activeTruckIds.size,
     costPerLoad: totalLoads > 0 ? formatCurrency(costEstimate / totalLoads) : formatCurrency(0),
     routeDistance: `${Math.round(routeKm * Math.max(totalLoads, 1))} km`,
+    criticalPathTasks: criticalTaskCount,
   };
 }
 
@@ -225,15 +701,15 @@ function getTruckFocusStats({ truckId, playback, currentMinute, totalMinutes, mo
   }
 
   const activeTrip = truckTrips.find(
-    (trip) => currentMinute >= trip.loadStart && currentMinute < (trip.returnToSource ?? trip.rigUpFinish),
+    (trip) => currentMinute >= (trip.dispatchStart ?? trip.pickupLoadStart ?? trip.loadStart) && currentMinute < (trip.returnToSource ?? trip.unloadDropFinish ?? trip.rigUpFinish),
   ) || null;
   const completedLoads = truckTrips.filter((trip) => currentMinute >= trip.rigUpFinish).length;
   const busyMinutes = truckTrips.reduce(
-    (sum, trip) => sum + Math.max(0, (trip.returnToSource ?? trip.rigUpFinish) - trip.loadStart),
+    (sum, trip) => sum + Math.max(0, (trip.returnToSource ?? trip.unloadDropFinish ?? trip.rigUpFinish) - (trip.dispatchStart ?? trip.pickupLoadStart ?? trip.loadStart)),
     0,
   );
   const utilization = Math.min(100, Math.round((busyMinutes / Math.max(totalMinutes, 1)) * 100));
-  const nextTrip = truckTrips.find((trip) => currentMinute < trip.loadStart) || null;
+  const nextTrip = truckTrips.find((trip) => currentMinute < (trip.dispatchStart ?? trip.pickupLoadStart ?? trip.loadStart)) || null;
   const lastTrip = [...truckTrips].reverse().find((trip) => currentMinute >= trip.rigUpFinish) || null;
   const routeKm = Number(move?.routeKm) || 0;
   const remainingAssignedLoads = truckTrips.filter((trip) => currentMinute < trip.rigUpFinish).length;
@@ -242,22 +718,25 @@ function getTruckFocusStats({ truckId, playback, currentMinute, totalMinutes, mo
   let statusDetail = "Waiting for its next assignment.";
 
   if (activeTrip) {
-    if (currentMinute < activeTrip.rigDownFinish) {
-      statusLabel = "Rig Down";
-      statusDetail = `Loading #${activeTrip.loadId} at the source rig.`;
+    if (currentMinute < (activeTrip.pickupLoadStart ?? activeTrip.loadStart)) {
+      statusLabel = "To Pickup";
+      statusDetail = `Driving to collect #${activeTrip.loadId}.`;
+    } else if (currentMinute < (activeTrip.pickupLoadFinish ?? activeTrip.moveStart ?? activeTrip.arrivalAtDestination)) {
+      statusLabel = "Pickup";
+      statusDetail = `Securing #${activeTrip.loadId} at the source rig.`;
     } else if (currentMinute < activeTrip.arrivalAtDestination) {
       statusLabel = "In Transit";
       statusDetail = `Hauling #${activeTrip.loadId} to destination.`;
-    } else if (currentMinute < activeTrip.rigUpFinish) {
-      statusLabel = "Rig Up";
-      statusDetail = `Setting #${activeTrip.loadId} at destination.`;
+    } else if (currentMinute < (activeTrip.unloadDropFinish ?? activeTrip.rigUpStart ?? activeTrip.rigUpFinish)) {
+      statusLabel = "Unload";
+      statusDetail = `Dropping #${activeTrip.loadId} at destination.`;
     } else {
       statusLabel = "Returning";
       statusDetail = "Returning to the source rig.";
     }
   } else if (nextTrip) {
     statusLabel = "Queued";
-    statusDetail = `Next load #${nextTrip.loadId} starts in ${formatMinutes(Math.max(0, Math.round(nextTrip.loadStart - currentMinute)))}`;
+    statusDetail = `Next load #${nextTrip.loadId} starts in ${formatMinutes(Math.max(0, Math.round((nextTrip.dispatchStart ?? nextTrip.pickupLoadStart ?? nextTrip.loadStart) - currentMinute)))}`;
   } else if (lastTrip) {
     statusLabel = "Complete";
     statusDetail = `Finished assigned loads by ${formatMinutes(Math.round(lastTrip.rigUpFinish))}.`;
@@ -277,18 +756,20 @@ function getTruckFocusStats({ truckId, playback, currentMinute, totalMinutes, mo
           Math.round(
             Math.max(
               0,
-              (currentMinute < activeTrip.rigDownFinish
-                ? activeTrip.rigDownFinish
-                : currentMinute < activeTrip.arrivalAtDestination
-                  ? activeTrip.arrivalAtDestination
-                  : currentMinute < activeTrip.rigUpFinish
-                    ? activeTrip.rigUpFinish
-                    : activeTrip.returnToSource ?? activeTrip.rigUpFinish) - currentMinute,
+              (currentMinute < (activeTrip.pickupLoadStart ?? activeTrip.loadStart)
+                ? (activeTrip.pickupLoadStart ?? activeTrip.loadStart)
+                : currentMinute < (activeTrip.pickupLoadFinish ?? activeTrip.moveStart ?? activeTrip.arrivalAtDestination)
+                  ? (activeTrip.pickupLoadFinish ?? activeTrip.moveStart ?? activeTrip.arrivalAtDestination)
+                  : currentMinute < activeTrip.arrivalAtDestination
+                    ? activeTrip.arrivalAtDestination
+                    : currentMinute < (activeTrip.unloadDropFinish ?? activeTrip.rigUpStart ?? activeTrip.rigUpFinish)
+                      ? (activeTrip.unloadDropFinish ?? activeTrip.rigUpStart ?? activeTrip.rigUpFinish)
+                      : activeTrip.returnToSource ?? activeTrip.rigUpFinish) - currentMinute,
             ),
           ),
         )
       : nextTrip
-        ? formatMinutes(Math.max(0, Math.round(nextTrip.loadStart - currentMinute)))
+        ? formatMinutes(Math.max(0, Math.round((nextTrip.dispatchStart ?? nextTrip.pickupLoadStart ?? nextTrip.loadStart) - currentMinute)))
         : "0m",
     assignedDistance: `${Math.round(routeKm * truckTrips.length * 2)} km`,
   };
@@ -301,9 +782,9 @@ function getRigInsightStats({ side, move, playback, currentMinute, totalMinutes 
   }
 
   const trips = playback.trips;
-  const loadingNow = trips.filter((trip) => currentMinute >= trip.loadStart && currentMinute < trip.rigDownFinish).length;
+  const loadingNow = trips.filter((trip) => currentMinute >= (trip.rigDownStart ?? trip.loadStart) && currentMinute < (trip.pickupLoadFinish ?? trip.rigDownFinish)).length;
   const riggingNow = trips.filter(
-    (trip) => currentMinute >= trip.arrivalAtDestination && currentMinute < trip.rigUpFinish,
+    (trip) => currentMinute >= (trip.unloadDropFinish ?? trip.arrivalAtDestination) && currentMinute < trip.rigUpFinish,
   ).length;
   const nextEventMinute = side === "source"
     ? trips.filter((trip) => currentMinute < trip.rigDownFinish).map((trip) => trip.rigDownFinish).sort((a, b) => a - b)[0]
@@ -327,44 +808,16 @@ function buildDisplayedTruckCounts(truckSetup, targetTotal) {
     .map((truck, index) => ({
       id: truck.id || `truck-${index + 1}`,
       type: normalizeTruckTypeLabel(truck.type),
-      count: Math.max(1, Number.parseInt(truck.count, 10) || 1),
+      count: Math.max(0, Number.parseInt(truck.count, 10) || 0),
+      hourlyCost: Math.max(0, Number(truck.hourlyCost) || 0),
     }))
     .filter((truck) => truck.type.trim());
 
   if (!normalized.length) {
-    return [{ id: "fleet-default", type: "Heavy Haul", count: Math.max(1, targetTotal || 1) }];
+    return [{ id: "fleet-default", type: "Heavy Hauler", count: Math.max(1, targetTotal || 1) }];
   }
 
-  const safeTotal = Math.max(1, targetTotal || 1);
-  const currentTotal = normalized.reduce((sum, truck) => sum + truck.count, 0);
-
-  if (currentTotal <= 0) {
-    return normalized.map((truck, index) => ({
-      ...truck,
-      count: index === 0 ? safeTotal : 1,
-    }));
-  }
-
-  const scaled = normalized.map((truck) => {
-    const exact = (truck.count / currentTotal) * safeTotal;
-    return {
-      ...truck,
-      count: Math.floor(exact),
-      remainder: exact - Math.floor(exact),
-    };
-  });
-
-  let assigned = scaled.reduce((sum, truck) => sum + truck.count, 0);
-  const byRemainder = [...scaled].sort((a, b) => b.remainder - a.remainder);
-  let cursor = 0;
-
-  while (assigned < safeTotal && byRemainder.length) {
-    byRemainder[cursor % byRemainder.length].count += 1;
-    assigned += 1;
-    cursor += 1;
-  }
-
-  return scaled.map(({ remainder, ...truck }) => truck);
+  return normalized;
 }
 
 function getRigSiteStats({ side, move, playback, currentMinute, totalMinutes }) {
@@ -415,7 +868,7 @@ function getPhasePercentages(playback, currentMinute) {
   const trips = playback?.trips || [];
   const totalTrips = Math.max(trips.length, 1);
   const down = (trips.filter((trip) => currentMinute >= trip.rigDownFinish).length / totalTrips) * 100;
-  const move = (trips.filter((trip) => currentMinute >= trip.arrivalAtDestination).length / totalTrips) * 100;
+  const move = (trips.filter((trip) => currentMinute >= (trip.unloadDropFinish ?? trip.arrivalAtDestination)).length / totalTrips) * 100;
   const up = (trips.filter((trip) => currentMinute >= trip.rigUpFinish).length / totalTrips) * 100;
   return { down, move, up };
 }
@@ -424,7 +877,7 @@ function getRigLoadCounts(playback, currentMinute) {
   const trips = playback?.trips || [];
   const sourceCount = trips.filter((trip) => currentMinute < trip.rigDownFinish).length;
   const movingCount = trips.filter(
-    (trip) => currentMinute >= trip.rigDownFinish && currentMinute < trip.rigUpFinish,
+    (trip) => currentMinute >= (trip.moveStart ?? trip.pickupLoadFinish ?? trip.rigDownFinish) && currentMinute < trip.rigUpFinish,
   ).length;
   const destinationCount = trips.filter((trip) => currentMinute >= trip.rigUpFinish).length;
   return {
@@ -435,8 +888,8 @@ function getRigLoadCounts(playback, currentMinute) {
   };
 }
 
-function buildTruckScheduleRows(playback, truckCount) {
-  const trips = playback?.trips || [];
+function buildTruckScheduleRows(playback) {
+  const journeys = playback?.journeys?.length ? playback.journeys : (playback?.trips || []);
   const totalMinutes = Math.max(playback?.totalMinutes || 1, 1);
 
   function getTruckToneClass(truckType) {
@@ -450,34 +903,518 @@ function buildTruckScheduleRows(playback, truckCount) {
     return "scene-timeline-segment-truck-heavyhaul";
   }
 
-  return Array.from({ length: truckCount }, (_, index) => {
-    const truckId = index + 1;
-    let rowToneClass = "scene-timeline-segment-truck-heavyhaul";
-    const truckTrips = trips
-      .filter((trip) => trip.truckId === truckId)
-      .map((trip, tripIndex) => ({
-        ...trip,
-        key: `${truckId}-${trip.loadId}-${tripIndex}`,
-        left: (trip.loadStart / totalMinutes) * 100,
-        width: (((trip.rigUpFinish || trip.arrivalAtDestination) - trip.loadStart) / totalMinutes) * 100,
-        loadWidth: ((trip.rigDownFinish - trip.loadStart) / totalMinutes) * 100,
-        moveLeft: ((trip.rigDownFinish - trip.loadStart) / totalMinutes) * 100,
-        moveWidth: ((trip.arrivalAtDestination - trip.rigDownFinish) / totalMinutes) * 100,
-        upLeft: ((trip.arrivalAtDestination - trip.loadStart) / totalMinutes) * 100,
-        upWidth: ((trip.rigUpFinish - trip.arrivalAtDestination) / totalMinutes) * 100,
-        toneClass: getTruckToneClass(trip.truckType),
-      }));
+  const usedTruckIds = [...new Set(journeys.map((trip) => trip.truckId))].sort((left, right) => left - right);
 
-    if (truckTrips[0]?.toneClass) {
-      rowToneClass = truckTrips[0].toneClass;
+  return usedTruckIds.map((truckId) => {
+    let rowToneClass = "scene-timeline-segment-truck-heavyhaul";
+    const truckItems = journeys
+      .filter((trip) => trip.truckId === truckId)
+      .flatMap((trip, tripIndex) => {
+        const items = [];
+        const toneClass = getTruckToneClass(trip.truckType);
+
+        if ((trip.pickupLoadStart ?? 0) > (trip.dispatchStart ?? trip.pickupLoadStart ?? 0)) {
+          items.push({
+            key: `${truckId}-${trip.loadId}-${tripIndex}-pickup`,
+            loadId: trip.loadIds?.[0] ?? trip.loadId,
+            description: `${trip.description} to pickup`,
+            startMinute: trip.dispatchStart ?? trip.pickupLoadStart,
+            endMinute: trip.moveStart ?? trip.pickupLoadStart,
+            left: (((trip.dispatchStart ?? trip.pickupLoadStart) / totalMinutes) * 100),
+            width: ((((trip.moveStart ?? trip.pickupLoadStart) - (trip.dispatchStart ?? trip.pickupLoadStart)) / totalMinutes) * 100),
+            toneClass,
+            label: trip.description || getLoadDisplayLabel(trip),
+          });
+        }
+
+        if ((trip.arrivalAtDestination ?? 0) > (trip.moveStart ?? trip.pickupLoadFinish ?? trip.rigDownFinish ?? 0)) {
+          items.push({
+            key: `${truckId}-${trip.loadId}-${tripIndex}-move`,
+            loadId: trip.loadIds?.[0] ?? trip.loadId,
+            description: `${trip.description} move`,
+            startMinute: trip.moveStart ?? trip.pickupLoadFinish ?? trip.rigDownFinish,
+            endMinute: trip.arrivalAtDestination,
+            left: (((trip.moveStart ?? trip.pickupLoadFinish ?? trip.rigDownFinish) / totalMinutes) * 100),
+            width: (((trip.arrivalAtDestination - (trip.moveStart ?? trip.pickupLoadFinish ?? trip.rigDownFinish)) / totalMinutes) * 100),
+            toneClass,
+            label: trip.description || getLoadDisplayLabel(trip),
+          });
+        }
+
+        if ((trip.returnToSource ?? 0) > (trip.returnStart ?? trip.unloadDropFinish ?? trip.arrivalAtDestination ?? 0)) {
+          items.push({
+            key: `${truckId}-${trip.loadId}-${tripIndex}-return`,
+            loadId: trip.loadIds?.[0] ?? trip.loadId,
+            description: `${trip.description} return`,
+            startMinute: trip.returnStart ?? trip.unloadDropFinish ?? trip.arrivalAtDestination,
+            endMinute: trip.returnToSource,
+            left: (((trip.returnStart ?? trip.unloadDropFinish ?? trip.arrivalAtDestination) / totalMinutes) * 100),
+            width: (((trip.returnToSource - (trip.returnStart ?? trip.unloadDropFinish ?? trip.arrivalAtDestination)) / totalMinutes) * 100),
+            toneClass,
+            label: trip.description || getLoadDisplayLabel(trip),
+          });
+        }
+
+        return items;
+      })
+      .sort((left, right) => left.startMinute - right.startMinute);
+
+    if (truckItems[0]?.toneClass) {
+      rowToneClass = truckItems[0].toneClass;
     }
 
     return {
+      key: `truck-${truckId}`,
       truckId,
       toneClass: rowToneClass,
-      trips: truckTrips,
+      items: truckItems,
+      loadCount: journeys.filter((trip) => trip.truckId === truckId).length,
     };
   });
+}
+
+function buildWorkerScheduleRows(playback) {
+  const assignments = playback?.workerAssignments || [];
+  const totalMinutes = Math.max(playback?.totalMinutes || 1, 1);
+  const rowsByWorker = new Map();
+
+  assignments.forEach((assignment, index) => {
+    if (!rowsByWorker.has(assignment.workerId)) {
+      rowsByWorker.set(assignment.workerId, {
+        key: assignment.workerId,
+        workerId: assignment.workerId,
+        roleId: assignment.roleId,
+        label: assignment.workerLabel || getWorkerRoleLabel(assignment.roleId),
+        items: [],
+      });
+    }
+
+    rowsByWorker.get(assignment.workerId).items.push({
+      key: `${assignment.workerId}-${assignment.phase}-${assignment.loadId}-${index}`,
+      loadId: assignment.loadId,
+      startMinute: assignment.startMinute,
+      endMinute: assignment.endMinute,
+      left: (assignment.startMinute / totalMinutes) * 100,
+      width: ((assignment.endMinute - assignment.startMinute) / totalMinutes) * 100,
+      toneClass: assignment.phase === "rig-down" ? "scene-timeline-segment-down" : "scene-timeline-segment-up",
+      label: getLoadDisplayLabel(assignment),
+      count: 1,
+    });
+  });
+
+  const rows = [...rowsByWorker.values()]
+    .map((row) => ({
+      ...row,
+      items: row.items.sort((left, right) => left.startMinute - right.startMinute),
+    }))
+    .sort((left, right) =>
+      getWorkerRoleLabel(left.roleId).localeCompare(getWorkerRoleLabel(right.roleId)) ||
+      String(left.workerId || "").localeCompare(String(right.workerId || "")),
+    );
+
+  const roleCounters = new Map();
+  rows.forEach((row) => {
+    const nextIndex = (roleCounters.get(row.roleId) || 0) + 1;
+    roleCounters.set(row.roleId, nextIndex);
+    row.label = `${getWorkerRoleLabel(row.roleId)} ${nextIndex}`;
+  });
+
+  return rows;
+}
+
+function buildLoadScheduleRows(playback) {
+  const trips = playback?.trips || [];
+  const totalMinutes = Math.max(playback?.totalMinutes || 1, 1);
+
+  return trips
+    .map((trip, index) => {
+      const items = [];
+
+      if ((trip.rigDownFinish ?? 0) > (trip.rigDownStart ?? trip.loadStart ?? 0)) {
+        items.push({
+          key: `load-${trip.loadId}-${index}-down`,
+          loadId: trip.loadId,
+          description: `${trip.description} rig down`,
+          startMinute: trip.rigDownStart ?? trip.loadStart,
+          endMinute: trip.rigDownFinish,
+          left: (((trip.rigDownStart ?? trip.loadStart ?? 0) / totalMinutes) * 100),
+          width: (((trip.rigDownFinish || 0) - (trip.rigDownStart ?? trip.loadStart ?? 0)) / totalMinutes) * 100,
+          toneClass: "scene-timeline-segment-down",
+          label: "Down",
+        });
+      }
+
+      if ((trip.pickupLoadFinish ?? 0) > (trip.pickupLoadStart ?? trip.rigDownFinish ?? 0)) {
+        items.push({
+          key: `load-${trip.loadId}-${index}-pickup`,
+          loadId: trip.loadId,
+          description: `${trip.description} pickup`,
+          startMinute: trip.pickupLoadStart ?? trip.rigDownFinish,
+          endMinute: trip.pickupLoadFinish,
+          left: (((trip.pickupLoadStart ?? trip.rigDownFinish ?? 0) / totalMinutes) * 100),
+          width: (((trip.pickupLoadFinish || 0) - (trip.pickupLoadStart ?? trip.rigDownFinish ?? 0)) / totalMinutes) * 100,
+          toneClass: "scene-timeline-segment-truck-lowbed",
+          label: "Pickup",
+        });
+      }
+
+      if ((trip.arrivalAtDestination ?? 0) > (trip.moveStart ?? trip.pickupLoadFinish ?? trip.rigDownFinish ?? 0)) {
+        items.push({
+          key: `load-${trip.loadId}-${index}-move`,
+          loadId: trip.loadId,
+          description: `${trip.description} move`,
+          startMinute: trip.moveStart ?? trip.pickupLoadFinish ?? trip.rigDownFinish,
+          endMinute: trip.arrivalAtDestination,
+          left: (((trip.moveStart ?? trip.pickupLoadFinish ?? trip.rigDownFinish ?? 0) / totalMinutes) * 100),
+          width: (((trip.arrivalAtDestination || 0) - (trip.moveStart ?? trip.pickupLoadFinish ?? trip.rigDownFinish ?? 0)) / totalMinutes) * 100,
+          toneClass: "scene-timeline-segment-move",
+          label: "Move",
+        });
+      }
+
+      if ((trip.unloadDropFinish ?? 0) > (trip.unloadDropStart ?? trip.arrivalAtDestination ?? 0)) {
+        items.push({
+          key: `load-${trip.loadId}-${index}-drop`,
+          loadId: trip.loadId,
+          description: `${trip.description} unload`,
+          startMinute: trip.unloadDropStart ?? trip.arrivalAtDestination,
+          endMinute: trip.unloadDropFinish,
+          left: (((trip.unloadDropStart ?? trip.arrivalAtDestination ?? 0) / totalMinutes) * 100),
+          width: (((trip.unloadDropFinish || 0) - (trip.unloadDropStart ?? trip.arrivalAtDestination ?? 0)) / totalMinutes) * 100,
+          toneClass: "scene-timeline-segment-truck-flatbed",
+          label: "Drop",
+        });
+      }
+
+      if ((trip.rigUpFinish ?? 0) > (trip.rigUpStart ?? trip.arrivalAtDestination ?? 0)) {
+        items.push({
+          key: `load-${trip.loadId}-${index}-up`,
+          loadId: trip.loadId,
+          description: `${trip.description} rig up`,
+          startMinute: trip.rigUpStart ?? trip.arrivalAtDestination,
+          endMinute: trip.rigUpFinish,
+          left: (((trip.rigUpStart ?? trip.arrivalAtDestination ?? 0) / totalMinutes) * 100),
+          width: (((trip.rigUpFinish || 0) - (trip.rigUpStart ?? trip.arrivalAtDestination ?? 0)) / totalMinutes) * 100,
+          toneClass: "scene-timeline-segment-up",
+          label: "Up",
+        });
+      }
+
+      return {
+        key: `load-row-${trip.loadId}-${index}`,
+        loadId: trip.loadId,
+        label: `${getLoadDisplayLabel(trip)} · ${trip.description || `Load ${getLoadDisplayLabel(trip)}`}`,
+        items,
+      };
+    })
+    .sort((left, right) => left.loadId - right.loadId);
+}
+
+function buildCriticalPathRows(playback) {
+  const criticalTasks = getEffectiveCriticalTasks(playback);
+  const totalMinutes = Math.max(playback?.totalMinutes || 1, 1);
+  const rowsByLoad = new Map();
+  const phaseToneMap = {
+    rig_down: "scene-timeline-segment-down",
+    pickup_load: "scene-timeline-segment-truck-lowbed",
+    haul: "scene-timeline-segment-move",
+    unload_drop: "scene-timeline-segment-truck-flatbed",
+    rig_up: "scene-timeline-segment-up",
+  };
+  const phaseLabelMap = {
+    rig_down: "Down",
+    pickup_load: "Pickup",
+    haul: "Move",
+    unload_drop: "Drop",
+    rig_up: "Up",
+  };
+
+  criticalTasks.forEach((task, index) => {
+    if (!rowsByLoad.has(task.loadId)) {
+      rowsByLoad.set(task.loadId, {
+        key: `critical-load-${task.loadId}`,
+        loadId: task.loadId,
+        label: task.loadCode || task.description || `#${task.loadId}`,
+        items: [],
+      });
+    }
+
+    rowsByLoad.get(task.loadId).items.push({
+      key: `${task.id}-${index}`,
+      loadId: task.loadId,
+      description: `${task.description} ${phaseLabelMap[task.phase] || task.phase}`,
+      startMinute: task.startMinute,
+      endMinute: task.endMinute,
+      left: (task.startMinute / totalMinutes) * 100,
+      width: ((task.endMinute - task.startMinute) / totalMinutes) * 100,
+      toneClass: phaseToneMap[task.phase] || "scene-timeline-segment-move",
+      label: phaseLabelMap[task.phase] || task.phase,
+    });
+  });
+
+  return [...rowsByLoad.values()]
+    .map((row) => ({
+      ...row,
+      items: row.items.sort((left, right) => left.startMinute - right.startMinute),
+    }))
+    .sort((left, right) => left.items[0].startMinute - right.items[0].startMinute || left.loadId - right.loadId);
+}
+
+function buildCriticalPathNetwork(playback, zoom = 1) {
+  const tasks = getPlaybackTasks(playback);
+  const criticalTaskIds = new Set(getEffectiveCriticalTasks(playback).map((task) => task.id));
+  const taskMap = new Map(tasks.map((task) => [task.id, task]));
+  const phaseRank = {
+    rig_down: 0,
+    pickup_load: 1,
+    haul: 2,
+    unload_drop: 3,
+    rig_up: 4,
+  };
+  const columnMap = new Map();
+
+  tasks.forEach((task) => {
+    const bucket = Math.round((task.earliestStart ?? task.startMinute ?? 0) / 60);
+    if (!columnMap.has(bucket)) {
+      columnMap.set(bucket, []);
+    }
+    columnMap.get(bucket).push(task);
+  });
+
+  const orderedBuckets = [...columnMap.keys()].sort((left, right) => left - right);
+  const nodes = [];
+  const edges = [];
+  const nodeLayout = new Map();
+  const scale = Math.max(0.1, Number(zoom) || 1);
+  const cardWidth = Math.round(172 * scale);
+  const cardHeight = Math.round(98 * scale);
+  const columnGap = Math.round(78 * scale);
+  const rowGap = Math.round(42 * scale);
+
+  orderedBuckets.forEach((bucket, columnIndex) => {
+    const columnTasks = columnMap.get(bucket)
+      .sort((left, right) =>
+        (left.loadId - right.loadId) ||
+        ((phaseRank[left.phase] || 0) - (phaseRank[right.phase] || 0)) ||
+        String(left.id).localeCompare(String(right.id)),
+      );
+    columnTasks.forEach((task, rowIndex) => {
+      const x = columnIndex * (cardWidth + columnGap);
+      const y = rowIndex * (cardHeight + rowGap);
+      nodeLayout.set(task.id, { x, y });
+      nodes.push({
+        ...task,
+        x,
+        y,
+        width: cardWidth,
+        height: cardHeight,
+        duration: Math.max(0, (task.endMinute ?? 0) - (task.startMinute ?? 0)),
+        totalFloat: Math.max(0, Math.round(task.slack ?? 0)),
+        isCritical: task.isCritical || criticalTaskIds.has(task.id),
+      });
+    });
+  });
+
+  nodes.forEach((task) => {
+    (task.predecessorIds || []).forEach((predecessorId) => {
+      const from = nodeLayout.get(predecessorId);
+      const to = nodeLayout.get(task.id);
+      const predecessor = taskMap.get(predecessorId);
+      if (!from || !to || !predecessor) {
+        return;
+      }
+      edges.push({
+        key: `${predecessorId}->${task.id}`,
+        x1: from.x + cardWidth,
+        y1: from.y + (cardHeight / 2),
+        x2: to.x,
+        y2: to.y + (cardHeight / 2),
+        isCritical: (criticalTaskIds.has(predecessorId) || predecessor.isCritical) && (task.isCritical || criticalTaskIds.has(task.id)),
+      });
+    });
+  });
+
+  const width = Math.max(Math.round(900 * scale), ...nodes.map((node) => node.x + node.width + 40), Math.round(900 * scale));
+  const height = Math.max(Math.round(420 * scale), ...nodes.map((node) => node.y + node.height + 40), Math.round(420 * scale));
+
+  return { nodes, edges, width, height };
+}
+
+function CPMNetworkDiagram({ playback, zoom = 1 }) {
+  const network = useMemo(() => buildCriticalPathNetwork(playback, zoom), [playback, zoom]);
+  const numericZoom = Math.max(0.1, Number(zoom) || 1);
+  const isCompactView = numericZoom <= 0.35;
+  const isMidCompactView = numericZoom > 0.35 && numericZoom <= 0.6;
+
+  if (!network.nodes.length) {
+    return h(
+      "div",
+      { className: "empty-state scene-loading-card" },
+      h("h2", null, "No CPM Task Data"),
+      h("p", { className: "muted-copy" }, "Rebuild the move so the critical path network can be generated from the latest task graph."),
+    );
+  }
+
+  return h(
+    "section",
+    {
+      className: "scene-timeline-shell",
+      style: {
+        display: "block",
+        overflow: "auto",
+        padding: "20px",
+      },
+    },
+    h(
+      "div",
+      {
+        style: {
+          minWidth: `${network.width}px`,
+          minHeight: `${network.height}px`,
+          position: "relative",
+        },
+      },
+      h(
+        "svg",
+        {
+          width: network.width,
+          height: network.height,
+          style: {
+            position: "absolute",
+            inset: 0,
+            overflow: "visible",
+          },
+        },
+        h(
+          "defs",
+          null,
+          h("marker", {
+            id: "cpm-arrow-default",
+            markerWidth: "10",
+            markerHeight: "10",
+            refX: "8",
+            refY: "3",
+            orient: "auto",
+            markerUnits: "strokeWidth",
+          }, h("path", { d: "M0,0 L0,6 L9,3 z", fill: "#8fa3b8" })),
+          h("marker", {
+            id: "cpm-arrow-critical",
+            markerWidth: "10",
+            markerHeight: "10",
+            refX: "8",
+            refY: "3",
+            orient: "auto",
+            markerUnits: "strokeWidth",
+          }, h("path", { d: "M0,0 L0,6 L9,3 z", fill: "#d7b64a" })),
+        ),
+        network.edges.map((edge) =>
+          h("line", {
+            key: edge.key,
+            x1: edge.x1,
+            y1: edge.y1,
+            x2: edge.x2,
+            y2: edge.y2,
+            stroke: edge.isCritical ? "#d7b64a" : "#8fa3b8",
+            strokeWidth: edge.isCritical ? 3 : 2,
+            markerEnd: `url(#${edge.isCritical ? "cpm-arrow-critical" : "cpm-arrow-default"})`,
+            opacity: edge.isCritical ? 0.95 : 0.6,
+          }),
+        ),
+      ),
+      network.nodes.map((node) =>
+        h(
+          "div",
+          {
+            key: node.id,
+            style: {
+              position: "absolute",
+              left: `${node.x}px`,
+              top: `${node.y}px`,
+              width: `${node.width}px`,
+              borderRadius: isCompactView ? "999px" : "16px",
+              overflow: "hidden",
+              background: "rgba(12, 16, 22, 0.96)",
+              border: node.isCritical ? "2px solid rgba(215, 182, 74, 0.9)" : "1px solid rgba(143, 163, 184, 0.35)",
+              boxShadow: node.isCritical ? "0 16px 40px rgba(215, 182, 74, 0.18)" : "0 12px 32px rgba(0,0,0,0.2)",
+              minHeight: isCompactView ? `${Math.max(18, Math.round(node.height * 0.3))}px` : undefined,
+            },
+            title: `${node.description} | ES ${formatMinutes(Math.round(node.earliestStart || 0))} | EF ${formatMinutes(Math.round(node.earliestFinish || 0))} | LS ${formatMinutes(Math.round(node.latestStart || 0))} | LF ${formatMinutes(Math.round(node.latestFinish || 0))} | TF ${formatMinutes(Math.round(node.totalFloat || 0))}`,
+          },
+          isCompactView
+            ? h(
+                "div",
+                {
+                  style: {
+                    minHeight: `${Math.max(18, Math.round(node.height * 0.3))}px`,
+                    padding: "4px 8px",
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "center",
+                    background: node.isCritical ? "linear-gradient(135deg, rgba(189,255,72,0.92), rgba(24,180,74,0.92))" : "linear-gradient(135deg, rgba(136,196,255,0.9), rgba(69,122,227,0.88))",
+                    color: "#081018",
+                    fontWeight: 800,
+                    fontSize: `${Math.max(0.54, 0.62 * numericZoom)}rem`,
+                    letterSpacing: "0.02em",
+                    textAlign: "center",
+                  },
+                },
+                `${node.loadCode || `#${node.loadId}`}`,
+              )
+            : [
+                h(
+                  "div",
+                  {
+                    style: {
+                      display: "grid",
+                      gridTemplateColumns: "1fr 1fr 1fr",
+                      background: node.isCritical ? "linear-gradient(135deg, rgba(189,255,72,0.92), rgba(24,180,74,0.92))" : "linear-gradient(135deg, rgba(136,196,255,0.9), rgba(69,122,227,0.88))",
+                      color: "#091018",
+                      fontWeight: 800,
+                      fontSize: `${0.78 * Math.max(0.85, Math.min(numericZoom, 1.8))}rem`,
+                    },
+                  },
+                  h("div", { style: { padding: "8px 10px", textAlign: "center", borderRight: "1px solid rgba(9,16,24,0.18)" } }, String(Math.round(node.earliestStart || 0))),
+                  h("div", { style: { padding: "8px 10px", textAlign: "center", borderRight: "1px solid rgba(9,16,24,0.18)" } }, String(Math.max(1, Math.round(node.duration || 0)))),
+                  h("div", { style: { padding: "8px 10px", textAlign: "center" } }, String(Math.round(node.earliestFinish || 0))),
+                ),
+                h(
+                  "div",
+                  {
+                    style: {
+                      padding: isMidCompactView ? "8px 10px" : "10px 12px",
+                      minHeight: `${Math.round((isMidCompactView ? 40 : 54) * Math.max(0.75, numericZoom))}px`,
+                      display: "grid",
+                      gap: "4px",
+                      alignContent: "center",
+                      textAlign: "center",
+                    },
+                  },
+                  h("strong", { style: { fontSize: `${(isMidCompactView ? 0.72 : 0.84) * Math.max(0.85, Math.min(numericZoom, 1.8))}rem`, lineHeight: 1.2 } }, `${node.loadCode || `#${node.loadId}`} · ${node.phase.replace("_", " ")}`),
+                  isMidCompactView
+                    ? null
+                    : h("span", { className: "muted-copy", style: { fontSize: `${0.72 * Math.max(0.85, Math.min(numericZoom, 1.8))}rem` } }, node.description),
+                ),
+                h(
+                  "div",
+                  {
+                    style: {
+                      display: "grid",
+                      gridTemplateColumns: "1fr 1fr 1fr",
+                      background: "linear-gradient(135deg, rgba(84,218,212,0.92), rgba(35,160,170,0.9))",
+                      color: "#071016",
+                      fontWeight: 800,
+                      fontSize: `${0.78 * Math.max(0.85, Math.min(numericZoom, 1.8))}rem`,
+                    },
+                  },
+                  h("div", { style: { padding: "8px 10px", textAlign: "center", borderRight: "1px solid rgba(7,16,22,0.18)" } }, String(Math.round(node.latestStart || 0))),
+                  h("div", { style: { padding: "8px 10px", textAlign: "center", borderRight: "1px solid rgba(7,16,22,0.18)" } }, String(Math.round(node.totalFloat || 0))),
+                  h("div", { style: { padding: "8px 10px", textAlign: "center" } }, String(Math.round(node.latestFinish || 0))),
+                ),
+              ],
+        ),
+      ),
+    ),
+  );
 }
 
 function LoadScheduleTable({ playback, currentMinute }) {
@@ -551,9 +1488,9 @@ function LoadScheduleTable({ playback, currentMinute }) {
                       left: `${trip.left}%`,
                       width: `${Math.max(trip.width, 5)}%`,
                     },
-                    title: `${trip.description} | ${formatMinutes(Math.round(trip.loadStart))} -> ${formatMinutes(Math.round(trip.rigUpFinish))}`,
+                    title: `${getLoadDisplayLabel(trip)} | ${trip.description} | ${formatMinutes(Math.round(trip.loadStart))} -> ${formatMinutes(Math.round(trip.rigUpFinish))}`,
                   },
-                  h("span", { className: "schedule-trip-label" }, `#${trip.loadId}`),
+                  h("span", { className: "schedule-trip-label" }, getLoadDisplayLabel(trip)),
                   h("span", {
                     className: "schedule-segment schedule-segment-down",
                     style: {
@@ -586,6 +1523,10 @@ function LoadScheduleTable({ playback, currentMinute }) {
 }
 
 function FullScreenTimeline({ playback, currentMinute, zoom = 1, rowType = "truck", gapMinutes = 8 * 60 }) {
+  if (rowType === "cpm") {
+    return h(CPMNetworkDiagram, { playback, zoom });
+  }
+
   const headerScrollRef = useRef(null);
   const bodyScrollRef = useRef(null);
   const fixedBodyRef = useRef(null);
@@ -594,71 +1535,65 @@ function FullScreenTimeline({ playback, currentMinute, zoom = 1, rowType = "truc
   const [hoverCard, setHoverCard] = useState(null);
   const totalMinutes = Math.max(playback?.totalMinutes || 1, 1);
   const trips = playback?.trips || [];
-  const buildMergedPhaseItems = (phaseKey, toneClass, getRange) => {
-    const intervals = trips
+  const buildPhaseItems = (phaseKey, toneClass, getRange) =>
+    trips
       .map((trip, index) => {
         const [startMinute, endMinute] = getRange(trip);
         return {
           key: `${phaseKey}-${trip.truckId}-${trip.loadId}-${index}`,
+          loadId: trip.loadId,
           startMinute,
           endMinute,
+          left: (startMinute / totalMinutes) * 100,
+          width: ((endMinute - startMinute) / totalMinutes) * 100,
+      title: `${phaseKey} | ${getLoadDisplayLabel(trip)} | ${formatMinutes(Math.round(startMinute))} -> ${formatMinutes(Math.round(endMinute))}`,
+          toneClass,
+          label: getLoadDisplayLabel(trip),
         };
       })
       .filter((item) => item.endMinute > item.startMinute)
-      .sort((a, b) => a.startMinute - b.startMinute);
-
-    const merged = [];
-    intervals.forEach((item) => {
-      const previous = merged[merged.length - 1];
-      if (previous && item.startMinute <= previous.endMinute) {
-        previous.endMinute = Math.max(previous.endMinute, item.endMinute);
-        return;
-      }
-
-      merged.push({ ...item });
-    });
-
-    return merged.map((item, index) => ({
-      key: `${phaseKey}-merged-${index}`,
-      loadId: phaseKey,
-      startMinute: item.startMinute,
-      endMinute: item.endMinute,
-      left: (item.startMinute / totalMinutes) * 100,
-      width: ((item.endMinute - item.startMinute) / totalMinutes) * 100,
-      title: `${phaseKey} active | ${formatMinutes(Math.round(item.startMinute))} -> ${formatMinutes(Math.round(item.endMinute))}`,
-      toneClass,
-      label: `${formatTimelineClock(item.startMinute)} to ${formatTimelineClock(item.endMinute)}`,
-    }));
-  };
-  const rows = rowType === "phase"
-    ? [
-        {
-          key: "rig-down",
-          label: "Rig Down",
-          items: buildMergedPhaseItems("Rig Down", "scene-timeline-segment-down", (trip) => [trip.loadStart, trip.rigDownFinish]),
-        },
-        {
-          key: "move",
-          label: "Move",
-          items: buildMergedPhaseItems("Move", "scene-timeline-segment-move", (trip) => [trip.rigDownFinish, trip.arrivalAtDestination]),
-        },
-        {
-          key: "rig-up",
-          label: "Rig Up",
-          items: buildMergedPhaseItems("Rig Up", "scene-timeline-segment-up", (trip) => [trip.arrivalAtDestination, trip.rigUpFinish]),
-        },
-      ]
-    : buildTruckScheduleRows(playback, Math.max(...trips.map((trip) => trip.truckId), 1));
+      .sort((left, right) => left.startMinute - right.startMinute);
+  const rows = useMemo(
+    () => rowType === "phase"
+      ? [
+          {
+            key: "rig-down",
+            label: "Rig Down",
+            items: buildPhaseItems("Rig Down", "scene-timeline-segment-down", (trip) => [trip.rigDownStart ?? trip.loadStart, trip.rigDownFinish]),
+          },
+          {
+            key: "move",
+            label: "Move",
+            items: buildPhaseItems("Move", "scene-timeline-segment-move", (trip) => [trip.moveStart ?? trip.pickupLoadFinish ?? trip.rigDownFinish, trip.arrivalAtDestination]),
+          },
+          {
+            key: "rig-up",
+            label: "Rig Up",
+            items: buildPhaseItems("Rig Up", "scene-timeline-segment-up", (trip) => [trip.rigUpStart ?? trip.unloadDropFinish ?? trip.arrivalAtDestination, trip.rigUpFinish]),
+          },
+        ]
+      : rowType === "worker"
+        ? buildWorkerScheduleRows(playback)
+        : rowType === "load"
+          ? buildLoadScheduleRows(playback)
+          : rowType === "cpm"
+            ? buildCriticalPathRows(playback)
+          : buildTruckScheduleRows(playback),
+    [playback, rowType],
+  );
   const tickStepMinutes = Math.max(30, gapMinutes);
   const tickCount = Math.max(1, Math.ceil(totalMinutes / tickStepMinutes));
-  const ticks = Array.from({ length: tickCount + 1 }, (_, index) => {
-    const minute = Math.min(totalMinutes, index * tickStepMinutes);
-    return {
-      key: `timeline-tick-${index}`,
-      left: `${(minute / totalMinutes) * 100}%`,
-      label: formatMinutes(minute),
-    };
-  });
+  const ticks = useMemo(
+    () => Array.from({ length: tickCount + 1 }, (_, index) => {
+      const minute = Math.min(totalMinutes, index * tickStepMinutes);
+      return {
+        key: `timeline-tick-${index}`,
+        left: `${(minute / totalMinutes) * 100}%`,
+        label: formatMinutes(minute),
+      };
+    }),
+    [tickCount, tickStepMinutes, totalMinutes],
+  );
   const currentX = `${(Math.min(currentMinute, totalMinutes) / totalMinutes) * 100}%`;
   const pixelsPerTick = 180;
   const timelineWidth = Math.max(Math.round(tickCount * pixelsPerTick * zoom), 1);
@@ -753,7 +1688,7 @@ function FullScreenTimeline({ playback, currentMinute, zoom = 1, rowType = "truc
       h(
         "div",
         { className: "scene-timeline-header-copy" },
-        h("span", null, rowType === "phase" ? "Phase" : "Truck"),
+        h("span", null, rowType === "phase" ? "Phase" : rowType === "worker" ? "Worker" : rowType === "load" ? "Load" : rowType === "cpm" ? "CPM" : "Truck"),
         h("strong", null, "Schedule"),
       ),
       h(
@@ -763,8 +1698,20 @@ function FullScreenTimeline({ playback, currentMinute, zoom = 1, rowType = "truc
           h(
             "div",
             { key: `timeline-copy-${row.key || row.truckId}`, className: "scene-timeline-row-copy" },
-            h("strong", null, rowType === "phase" ? row.label : `Truck ${row.truckId}`),
-            h("span", null, rowType === "phase" ? `${row.items.length} active window${row.items.length === 1 ? "" : "s"}` : `${row.trips.length} loads in sequence`),
+            h("strong", null, rowType === "phase" ? row.label : rowType === "worker" ? row.label : rowType === "load" ? row.label : rowType === "cpm" ? row.label : `Truck ${row.truckId}`),
+            h(
+              "span",
+              null,
+              rowType === "phase"
+                ? `${row.items.length} active window${row.items.length === 1 ? "" : "s"}`
+                : rowType === "worker"
+                  ? `${row.items.length} assignments`
+                  : rowType === "load"
+                    ? `${row.items.length} task segment${row.items.length === 1 ? "" : "s"}`
+                  : rowType === "cpm"
+                    ? `${row.items.length} critical task${row.items.length === 1 ? "" : "s"}`
+                  : `${row.loadCount || row.items.length} road segment${(row.loadCount || row.items.length) === 1 ? "" : "s"}`,
+            ),
           ),
         ),
       ),
@@ -830,68 +1777,91 @@ function FullScreenTimeline({ playback, currentMinute, zoom = 1, rowType = "truc
           rows.map((row) => {
             const rowKey = row.key || row.truckId;
             const rowTrips = (row.items || row.trips || []).map((trip) => {
-              const tripStartMinute = rowType === "phase" ? trip.startMinute : trip.rigDownFinish;
-              const tripEndMinute = rowType === "phase" ? trip.endMinute : trip.arrivalAtDestination;
-              const tripWidthPercent = rowType === "phase"
-                ? trip.width
-                : (((trip.arrivalAtDestination - trip.rigDownFinish) / totalMinutes) * 100);
+              const tripStartMinute =
+                rowType === "phase" || rowType === "worker" || rowType === "load" || rowType === "cpm"
+                  ? trip.startMinute
+                  : trip.startMinute ?? trip.dispatchStart ?? trip.loadStart;
+              const tripEndMinute =
+                rowType === "phase" || rowType === "worker" || rowType === "load" || rowType === "cpm"
+                  ? trip.endMinute
+                  : trip.endMinute ?? trip.returnToSource ?? trip.rigUpFinish;
+              const tripWidthPercent =
+                rowType === "phase" || rowType === "worker" || rowType === "load" || rowType === "cpm"
+                  ? trip.width
+                  : trip.width ?? ((((trip.returnToSource ?? trip.rigUpFinish) - (trip.dispatchStart ?? trip.loadStart)) / totalMinutes) * 100);
               const tripWidthPx = (tripWidthPercent / 100) * timelineWidth;
               const tripSizeClass = tripWidthPx < 72 ? " is-micro" : tripWidthPx < 132 ? " is-compact" : "";
               const visibleDuration = Math.max(0, Math.min(currentMinute, tripEndMinute) - tripStartMinute);
               const activeFillPercent = tripEndMinute > tripStartMinute
                 ? Math.max(0, Math.min(100, (visibleDuration / (tripEndMinute - tripStartMinute)) * 100))
                 : 0;
-              const toneClass = rowType === "phase" ? trip.toneClass : (trip.toneClass || row.toneClass || "scene-timeline-segment-truck-heavyhaul");
+              const toneClass = trip.toneClass || row.toneClass || "scene-timeline-segment-truck-heavyhaul";
+              const leftPercent =
+                rowType === "phase" || rowType === "worker" || rowType === "load" || rowType === "cpm"
+                  ? trip.left
+                  : trip.left ?? (((trip.dispatchStart ?? trip.loadStart) / totalMinutes) * 100);
+              const labelText = rowType === "phase"
+                ? trip.label
+                : rowType === "worker"
+                  ? `${formatTimelineClock(trip.startMinute)} to ${formatTimelineClock(trip.endMinute)}`
+                  : rowType === "load"
+                    ? trip.label
+                  : rowType === "cpm"
+                    ? trip.label
+                  : `${formatTimelineClock(tripStartMinute)} to ${formatTimelineClock(tripEndMinute)}`;
+              const hoverText = rowType === "phase"
+                ? `${row.label} | ${getLoadDisplayLabel(trip)} | ${formatTimelineClock(tripStartMinute)} -> ${formatTimelineClock(tripEndMinute)}`
+                : rowType === "worker"
+                  ? `${row.label} | ${getLoadDisplayLabel(trip)} | ${formatTimelineClock(tripStartMinute)} -> ${formatTimelineClock(tripEndMinute)}`
+                  : rowType === "load"
+                    ? `${row.label} | ${trip.label} | ${formatTimelineClock(tripStartMinute)} -> ${formatTimelineClock(tripEndMinute)}`
+                  : rowType === "cpm"
+                    ? `${row.label} | Critical ${trip.label} | ${formatTimelineClock(tripStartMinute)} -> ${formatTimelineClock(tripEndMinute)}`
+                  : `Truck ${row.truckId} | ${getLoadDisplayLabel(trip)} | ${formatTimelineClock(tripStartMinute)} -> ${formatTimelineClock(tripEndMinute)}`;
 
               return h(
                 "div",
                 {
                   key: trip.key,
-                  className: `scene-timeline-trip${rowType === "phase" ? " is-phase" : " is-truck"}${tripSizeClass}`,
+                  className: `scene-timeline-trip${rowType === "phase" ? " is-phase" : rowType === "load" ? " is-phase" : rowType === "cpm" ? " is-phase" : " is-truck"}${tripSizeClass}`,
                   style: {
-                    left: `${rowType === "phase" ? trip.left : ((trip.rigDownFinish / totalMinutes) * 100)}%`,
+                    left: `${leftPercent}%`,
                     width: `${tripWidthPercent}%`,
                   },
-                  onPointerEnter: (event) =>
-                    handleTripHover(
-                      event,
-                      `${rowType === "phase" ? row.label : trip.description} | ${formatTimelineClock(tripStartMinute)} -> ${formatTimelineClock(tripEndMinute)}`,
-                    ),
-                  onPointerMove: (event) =>
-                    handleTripHover(
-                      event,
-                      `${rowType === "phase" ? row.label : trip.description} | ${formatTimelineClock(tripStartMinute)} -> ${formatTimelineClock(tripEndMinute)}`,
-                    ),
+                  onPointerEnter: (event) => handleTripHover(event, hoverText),
+                  onPointerMove: (event) => handleTripHover(event, hoverText),
                   onPointerLeave: () => setHoverCard(null),
                 },
                 h(
                   "div",
                   { className: "scene-timeline-trip-shell" },
-                  h("span", {
-                    className: `scene-timeline-segment scene-timeline-segment-future ${toneClass}`,
-                    style: {
-                      left: "0%",
-                      width: "100%",
-                    },
-                  }),
-                  h("span", {
-                    className: `scene-timeline-segment scene-timeline-segment-active${activeFillPercent >= 99.5 ? " is-complete" : ""} ${toneClass}`,
-                    style: {
-                      left: "0%",
-                      width: `${activeFillPercent}%`,
-                    },
-                  }),
+                  [
+                    h("span", {
+                      key: `${trip.key}-future`,
+                      className: `scene-timeline-segment scene-timeline-segment-future ${toneClass}`,
+                      style: {
+                        left: "0%",
+                        width: "100%",
+                      },
+                    }),
+                    h("span", {
+                      key: `${trip.key}-active`,
+                      className: `scene-timeline-segment scene-timeline-segment-active${activeFillPercent >= 99.5 ? " is-complete" : ""} ${toneClass}`,
+                      style: {
+                        left: "0%",
+                        width: `${activeFillPercent}%`,
+                      },
+                    }),
+                  ],
                   h(
                     "span",
                     { className: "scene-timeline-trip-pill" },
-                    rowType === "phase" ? row.label : `#${trip.loadId}`,
+                    rowType === "phase" ? row.label : rowType === "worker" ? "Crew" : rowType === "load" ? trip.label : rowType === "cpm" ? "CPM" : trip.label,
                   ),
                   h(
                     "span",
                     { className: "scene-timeline-trip-label" },
-                    rowType === "phase"
-                      ? trip.label
-                      : `${formatTimelineClock(trip.rigDownFinish)} to ${formatTimelineClock(trip.arrivalAtDestination)}`,
+                    labelText,
                   ),
                 ),
               );
@@ -933,9 +1903,9 @@ function getTimelineWorkingMinutes(playback, rowType) {
 
   if (rowType === "phase") {
     const phaseRanges = [
-      (trip) => [trip.loadStart, trip.rigDownFinish],
-      (trip) => [trip.rigDownFinish, trip.arrivalAtDestination],
-      (trip) => [trip.arrivalAtDestination, trip.rigUpFinish],
+      (trip) => [trip.rigDownStart ?? trip.loadStart, trip.rigDownFinish],
+      (trip) => [trip.moveStart ?? trip.pickupLoadFinish ?? trip.rigDownFinish, trip.arrivalAtDestination],
+      (trip) => [trip.rigUpStart ?? trip.unloadDropFinish ?? trip.arrivalAtDestination, trip.rigUpFinish],
     ];
 
     return phaseRanges.reduce((sum, getRange) => {
@@ -961,7 +1931,45 @@ function getTimelineWorkingMinutes(playback, rowType) {
     }, 0);
   }
 
-  return trips.reduce((sum, trip) => sum + Math.max(0, trip.arrivalAtDestination - trip.rigDownFinish), 0);
+  if (rowType === "worker") {
+    return trips.reduce(
+      (sum, trip) =>
+        sum +
+        (Math.max(0, trip.rigDownFinish - (trip.rigDownStart ?? trip.loadStart)) * Math.max(0, Number.parseInt(trip.rigDownWorkerCount, 10) || 0)) +
+        (Math.max(0, (trip.pickupLoadFinish ?? 0) - (trip.pickupLoadStart ?? trip.rigDownFinish ?? 0)) * Math.max(0, Number.parseInt(trip.pickupLoadWorkerCount, 10) || 0)) +
+        (Math.max(0, (trip.unloadDropFinish ?? 0) - (trip.unloadDropStart ?? trip.arrivalAtDestination ?? 0)) * Math.max(0, Number.parseInt(trip.unloadDropWorkerCount, 10) || 0)) +
+        (Math.max(0, trip.rigUpFinish - (trip.rigUpStart ?? trip.unloadDropFinish ?? trip.arrivalAtDestination)) * Math.max(0, Number.parseInt(trip.rigUpWorkerCount, 10) || 0)),
+      0,
+    );
+  }
+
+  if (rowType === "load") {
+    return trips.reduce(
+      (sum, trip) =>
+        sum +
+        Math.max(0, (trip.rigDownFinish || 0) - (trip.rigDownStart ?? trip.loadStart ?? 0)) +
+        Math.max(0, (trip.pickupLoadFinish || 0) - (trip.pickupLoadStart ?? trip.rigDownFinish ?? 0)) +
+        Math.max(0, (trip.arrivalAtDestination || 0) - (trip.moveStart || trip.pickupLoadFinish || trip.rigDownFinish || 0)) +
+        Math.max(0, (trip.unloadDropFinish || 0) - (trip.unloadDropStart ?? trip.arrivalAtDestination ?? 0)) +
+        Math.max(0, (trip.rigUpFinish || 0) - (trip.rigUpStart || trip.unloadDropFinish || trip.arrivalAtDestination || 0)),
+      0,
+    );
+  }
+
+  if (rowType === "cpm") {
+    return (playback?.tasks || [])
+      .filter((task) => task.isCritical)
+      .reduce((sum, task) => sum + Math.max(0, task.endMinute - task.startMinute), 0);
+  }
+
+  return trips.reduce(
+    (sum, trip) =>
+      sum +
+      Math.max(0, (trip.pickupLoadStart || trip.loadStart || 0) - (trip.dispatchStart || trip.pickupLoadStart || trip.loadStart || 0)) +
+      Math.max(0, (trip.arrivalAtDestination || 0) - (trip.moveStart || trip.pickupLoadFinish || trip.rigDownFinish || 0)) +
+      Math.max(0, (trip.returnToSource || 0) - (trip.returnStart || trip.unloadDropFinish || trip.arrivalAtDestination || 0)),
+    0,
+  );
 }
 
 function parseFirstInteger(value) {
@@ -978,14 +1986,20 @@ function getLoadStage(trip, currentMinute) {
     return null;
   }
 
-  if (currentMinute < trip.loadStart) {
+  if (currentMinute < (trip.rigDownStart ?? trip.loadStart)) {
     return "queued";
   }
   if (currentMinute < trip.rigDownFinish) {
     return "loading";
   }
+  if (currentMinute < (trip.pickupLoadFinish ?? trip.moveStart ?? trip.arrivalAtDestination)) {
+    return "loading";
+  }
   if (currentMinute < trip.arrivalAtDestination) {
     return "in-transit";
+  }
+  if (currentMinute < (trip.unloadDropFinish ?? trip.rigUpStart ?? trip.rigUpFinish)) {
+    return "rig-up";
   }
   if (currentMinute < trip.rigUpFinish) {
     return "rig-up";
@@ -1062,6 +2076,23 @@ function formatPlanningDateTime(dateValue, timeValue) {
   }).format(date);
 }
 
+function formatDaysHours(totalMinutes) {
+  const safeMinutes = Math.max(0, Math.round(totalMinutes || 0));
+  const totalHours = Math.ceil(safeMinutes / 60);
+  const days = Math.floor(totalHours / 24);
+  const hours = totalHours % 24;
+
+  if (days <= 0) {
+    return `${hours}h`;
+  }
+
+  if (hours <= 0) {
+    return `${days}d`;
+  }
+
+  return `${days}d ${hours}h`;
+}
+
 function getPlanEtaLabel(dateValue, timeValue, durationMinutes) {
   const normalizedDate = normalizePlanningDate(dateValue);
   const planningStartMinutes = parsePlanningTimeMinutes(timeValue);
@@ -1084,38 +2115,40 @@ function answerLoadLocation({ trip, currentMinute, move }) {
   const stage = getLoadStage(trip, currentMinute);
   const sourceLabel = formatLocationLabel(move?.startLabel, "source");
   const destinationLabel = formatLocationLabel(move?.endLabel, "destination");
+  const loadLabel = getLoadDisplayLabel(trip);
 
   if (stage === "queued") {
-    return `Load #${trip.loadId} is queued at ${sourceLabel}. Truck ${trip.truckId} is scheduled to start it at ${formatMinutePoint(trip.loadStart)}.`;
+    return `${loadLabel} is queued at ${sourceLabel}. Truck ${trip.truckId} is scheduled to start it at ${formatMinutePoint(trip.loadStart)}.`;
   }
   if (stage === "loading") {
-    return `Load #${trip.loadId} is at ${sourceLabel} and currently loading on truck ${trip.truckId}. It should leave at ${formatMinutePoint(trip.rigDownFinish)}.`;
+    return `${loadLabel} is at ${sourceLabel} and currently loading on truck ${trip.truckId}. It should leave at ${formatMinutePoint(trip.rigDownFinish)}.`;
   }
   if (stage === "in-transit") {
-    return `Load #${trip.loadId} is in transit on truck ${trip.truckId} between ${sourceLabel} and ${destinationLabel}. ETA is ${formatMinutePoint(trip.arrivalAtDestination)}.`;
+    return `${loadLabel} is in transit on truck ${trip.truckId} between ${sourceLabel} and ${destinationLabel}. ETA is ${formatMinutePoint(trip.arrivalAtDestination)}.`;
   }
   if (stage === "rig-up") {
-    return `Load #${trip.loadId} has reached ${destinationLabel} and is in rig-up on truck ${trip.truckId}. Rig-up should finish at ${formatMinutePoint(trip.rigUpFinish)}.`;
+    return `${loadLabel} has reached ${destinationLabel} and is in rig-up on truck ${trip.truckId}. Rig-up should finish at ${formatMinutePoint(trip.rigUpFinish)}.`;
   }
-  return `Load #${trip.loadId} has been delivered to ${destinationLabel}. Rig-up finished at ${formatMinutePoint(trip.rigUpFinish)}.`;
+  return `${loadLabel} has been delivered to ${destinationLabel}. Rig-up finished at ${formatMinutePoint(trip.rigUpFinish)}.`;
 }
 
 function answerLoadTiming({ trip, currentMinute }) {
   const stage = getLoadStage(trip, currentMinute);
+  const loadLabel = getLoadDisplayLabel(trip);
 
   if (stage === "queued") {
-    return `Load #${trip.loadId} starts at ${formatMinutePoint(trip.loadStart)}, departs at ${formatMinutePoint(trip.rigDownFinish)}, arrives at ${formatMinutePoint(trip.arrivalAtDestination)}, and finishes rig-up at ${formatMinutePoint(trip.rigUpFinish)}.`;
+    return `${loadLabel} starts at ${formatMinutePoint(trip.loadStart)}, departs at ${formatMinutePoint(trip.rigDownFinish)}, arrives at ${formatMinutePoint(trip.arrivalAtDestination)}, and finishes rig-up at ${formatMinutePoint(trip.rigUpFinish)}.`;
   }
   if (stage === "loading") {
-    return `Load #${trip.loadId} is loading now. It should arrive in ${formatMinutePoint(trip.arrivalAtDestination - currentMinute)} at ${formatMinutePoint(trip.arrivalAtDestination)}.`;
+    return `${loadLabel} is loading now. It should arrive in ${formatMinutePoint(trip.arrivalAtDestination - currentMinute)} at ${formatMinutePoint(trip.arrivalAtDestination)}.`;
   }
   if (stage === "in-transit") {
-    return `Load #${trip.loadId} is already on the road. It should arrive in ${formatMinutePoint(trip.arrivalAtDestination - currentMinute)} at ${formatMinutePoint(trip.arrivalAtDestination)}.`;
+    return `${loadLabel} is already on the road. It should arrive in ${formatMinutePoint(trip.arrivalAtDestination - currentMinute)} at ${formatMinutePoint(trip.arrivalAtDestination)}.`;
   }
   if (stage === "rig-up") {
-    return `Load #${trip.loadId} already arrived at ${formatMinutePoint(trip.arrivalAtDestination)}. Rig-up should complete in ${formatMinutePoint(trip.rigUpFinish - currentMinute)} at ${formatMinutePoint(trip.rigUpFinish)}.`;
+    return `${loadLabel} already arrived at ${formatMinutePoint(trip.arrivalAtDestination)}. Rig-up should complete in ${formatMinutePoint(trip.rigUpFinish - currentMinute)} at ${formatMinutePoint(trip.rigUpFinish)}.`;
   }
-  return `Load #${trip.loadId} already arrived at ${formatMinutePoint(trip.arrivalAtDestination)} and finished at ${formatMinutePoint(trip.rigUpFinish)}.`;
+  return `${loadLabel} already arrived at ${formatMinutePoint(trip.arrivalAtDestination)} and finished at ${formatMinutePoint(trip.rigUpFinish)}.`;
 }
 
 function answerTruckStatus({ playback, truckId, currentMinute, move }) {
@@ -1132,14 +2165,14 @@ function answerTruckStatus({ playback, truckId, currentMinute, move }) {
   if (!activeTrip) {
     const nextTrip = truckTrips.find((trip) => currentMinute < trip.loadStart);
     if (nextTrip) {
-      return `Truck ${truckId} is waiting at ${formatLocationLabel(move?.startLabel, "source")} and will start load #${nextTrip.loadId} at ${formatMinutePoint(nextTrip.loadStart)}.`;
+      return `Truck ${truckId} is waiting at ${formatLocationLabel(move?.startLabel, "source")} and will start ${getLoadDisplayLabel(nextTrip)} at ${formatMinutePoint(nextTrip.loadStart)}.`;
     }
 
     const lastTrip = truckTrips[truckTrips.length - 1];
-    return `Truck ${truckId} completed its last assigned load, #${lastTrip.loadId}.`;
+    return `Truck ${truckId} completed its last assigned load, ${getLoadDisplayLabel(lastTrip)}.`;
   }
 
-  return answerLoadLocation({ trip: activeTrip, currentMinute, move }).replace(`Load #${activeTrip.loadId}`, `Truck ${truckId} with load #${activeTrip.loadId}`);
+  return answerLoadLocation({ trip: activeTrip, currentMinute, move }).replace(getLoadDisplayLabel(activeTrip), `Truck ${truckId} with ${getLoadDisplayLabel(activeTrip)}`);
 }
 
 function buildAssistantReply({ question, move, playback, currentMinute, rigLoads, lastLog, completion }) {
@@ -1169,7 +2202,7 @@ function buildAssistantReply({ question, move, playback, currentMinute, rigLoads
 
     const summary = movingTrips
       .slice(0, 5)
-      .map((trip) => `#${trip.loadId} on truck ${trip.truckId}`)
+      .map((trip) => `${getLoadDisplayLabel(trip)} on truck ${trip.truckId}`)
       .join(", ");
     return movingTrips.length > 5 ? `Loads currently moving: ${summary}, and ${movingTrips.length - 5} more.` : `Loads currently moving: ${summary}.`;
   }
@@ -1374,34 +2407,52 @@ export function RigMovePage({
   sceneFocusResetKey,
   logicalLoads,
   simulationError,
+  simulationProgress = { percent: 0, message: "" },
   onPlaybackSpeedChange,
   onSelectPlan,
   onRunPlayback,
   onRunCustomPlan,
   onPausePlayback,
   onEndPlayback,
+  onStartExecution,
+  onCompleteExecutionStage,
   onDeleteMove,
   onBack,
   onLogout,
   currentUser,
+  readOnly = false,
+  availableFleet = [],
+  availableWorkers = 0,
+  workerRoles = [],
+  truckSpecs = [],
+  executionState = "planning",
+  operatingState = "standby",
+  executionProgress = {},
+  teamMoves = [],
+  startupRequirements = [],
 }) {
   const previousMoveIdRef = useRef(move?.id || null);
   const speedDropdownRef = useRef(null);
   const [hasSceneInitialized, setHasSceneInitialized] = useState(Boolean(sceneAssetsReady));
-  const [truckSetup, setTruckSetup] = useState(() => normalizeTruckSetup(move));
+  const [SimulationScene3DComponent, setSimulationScene3DComponent] = useState(null);
+  const [LeafletMapComponent, setLeafletMapComponent] = useState(null);
+  const [truckSetup, setTruckSetup] = useState(() => normalizeTruckSetup(move, availableFleet));
   const [activeScenarioName, setActiveScenarioName] = useState(move?.simulation?.preferredScenarioName || "");
   const [activePlanKey, setActivePlanKey] = useState(move?.simulation?.preferredScenarioName || "");
   const [activeView, setActiveView] = useState(move?.activeView || "map");
-  const [sceneMode, setSceneMode] = useState(move?.sceneMode || "3d");
+  const [sceneMode, setSceneMode] = useState(move?.sceneMode || "2d");
   const [previousSceneMode, setPreviousSceneMode] = useState(
-    move?.previousSceneMode || (move?.sceneMode === "2d" || move?.sceneMode === "3d" ? move.sceneMode : "3d"),
+    move?.previousSceneMode || (move?.sceneMode === "2d" || move?.sceneMode === "3d" ? move.sceneMode : "2d"),
   );
-  const [activeStageKey, setActiveStageKey] = useState("planning");
-  const [timelineZoom, setTimelineZoom] = useState(move?.timelineZoom || 1);
+  const [activeStageKey, setActiveStageKey] = useState(
+    executionState === "completed" ? "operations" : executionState === "active" ? "execution" : "planning",
+  );
+  const [timelineZoom, setTimelineZoom] = useState(move?.timelineZoom || 0.5);
   const [timelineRowType, setTimelineRowType] = useState(move?.timelineRowType || "truck");
   const [timelineGapMinutes, setTimelineGapMinutes] = useState(move?.timelineGapMinutes || 3 * 60);
   const [planningStartDate, setPlanningStartDate] = useState(normalizePlanningDate(move?.planningStartDate, move?.createdAt));
-  const [planningStartTime, setPlanningStartTime] = useState(normalizePlanningTime(move?.planningStartTime));
+  const planningStartTime = "06:00";
+  const [workerRoleDraft, setWorkerRoleDraft] = useState(() => normalizeWorkerRoleDraft(availableWorkers, workerRoles));
   const [focusTarget, setFocusTarget] = useState(null);
   const [isSpeedDropdownOpen, setIsSpeedDropdownOpen] = useState(false);
   const [isDeleteConfirmOpen, setIsDeleteConfirmOpen] = useState(false);
@@ -1422,6 +2473,32 @@ export function RigMovePage({
       setHasSceneInitialized(true);
     }
   }, [sceneAssetsReady]);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    async function ensureSceneComponent() {
+      if (sceneMode === "3d" && !SimulationScene3DComponent) {
+        const module = await import("../components/map/SimulationScene3D.js");
+        if (!cancelled) {
+          setSimulationScene3DComponent(() => module.SimulationScene3D);
+        }
+      }
+
+      if (sceneMode === "2d" && !LeafletMapComponent) {
+        const module = await import("../components/map/LeafletMap.js");
+        if (!cancelled) {
+          setLeafletMapComponent(() => module.LeafletMap);
+        }
+      }
+    }
+
+    void ensureSceneComponent();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [sceneMode, SimulationScene3DComponent, LeafletMapComponent]);
 
   useEffect(() => {
     if (!isSpeedDropdownOpen) {
@@ -1445,55 +2522,82 @@ export function RigMovePage({
 
     setHasSceneInitialized(Boolean(sceneAssetsReady));
     if (isNewMove) {
-      setTruckSetup(normalizeTruckSetup(move));
+      setTruckSetup(normalizeTruckSetup(move, availableFleet));
+      setWorkerRoleDraft(normalizeWorkerRoleDraft(availableWorkers, workerRoles));
     }
-    setActiveScenarioName(move?.simulation?.preferredScenarioName || "");
+    if (isNewMove) {
+      setActiveScenarioName(move?.simulation?.preferredScenarioName || "");
+    } else if (
+      activeScenarioName &&
+      !(move?.simulation?.scenarioPlans || []).some((scenario) => scenario.name === activeScenarioName)
+    ) {
+      setActiveScenarioName(move?.simulation?.preferredScenarioName || "");
+    }
     setActivePlanKey((current) => {
       if (isNewMove) {
         previousMoveIdRef.current = move?.id || null;
         return move?.simulation?.preferredScenarioName || "";
       }
-
-      return current === "customize" ? "customize" : move?.simulation?.preferredScenarioName || "";
+      if (current === "customize") {
+        return "customize";
+      }
+      if (current && (move?.simulation?.scenarioPlans || []).some((scenario) => scenario.name === current)) {
+        return current;
+      }
+      return move?.simulation?.preferredScenarioName || "";
     });
     if (isNewMove) {
       setActiveView(move?.activeView || "map");
-      setSceneMode(move?.sceneMode || "3d");
+      setSceneMode(move?.sceneMode || "2d");
       setPreviousSceneMode(
-        move?.previousSceneMode || (move?.sceneMode === "2d" || move?.sceneMode === "3d" ? move.sceneMode : "3d"),
+        move?.previousSceneMode || (move?.sceneMode === "2d" || move?.sceneMode === "3d" ? move.sceneMode : "2d"),
       );
-      setTimelineZoom(move?.timelineZoom || 1);
+      setTimelineZoom(move?.timelineZoom || 0.5);
       setTimelineRowType(move?.timelineRowType || "truck");
       setTimelineGapMinutes(move?.timelineGapMinutes || 3 * 60);
       setPlanningStartDate(normalizePlanningDate(move?.planningStartDate, move?.createdAt));
-      setPlanningStartTime(normalizePlanningTime(move?.planningStartTime));
+      setActiveStageKey(
+        move?.executionState === "completed" ? "operations" : move?.executionState === "active" ? "execution" : "planning",
+      );
       setIsSpeedDropdownOpen(false);
       setIsDeleteConfirmOpen(false);
     }
     if (isNewMove) {
       setFocusTarget(null);
     }
-  }, [move?.id, move?.updatedAt]);
+  }, [move?.id, move?.updatedAt, workerRoles, availableFleet, availableWorkers, activeScenarioName, move?.simulation]);
 
   useEffect(() => {
     setFocusTarget(null);
   }, [sceneFocusResetKey]);
 
   useEffect(() => {
+    setActiveStageKey(
+      executionState === "completed" ? "operations" : executionState === "active" ? "execution" : "planning",
+    );
+  }, [executionState]);
+
+  useEffect(() => {
     if (!move?.id) {
       return;
     }
 
-    persistMoveSession(move.id, {
-      activeView,
-      sceneMode,
-      previousSceneMode,
-      timelineZoom,
-      timelineRowType,
-      timelineGapMinutes,
-      planningStartDate,
-      planningStartTime,
-    });
+    const timeoutId = window.setTimeout(() => {
+      void persistMoveSession(move.id, {
+        activeView,
+        sceneMode,
+        previousSceneMode,
+        timelineZoom,
+        timelineRowType,
+        timelineGapMinutes,
+        planningStartDate,
+        planningStartTime,
+      }).catch(() => {});
+    }, 500);
+
+    return () => {
+      window.clearTimeout(timeoutId);
+    };
   }, [move?.id, activeView, sceneMode, previousSceneMode, timelineZoom, timelineRowType, timelineGapMinutes, planningStartDate, planningStartTime]);
 
   if (isLoadingMove) {
@@ -1501,7 +2605,7 @@ export function RigMovePage({
       AppLayout,
       {
         title: "Loading rig move",
-        subtitle: "Restoring the saved move from local storage.",
+        subtitle: "Restoring the saved move from the database.",
         currentUser,
         onLogout,
         onBack,
@@ -1539,45 +2643,45 @@ export function RigMovePage({
         Card,
         { className: "empty-state" },
         h("h2", null, "Move unavailable"),
-        h("p", { className: "muted-copy" }, "Open the dashboard and run the move simulation after setting the fleet."),
+        h("p", { className: "muted-copy" }, "Open the dashboard and start execution after setting the fleet plan."),
       ),
     );
   }
 
-  const scenarioPlans = move.simulation.scenarioPlans || [];
-  const activeScenario =
-    scenarioPlans.find((scenario) => scenario.name === activeScenarioName) ||
-    scenarioPlans[0];
+  const baseScenarioPlans = move.simulation.scenarioPlans || [];
+  const baseActiveScenario =
+    baseScenarioPlans.find((scenario) => scenario.name === activeScenarioName) ||
+    baseScenarioPlans[0];
   const totalTrucks = truckSetup.reduce((sum, item) => sum + (Number.parseInt(item.count, 10) || 0), 0);
-  const isCustomizeActive = activePlanKey === "customize";
+  const isCustomizeActive = !readOnly && activePlanKey === "customize";
+  const customAvailableWorkers = isCustomizeActive ? buildWorkerAvailabilityOverride(workerRoleDraft) : availableWorkers;
   const deferredTruckSetup = useDeferredValue(truckSetup);
   const deferredTotalTrucks = deferredTruckSetup.reduce((sum, item) => sum + (Number.parseInt(item.count, 10) || 0), 0);
-  const customPreviewScenario = useMemo(() => {
-    if (!isCustomizeActive || !logicalLoads?.length) {
-      return null;
-    }
-
-    const routeData = {
-      minutes: move.simulation?.routeMinutes || activeScenario?.routeMinutes || 0,
-      geometry: move.simulation?.routeGeometry || activeScenario?.routeGeometry || [],
-      source: move.simulation?.routeSource || activeScenario?.routeSource || "Preview route",
-    };
-    const previewWorkerCount = Math.max(move.simulation?.workerCount || 0, deferredTotalTrucks + 2);
-    const previewPlans = buildScenarioPlans(logicalLoads, routeData, previewWorkerCount, deferredTotalTrucks, deferredTruckSetup);
-
-    return (
-      previewPlans.find((scenario) => scenario.truckCount === deferredTotalTrucks) ||
-      previewPlans[0] ||
-      null
-    );
-  }, [isCustomizeActive, logicalLoads, move.simulation, activeScenario, deferredTotalTrucks]);
-  const selectedScenario = isCustomizeActive && customPreviewScenario ? customPreviewScenario : activeScenario;
+  const planningRouteData = {
+    minutes: move.simulation?.routeMinutes || baseActiveScenario?.routeMinutes || 0,
+    distanceKm: move.simulation?.routeDistanceKm || baseActiveScenario?.routeDistanceKm || move.routeKm || 0,
+    geometry: move.simulation?.routeGeometry || baseActiveScenario?.routeGeometry || [],
+    source: move.simulation?.routeSource || baseActiveScenario?.routeSource || "Preview route",
+  };
+  const scenarioPlans = baseScenarioPlans;
+  const activeScenario =
+    scenarioPlans.find((scenario) => scenario.name === activeScenarioName) ||
+    scenarioPlans[0] ||
+    baseActiveScenario;
+  const selectedScenario = activeScenario;
+  const selectedAllocatedTruckSetup = selectedScenario?.allocatedTruckSetup || selectedScenario?.truckSetup || truckSetup;
   const effectiveTruckCount = isCustomizeActive
-    ? (deferredTotalTrucks || totalTrucks || selectedScenario?.truckCount || 1)
-    : (selectedScenario?.truckCount || totalTrucks || 1);
+    ? (deferredTotalTrucks || totalTrucks || selectedScenario?.allocatedTruckCount || selectedScenario?.truckCount || 1)
+    : (
+        selectedAllocatedTruckSetup.reduce((sum, truck) => sum + Math.max(0, Number.parseInt(truck?.count, 10) || 0), 0) ||
+        selectedScenario?.allocatedTruckCount ||
+        selectedScenario?.truckCount ||
+        totalTrucks ||
+        1
+      );
   const effectiveTruckSetup = isCustomizeActive
     ? deferredTruckSetup
-    : buildDisplayedTruckCounts(truckSetup, effectiveTruckCount).map((truck) => ({
+    : buildDisplayedTruckCounts(selectedAllocatedTruckSetup, effectiveTruckCount).map((truck) => ({
         ...truck,
         count: String(truck.count),
       }));
@@ -1600,11 +2704,31 @@ export function RigMovePage({
   const visibleMinute = sceneAssetsReady ? Math.min(currentMinute, totalMinutes) : 0;
   const canResumePlayback = visibleMinute > 0 && visibleMinute < totalMinutes;
   const completion = Math.min(100, Math.round((visibleMinute / Math.max(totalMinutes, 1)) * 100));
-  const phases = getPhasePercentages(displaySimulation.bestPlan.playback, visibleMinute);
-  const rigLoads = getRigLoadCounts(displaySimulation.bestPlan.playback, visibleMinute);
-  const lastLog = displaySimulation.bestPlan.playback.steps.filter((step) => step.minute <= visibleMinute).slice(-1)[0] || displaySimulation.bestPlan.playback.steps[0];
-  const activePlanSummary = getPlanSummary(selectedScenario);
-  const activePlanDashboard = getPlanDashboardStats(selectedScenario, move);
+  const phases = useMemo(
+    () => getPhasePercentages(displaySimulation.bestPlan.playback, visibleMinute),
+    [displaySimulation.bestPlan.playback, visibleMinute],
+  );
+  const rigLoads = useMemo(
+    () => getRigLoadCounts(displaySimulation.bestPlan.playback, visibleMinute),
+    [displaySimulation.bestPlan.playback, visibleMinute],
+  );
+  const lastLog = useMemo(
+    () => displaySimulation.bestPlan.playback.steps.filter((step) => step.minute <= visibleMinute).slice(-1)[0] || displaySimulation.bestPlan.playback.steps[0],
+    [displaySimulation.bestPlan.playback, visibleMinute],
+  );
+  const activePlanSummary = useMemo(
+    () => getPlanSummary(selectedScenario),
+    [selectedScenario],
+  );
+  const activePlanDashboard = useMemo(
+    () => getPlanDashboardStats(selectedScenario, move),
+    [selectedScenario, move],
+  );
+  const workerRoleSummaryRows = buildWorkerRoleSummaryRows(
+    displaySimulation.bestPlan.playback,
+    customAvailableWorkers?.roles ? customAvailableWorkers : availableWorkers,
+    workerRoles,
+  );
   const displayedTruckCounts = useMemo(
     () => buildDisplayedTruckCounts(effectiveTruckSetup, effectiveTruckCount),
     [effectiveTruckSetup, effectiveTruckCount],
@@ -1636,6 +2760,26 @@ export function RigMovePage({
     [scenarioPlans, selectedScenario, move, visibleMinute],
   );
   const isPlaybackActiveState = isPlaybackRunning || isPlaybackPaused;
+  const operatingSnapshot = useMemo(
+    () =>
+      buildOperatingSnapshot({
+        move,
+        teamMoves,
+        logicalLoads,
+        startupRequirements,
+      }),
+    [move, teamMoves, logicalLoads, startupRequirements],
+  );
+  const drillingReadinessPercent = operatingSnapshot.startupSummary.totalUnits
+    ? Math.round((operatingSnapshot.startupSummary.coveredUnits / operatingSnapshot.startupSummary.totalUnits) * 100)
+    : 0;
+  const startupTransferSchedule = useMemo(
+    () =>
+      move?.simulation?.supportRoutes?.length
+        ? move.simulation.supportRoutes
+        : buildStartupTransferSchedule(operatingSnapshot.startupLoads, formatLocationLabel(move?.endLabel, "Destination")),
+    [move?.simulation?.supportRoutes, operatingSnapshot, move?.endLabel],
+  );
   const focusedTruckOverviewTitle = !isPlaybackActiveState
     ? "Truck Overview"
     : focusedTruckStats && (focusedTruckStats.statusLabel === "In Transit" || focusedTruckStats.statusLabel === "Returning")
@@ -1650,7 +2794,7 @@ export function RigMovePage({
         : "Idle";
 
   function updateTruckCount(truckId, nextCountValue) {
-    const parsedCount = Math.max(1, Number.parseInt(nextCountValue, 10) || 1);
+    const parsedCount = Math.max(0, Number.parseInt(nextCountValue, 10) || 0);
 
     setTruckSetup((current) =>
       current.map((item) =>
@@ -1659,7 +2803,7 @@ export function RigMovePage({
     );
   }
 
-  if (!sceneAssetsReady && !hasSceneInitialized) {
+  if (sceneMode === "3d" && !sceneAssetsReady && !hasSceneInitialized) {
     return h(
       AppLayout,
       {
@@ -1672,7 +2816,7 @@ export function RigMovePage({
       h(
         Card,
         { className: "empty-state scene-loading-card" },
-        h("h2", null, "Loading 3D simulation assets"),
+        h("h2", null, "Loading 3D operation assets"),
         h("p", { className: "muted-copy" }, "The page will open after the truck and rig models finish loading."),
       ),
     );
@@ -1699,10 +2843,61 @@ export function RigMovePage({
     playbackSpeedOptions.findIndex((option) => option.value === String(playbackSpeed)),
   );
   const isTimelineMode = sceneMode === "timeline";
-  const timelineRowsCount = timelineRowType === "phase" ? 3 : effectiveTruckCount;
-  const timelineWorkingMinutes = getTimelineWorkingMinutes(displaySimulation.bestPlan.playback, timelineRowType);
+  const canEditPlan = !readOnly && executionState === "planning" && !isPlaybackRunning && !isPlaybackPaused;
+  const workerTimelineRows = useMemo(
+    () => (isTimelineMode && timelineRowType === "worker" ? buildWorkerScheduleRows(displaySimulation.bestPlan.playback) : []),
+    [isTimelineMode, timelineRowType, displaySimulation.bestPlan.playback],
+  );
+  const loadTimelineRows = useMemo(
+    () => (isTimelineMode && timelineRowType === "load" ? buildLoadScheduleRows(displaySimulation.bestPlan.playback) : []),
+    [isTimelineMode, timelineRowType, displaySimulation.bestPlan.playback],
+  );
+  const criticalPathTimelineRows = useMemo(
+    () => (isTimelineMode && timelineRowType === "cpm" ? buildCriticalPathRows(displaySimulation.bestPlan.playback) : []),
+    [isTimelineMode, timelineRowType, displaySimulation.bestPlan.playback],
+  );
+  const timelineRowsCount = !isTimelineMode
+    ? 0
+    : timelineRowType === "phase"
+      ? 3
+      : timelineRowType === "worker"
+        ? Math.max(workerTimelineRows.length, 1)
+        : timelineRowType === "load"
+          ? Math.max(loadTimelineRows.length, 1)
+          : timelineRowType === "cpm"
+            ? Math.max(criticalPathTimelineRows.length, 1)
+          : effectiveTruckCount;
+  const timelineWorkingMinutes = useMemo(
+    () => (isTimelineMode ? getTimelineWorkingMinutes(displaySimulation.bestPlan.playback, timelineRowType) : 0),
+    [isTimelineMode, displaySimulation.bestPlan.playback, timelineRowType],
+  );
+  const truckTimelineWorkingMinutes = useMemo(
+    () => (isTimelineMode ? getTimelineWorkingMinutes(displaySimulation.bestPlan.playback, "truck") : 0),
+    [isTimelineMode, displaySimulation.bestPlan.playback],
+  );
+  const workerTimelineWorkingMinutes = useMemo(
+    () => (isTimelineMode && timelineRowType === "worker" ? getTimelineWorkingMinutes(displaySimulation.bestPlan.playback, "worker") : 0),
+    [isTimelineMode, timelineRowType, displaySimulation.bestPlan.playback],
+  );
+  const loadTimelineWorkingMinutes = useMemo(
+    () => (isTimelineMode && timelineRowType === "load" ? getTimelineWorkingMinutes(displaySimulation.bestPlan.playback, "load") : 0),
+    [isTimelineMode, timelineRowType, displaySimulation.bestPlan.playback],
+  );
+  const criticalPathTimelineWorkingMinutes = useMemo(
+    () => (isTimelineMode && timelineRowType === "cpm" ? getTimelineWorkingMinutes(displaySimulation.bestPlan.playback, "cpm") : 0),
+    [isTimelineMode, timelineRowType, displaySimulation.bestPlan.playback],
+  );
   const timelineWorkingMinutesPerTruck = Math.round(
-    getTimelineWorkingMinutes(displaySimulation.bestPlan.playback, "truck") / Math.max(effectiveTruckCount, 1),
+    truckTimelineWorkingMinutes / Math.max(effectiveTruckCount, 1),
+  );
+  const timelineWorkingMinutesPerWorkerRole = Math.round(
+    workerTimelineWorkingMinutes / Math.max(workerTimelineRows.length, 1),
+  );
+  const timelineWorkingMinutesPerLoad = Math.round(
+    loadTimelineWorkingMinutes / Math.max(loadTimelineRows.length, 1),
+  );
+  const timelineWorkingMinutesPerCriticalLoad = Math.round(
+    criticalPathTimelineWorkingMinutes / Math.max(criticalPathTimelineRows.length, 1),
   );
   const timelineUtilizationPercent = Math.min(
     100,
@@ -1710,6 +2905,162 @@ export function RigMovePage({
   );
   const planningStartDateLabel = formatPlanningDateLabel(planningStartDate);
   const planEtaLabel = getPlanEtaLabel(planningStartDate, planningStartTime, activePlanSummary.totalMinutes);
+  const isExecutionActive = executionState === "active";
+  const isExecutionCompleted = executionState === "completed";
+  const isPlanningStage = executionState === "planning";
+  const isOperationsStage = executionState === "completed";
+  const rigDownCompleted = Boolean(executionProgress?.rigDownCompleted);
+  const rigUpCompleted = Boolean(executionProgress?.rigUpCompleted);
+  const executionDetailRows = isPlanningStage
+    ? []
+    : [
+        { key: "reserved", label: "Trucks Reserved", value: executionProgress?.trucksReserved ? "Yes" : "Pending" },
+        { key: "manager", label: "Manager Notified", value: executionProgress?.managerNotified ? "Sent" : "Pending" },
+        { key: "live", label: "Driver Live Data", value: executionProgress?.liveDataRequested ? "Waiting on backend" : "Not requested" },
+        { key: "rigdown", label: "Rig Down", value: rigDownCompleted ? "Completed" : "Pending" },
+        { key: "rigup", label: "Rig Up", value: rigUpCompleted ? "Completed" : "Pending" },
+      ];
+  const readOnlyBanner = readOnly
+    ? h("p", { className: "muted-copy section-spacing" }, "Manager inspection mode. Planning and playback controls are disabled for this rig.")
+    : null;
+  const progressPercent = Math.max(1, Number(simulationProgress?.percent) || 0);
+  const progressStageLabel =
+    simulationProgress?.totalStages > 0
+      ? `${simulationProgress?.completedStages || 0}/${simulationProgress.totalStages} stages`
+      : "Planning";
+  const progressElapsedLabel = formatProgressDuration(simulationProgress?.elapsedMs || 0);
+  const progressRemainingLabel =
+    progressPercent >= 100 ? "0s" : formatProgressDuration(simulationProgress?.remainingMs || 0);
+  const simulationOverlay = isSimulating
+    ? h(
+        "div",
+        {
+          className: "scene-loading-overlay",
+          style: {
+            position: "fixed",
+            inset: "0",
+            background: "rgba(7, 10, 14, 0.86)",
+            backdropFilter: "blur(10px)",
+            zIndex: "1200",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            padding: "24px",
+          },
+        },
+        h(
+          "div",
+          {
+            className: "scene-loading-card",
+            style: {
+              width: "min(520px, 100%)",
+              padding: "24px",
+              borderRadius: "20px",
+              background: "rgba(15, 19, 26, 0.96)",
+              border: "1px solid rgba(210, 180, 70, 0.22)",
+              boxShadow: "0 20px 60px rgba(0,0,0,0.35)",
+              display: "grid",
+              gap: "14px",
+          },
+        },
+        h("span", { className: "scene-panel-kicker" }, "Planning Engine"),
+        h("strong", { style: { fontSize: "1.15rem" } }, simulationProgress?.message || "Building execution plan"),
+          h("p", { className: "muted-copy", style: { margin: 0 } }, simulationProgress?.detail || "The planner is still running. Large fleets and worker combinations can take longer."),
+          h(ProgressBar, { value: progressPercent }),
+          h(
+            "div",
+            { className: "scene-dashboard-pair" },
+            h("div", { className: "scene-dashboard-inline scene-dashboard-pair-item" }, h("span", { className: "scene-dashboard-label" }, "Completed"), h("strong", null, progressStageLabel)),
+            h("div", { className: "scene-dashboard-inline scene-dashboard-pair-item" }, h("span", { className: "scene-dashboard-label" }, "Elapsed"), h("strong", null, progressElapsedLabel)),
+          ),
+          h(
+            "div",
+            { className: "scene-dashboard-pair" },
+            h("div", { className: "scene-dashboard-inline scene-dashboard-pair-item" }, h("span", { className: "scene-dashboard-label" }, "Progress"), h("strong", null, `${progressPercent}%`)),
+            h("div", { className: "scene-dashboard-inline scene-dashboard-pair-item" }, h("span", { className: "scene-dashboard-label" }, "Remaining"), h("strong", null, progressRemainingLabel)),
+          ),
+        ),
+      )
+    : null;
+  const operatingStatusLabel = operatingState === "drilling" ? "Drilling" : "Standby";
+  const executionStatusLabel = isExecutionCompleted ? "Drilling" : isExecutionActive ? "Reserved and active" : "Planning only";
+  const executionStatusRow = !isPlanningStage
+    ? h("div", { className: "truck-count-row" }, h("span", null, "Execution Status"), h("strong", null, executionStatusLabel))
+    : null;
+  const executionStatusOverlayRow = !isPlanningStage
+    ? h("div", { className: "truck-count-row scene-passive-overlay" }, h("span", null, "Execution Status"), h("strong", null, executionStatusLabel))
+    : null;
+  const executionSummary = !isPlanningStage
+    ? h(
+        "section",
+        { className: "scene-panel-section scene-panel-section-plain" },
+        executionDetailRows.map((item) =>
+          h(
+            "div",
+            { key: item.key, className: "truck-count-row" },
+            h("span", null, item.label),
+            h("strong", null, item.value),
+          ),
+        ),
+      )
+    : null;
+  const executionActions = !readOnly && isExecutionActive
+    ? h(
+        "div",
+        { className: "scene-panel-actions scene-panel-actions-inline" },
+        h(Button, {
+          type: "button",
+          variant: rigDownCompleted ? "ghost" : "primary",
+          disabled: rigDownCompleted,
+          onClick: () => onCompleteExecutionStage?.({ moveId: move.id, stage: "rigDown" }),
+          children: rigDownCompleted ? "Rig Down Complete" : "Complete Rig Down",
+        }),
+        h(Button, {
+          type: "button",
+          variant: rigUpCompleted ? "ghost" : "primary",
+          disabled: !rigDownCompleted || rigUpCompleted,
+          onClick: () => onCompleteExecutionStage?.({ moveId: move.id, stage: "rigUp" }),
+          children: rigUpCompleted ? "Rig Up Complete" : "Complete Rig Up",
+        }),
+      )
+    : null;
+  const startupKpiSection = h(
+    "section",
+    { className: "scene-panel-section" },
+    h(
+      "div",
+      { className: "scene-panel-head" },
+      h("span", { className: "scene-panel-kicker" }, isOperationsStage ? "Drilling Readiness" : "Extra Loads"),
+      h("strong", null, `${operatingSnapshot.startupSummary.missingUnits} Missing`),
+    ),
+    h(
+      "div",
+      { className: "scene-stat-grid" },
+      h("div", { className: "scene-stat-card" }, h("span", null, "Needed"), h("strong", null, String(operatingSnapshot.startupSummary.totalUnits))),
+      h("div", { className: "scene-stat-card" }, h("span", null, "Sourced"), h("strong", null, String(operatingSnapshot.startupSummary.coveredUnits))),
+      h("div", { className: "scene-stat-card" }, h("span", null, "Missing"), h("strong", null, String(operatingSnapshot.startupSummary.missingUnits))),
+      h("div", { className: "scene-stat-card" }, h("span", null, "Readiness"), h("strong", null, `${drillingReadinessPercent}%`)),
+    ),
+  );
+  const reusableKpiSection = isOperationsStage
+    ? h(
+        "section",
+        { className: "scene-panel-section" },
+        h(
+          "div",
+          { className: "scene-panel-head" },
+          h("span", { className: "scene-panel-kicker" }, "Reusable Stock"),
+          h("strong", null, operatingStatusLabel),
+        ),
+        h(
+          "div",
+          { className: "scene-stat-grid" },
+          h("div", { className: "scene-stat-card" }, h("span", null, "Units"), h("strong", null, String(operatingSnapshot.reusableSummary.totalUnits))),
+          h("div", { className: "scene-stat-card" }, h("span", null, "Categories"), h("strong", null, String(operatingSnapshot.reusableSummary.categoryCount))),
+          h("div", { className: "scene-stat-card" }, h("span", null, "Critical"), h("strong", null, String(operatingSnapshot.reusableSummary.criticalUnits))),
+        ),
+      )
+    : null;
 
   function handleFocusChange(nextFocusTarget) {
     setFocusTarget(nextFocusTarget || null);
@@ -1748,31 +3099,33 @@ export function RigMovePage({
                     }),
                   ),
                 }),
-                h(
-                  Button,
-                  {
-                    type: "button",
-                    variant: "ghost",
-                    className: "scene-back-button scene-back-button-inline scene-delete-button",
-                    onClick: () => setIsDeleteConfirmOpen(true),
-                    "aria-label": "Delete move",
-                  },
-                  h(
-                    "svg",
-                    {
-                      className: "scene-back-icon",
-                      viewBox: "0 0 16 16",
-                      "aria-hidden": "true",
-                    },
-                    h("path", {
-                      d: "M 5.2 5.2 L 10.8 10.8 M 10.8 5.2 L 5.2 10.8",
-                      fill: "none",
-                      stroke: "currentColor",
-                      "stroke-width": "2",
-                      "stroke-linecap": "round",
-                    }),
-                  ),
-                ),
+                !readOnly
+                  ? h(
+                      Button,
+                      {
+                        type: "button",
+                        variant: "ghost",
+                        className: "scene-back-button scene-back-button-inline scene-delete-button",
+                        onClick: () => setIsDeleteConfirmOpen(true),
+                        "aria-label": "Delete move",
+                      },
+                      h(
+                        "svg",
+                        {
+                          className: "scene-back-icon",
+                          viewBox: "0 0 16 16",
+                          "aria-hidden": "true",
+                        },
+                        h("path", {
+                          d: "M 5.2 5.2 L 10.8 10.8 M 10.8 5.2 L 5.2 10.8",
+                          fill: "none",
+                          stroke: "currentColor",
+                          "stroke-width": "2",
+                          "stroke-linecap": "round",
+                        }),
+                      ),
+                    )
+                  : null,
                 h(Button, {
                   type: "button",
                   variant: "ghost",
@@ -1806,8 +3159,8 @@ export function RigMovePage({
                       ),
                     },
                     {
-                      key: "tracking",
-                      label: "Tracking",
+                      key: "execution",
+                      label: "Execution",
                       icon: h(
                         "svg",
                         { className: "scene-stage-icon", viewBox: "0 0 16 16", "aria-hidden": "true" },
@@ -1828,26 +3181,17 @@ export function RigMovePage({
                       ),
                     },
                     {
-                      key: "analysing",
-                      label: "Analysing",
+                      key: "operations",
+                      label: "Drilling",
                       icon: h(
                         "svg",
                         { className: "scene-stage-icon", viewBox: "0 0 16 16", "aria-hidden": "true" },
                         h("path", {
-                          d: "M 4 11.5 L 6.3 8.6 L 8 9.8 L 11.5 5.8",
+                          d: "M 8 2.8 V 13.2 M 4.8 6.3 H 11.2 M 5.6 3.8 H 10.4 M 5.6 12.2 H 10.4",
                           fill: "none",
                           stroke: "currentColor",
-                          "stroke-width": "1.8",
+                          "stroke-width": "1.6",
                           "stroke-linecap": "round",
-                          "stroke-linejoin": "round",
-                        }),
-                        h("path", {
-                          d: "M 4 4.5 V 11.5 H 12",
-                          fill: "none",
-                          stroke: "currentColor",
-                          "stroke-width": "1.5",
-                          "stroke-linecap": "round",
-                          "stroke-linejoin": "round",
                         }),
                       ),
                     },
@@ -1887,7 +3231,7 @@ export function RigMovePage({
                 type: "button",
                 variant: "ghost",
                 className: "scene-back-button scene-back-button-inline",
-                onClick: () => handleSceneModeChange(previousSceneMode || "3d"),
+                onClick: () => handleSceneModeChange(previousSceneMode || "2d"),
                 children: h(
                   "svg",
                   {
@@ -1944,7 +3288,51 @@ export function RigMovePage({
                           h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Total Time"), h("strong", null, formatMinutes(activePlanSummary.totalMinutes))),
                           h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Phase Utilization"), h("strong", null, `${timelineUtilizationPercent}%`)),
                         ]
-                      : [
+                      : timelineRowType === "worker"
+                        ? [
+                            h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Completion"), h("strong", null, `${completion}%`)),
+                            h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Current Time"), h("strong", null, formatMinutes(Math.round(visibleMinute)))),
+                            h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Time Left"), h("strong", null, formatMinutes(Math.max(0, Math.round(totalMinutes - visibleMinute))))),
+                            h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Rows"), h("strong", null, String(timelineRowsCount))),
+                            h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Row Mode"), h("strong", null, "Worker")),
+                            h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Gap"), h("strong", null, `${timelineGapMinutes / 60}h`)),
+                            h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Workers Used"), h("strong", null, String(activePlanDashboard.workerCount))),
+                            h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Day / Night"), h("strong", null, `${activePlanDashboard.dayShiftCapacity}/${activePlanDashboard.nightShiftCapacity}`)),
+                            h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Worker Utilization"), h("strong", null, activePlanDashboard.workerUtilization)),
+                            h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Worker Idle Hours"), h("strong", null, activePlanDashboard.workerIdleHours)),
+                            h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Avg / Role"), h("strong", null, formatMinutes(timelineWorkingMinutesPerWorkerRole))),
+                            h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Combined Utilization"), h("strong", null, `${timelineUtilizationPercent}%`)),
+                          ]
+                        : timelineRowType === "load"
+                          ? [
+                              h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Completion"), h("strong", null, `${completion}%`)),
+                              h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Current Time"), h("strong", null, formatMinutes(Math.round(visibleMinute)))),
+                              h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Time Left"), h("strong", null, formatMinutes(Math.max(0, Math.round(totalMinutes - visibleMinute))))),
+                              h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Rows"), h("strong", null, String(timelineRowsCount))),
+                              h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Row Mode"), h("strong", null, "Load")),
+                              h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Gap"), h("strong", null, `${timelineGapMinutes / 60}h`)),
+                              h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Loads"), h("strong", null, String(activePlanSummary.totalLoads))),
+                              h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "At Source"), h("strong", null, String(rigLoads.sourceCount))),
+                              h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Moving"), h("strong", null, String(rigLoads.movingCount))),
+                              h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Completed"), h("strong", null, String(rigLoads.destinationCount))),
+                              h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Avg / Load"), h("strong", null, formatMinutes(timelineWorkingMinutesPerLoad))),
+                              h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Utilization"), h("strong", null, `${timelineUtilizationPercent}%`)),
+                            ]
+                        : timelineRowType === "cpm"
+                          ? [
+                              h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Completion"), h("strong", null, `${completion}%`)),
+                              h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Current Time"), h("strong", null, formatMinutes(Math.round(visibleMinute)))),
+                              h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Time Left"), h("strong", null, formatMinutes(Math.max(0, Math.round(totalMinutes - visibleMinute))))),
+                              h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Rows"), h("strong", null, String(timelineRowsCount))),
+                              h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Row Mode"), h("strong", null, "CPM")),
+                              h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Gap"), h("strong", null, `${timelineGapMinutes / 60}h`)),
+                              h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Critical Tasks"), h("strong", null, String(activePlanDashboard.criticalTaskCount))),
+                              h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Critical Loads"), h("strong", null, String(activePlanDashboard.criticalLoadCount))),
+                              h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Critical Path"), h("strong", null, `${activePlanDashboard.criticalPathHours}h`)),
+                              h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Avg / Critical Load"), h("strong", null, formatMinutes(timelineWorkingMinutesPerCriticalLoad))),
+                              h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Utilization"), h("strong", null, `${timelineUtilizationPercent}%`)),
+                            ]
+                        : [
                           h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Completion"), h("strong", null, `${completion}%`)),
                           h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Current Time"), h("strong", null, formatMinutes(Math.round(visibleMinute)))),
                           h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Time Left"), h("strong", null, formatMinutes(Math.max(0, Math.round(totalMinutes - visibleMinute))))),
@@ -1975,8 +3363,8 @@ export function RigMovePage({
                           {
                             type: "button",
                             className: "scene-dimension-toggle",
-                            disabled: timelineZoom <= 1,
-                            onClick: () => setTimelineZoom((current) => Math.max(1, current / 2)),
+                            disabled: timelineZoom <= 0.1,
+                            onClick: () => setTimelineZoom((current) => Math.max(0.1, Math.round((current / 2) * 100) / 100)),
                           },
                           "-",
                         ),
@@ -1987,27 +3375,29 @@ export function RigMovePage({
                             type: "button",
                             className: "scene-dimension-toggle",
                             disabled: timelineZoom >= 8,
-                            onClick: () => setTimelineZoom((current) => Math.min(8, current * 2)),
+                            onClick: () => setTimelineZoom((current) => Math.min(8, Math.round((current * 2) * 100) / 100)),
                           },
                           "+",
                         ),
                       ),
-                      h(
-                        "div",
-                        { className: "scene-speed-button-wrap" },
-                        h(
-                          "button",
-                          {
-                            type: "button",
-                            className: "scene-speed-button",
-                            onClick: () => {
-                              const nextOption = playbackSpeedOptions[(activePlaybackSpeedIndex + 1) % playbackSpeedOptions.length];
-                              onPlaybackSpeedChange?.(Number(nextOption.value));
-                            },
-                          },
-                          h("span", null, `Speed ${activePlaybackSpeedOption.label}`),
-                        ),
-                      ),
+                      isPlanningStage
+                        ? h(
+                            "div",
+                            { className: "scene-speed-button-wrap" },
+                            h(
+                              "button",
+                              {
+                                type: "button",
+                                className: "scene-speed-button",
+                                onClick: () => {
+                                  const nextOption = playbackSpeedOptions[(activePlaybackSpeedIndex + 1) % playbackSpeedOptions.length];
+                                  onPlaybackSpeedChange?.(Number(nextOption.value));
+                                },
+                              },
+                              h("span", null, `Speed ${activePlaybackSpeedOption.label}`),
+                            ),
+                          )
+                        : null,
                     ),
                     h(
                       "div",
@@ -2035,7 +3425,7 @@ export function RigMovePage({
                       h(
                         "div",
                         { className: "scene-timeline-compact-switcher" },
-                        ["truck", "phase"].map((type) =>
+                        ["truck", "worker", "load", "phase", "cpm"].map((type) =>
                           h(
                             "button",
                             {
@@ -2044,7 +3434,7 @@ export function RigMovePage({
                               className: `scene-dimension-toggle${timelineRowType === type ? " is-active" : ""}`,
                               onClick: () => setTimelineRowType(type),
                             },
-                            type === "truck" ? "Truck" : "Phase",
+                            type === "truck" ? "Truck" : type === "worker" ? "Worker" : type === "load" ? "Load" : type === "cpm" ? "CPM" : "Phase",
                           ),
                         ),
                       ),
@@ -2068,28 +3458,43 @@ export function RigMovePage({
               ),
             )
           : sceneMode === "3d"
-          ? h(SimulationScene3D, {
-              startPoint: move.startPoint,
-              endPoint: move.endPoint,
-              startLabel: move.startLabel,
-              endLabel: move.endLabel,
-              simulation: displaySimulation,
-              currentMinute: visibleMinute,
-              sceneFocusResetKey,
-              heightClass: "scene-only-canvas",
-              showOverlay: false,
-              onReadyStateChange: onScenePlaybackReadyChange,
-              onFocusChange: handleFocusChange,
-            })
-          : sceneMode === "2d"
-            ? h(LeafletMap, {
+          ? (SimulationScene3DComponent
+            ? h(SimulationScene3DComponent, {
                 startPoint: move.startPoint,
                 endPoint: move.endPoint,
+                startLabel: move.startLabel,
+                endLabel: move.endLabel,
                 simulation: displaySimulation,
                 currentMinute: visibleMinute,
+                sceneFocusResetKey,
                 heightClass: "scene-only-canvas",
+                showOverlay: false,
+                onReadyStateChange: onScenePlaybackReadyChange,
                 onFocusChange: handleFocusChange,
               })
+            : h(
+                Card,
+                { className: "empty-state scene-loading-card" },
+                h("h2", null, "Loading 3D view"),
+                h("p", { className: "muted-copy" }, "3D loads only when you open it."),
+              ))
+          : sceneMode === "2d"
+            ? (LeafletMapComponent
+              ? h(LeafletMapComponent, {
+                  startPoint: move.startPoint,
+                  endPoint: move.endPoint,
+                  simulation: displaySimulation,
+                  currentMinute: visibleMinute,
+                  supportRoutes: startupTransferSchedule,
+                  heightClass: "scene-only-canvas",
+                  onFocusChange: handleFocusChange,
+                })
+              : h(
+                  Card,
+                  { className: "empty-state scene-loading-card" },
+                  h("h2", null, "Loading map"),
+                  h("p", { className: "muted-copy" }, "The map view is loading."),
+                ))
             : h(FullScreenTimeline, {
                 playback: displaySimulation.bestPlan.playback,
                 currentMinute: visibleMinute,
@@ -2109,7 +3514,7 @@ export function RigMovePage({
           ),
         )
           : null,
-        !isTimelineMode
+        !isTimelineMode && isPlanningStage
           ? h(
           "div",
           { className: "scene-bottom-controls" },
@@ -2189,7 +3594,8 @@ export function RigMovePage({
                   {
                     type: "button",
                     className: "scene-dimension-toggle",
-                    onClick: () => setTimelineZoom((current) => Math.max(1, current / 2)),
+                    disabled: timelineZoom <= 0.1,
+                    onClick: () => setTimelineZoom((current) => Math.max(0.1, Math.round((current / 2) * 100) / 100)),
                   },
                   "-",
                 ),
@@ -2199,7 +3605,8 @@ export function RigMovePage({
                   {
                     type: "button",
                     className: "scene-dimension-toggle",
-                    onClick: () => setTimelineZoom((current) => Math.min(8, current * 2)),
+                    disabled: timelineZoom >= 8,
+                    onClick: () => setTimelineZoom((current) => Math.min(8, Math.round((current * 2) * 100) / 100)),
                   },
                       "+",
                     ),
@@ -2226,40 +3633,86 @@ export function RigMovePage({
                 h(
                   "section",
                   { className: "scene-panel-section scene-panel-section-plain" },
-                  !isPlaybackRunning && !isPlaybackPaused
-                    ? truckSetup.map((truck) =>
-                        h(
-                          "label",
-                          { key: truck.id, className: "truck-slider-card" },
-                          h("div", { className: "truck-slider-head" }, h("span", null, truck.type || "Truck"), h("strong", null, truck.count)),
-                          (() => {
-                            const min = 1;
-                            const max = getSliderMaxCount(Number.parseInt(truck.count, 10) || 0);
-                            const currentValue = Number.parseInt(truck.count, 10) || min;
-                            const progress = max > min ? ((currentValue - min) / (max - min)) * 100 : 100;
+                  canEditPlan
+                    ? h(
+                        "div",
+                        { className: "worker-slider-grid" },
+                        truckSetup.map((truck) =>
+                          h(
+                            "label",
+                            { key: truck.id, className: "truck-slider-card truck-slider-card-compact" },
+                            h(
+                              "div",
+                              { className: "truck-slider-head truck-slider-head-compact" },
+                              h("span", { title: truck.type || "Truck" }, getTruckShortLabel(truck.type)),
+                              h("strong", null, truck.count),
+                            ),
+                            (() => {
+                              const min = 1;
+                              const max = getSliderMaxCount(Number.parseInt(truck.count, 10) || 0);
+                              const currentValue = Number.parseInt(truck.count, 10) || min;
+                              const progress = max > min ? ((currentValue - min) / (max - min)) * 100 : 100;
 
-                            return h("input", {
-                              className: "truck-slider-input",
-                              type: "range",
-                              min: String(min),
-                              max: String(max),
-                              step: "1",
-                              value: truck.count,
-                              style: { "--truck-slider-progress": `${progress}%` },
-                              onInput: (event) => updateTruckCount(truck.id, event.target.value),
-                            });
-                          })(),
+                              return h("input", {
+                                className: "truck-slider-input",
+                                type: "range",
+                                min: String(min),
+                                max: String(max),
+                                step: "1",
+                                value: truck.count,
+                                style: { "--truck-slider-progress": `${progress}%` },
+                                onInput: (event) => updateTruckCount(truck.id, event.target.value),
+                              });
+                            })(),
+                          ),
                         ),
                       )
-                    : truckSetup.map((truck) =>
-                        h(
-                          "div",
-                          { key: truck.id, className: "truck-count-row" },
-                          h("span", null, truck.type || "Truck"),
-                          h("strong", null, truck.count),
+                    : isPlanningStage
+                      ? truckSetup.map((truck) =>
+                          h(
+                            "div",
+                            { key: truck.id, className: "truck-count-row" },
+                            h("span", null, truck.type || "Truck"),
+                            h("strong", null, truck.count),
+                          ),
+                      )
+                    : null,
+                  canEditPlan
+                    ? h(
+                        "div",
+                        { className: "worker-slider-grid" },
+                        Object.entries(workerRoleDraft).map(([roleId, role]) =>
+                          h(
+                            "label",
+                            { key: `worker-${roleId}`, className: "truck-slider-card truck-slider-card-compact" },
+                            h(
+                              "div",
+                              { className: "truck-slider-head truck-slider-head-compact" },
+                              h("span", { title: role.label || getWorkerRoleLabel(roleId) }, getWorkerRoleShortLabel(roleId, role.label)),
+                              h("strong", null, String(role.count)),
+                            ),
+                            h("input", {
+                              className: "truck-slider-input",
+                              type: "range",
+                              min: "0",
+                              max: String(Math.max(12, role.count + 6)),
+                              step: "1",
+                              value: role.count,
+                              style: { "--truck-slider-progress": `${Math.min(100, (role.count / Math.max(12, role.count + 6)) * 100)}%` },
+                              onInput: (event) =>
+                                setWorkerRoleDraft((current) => ({
+                                  ...current,
+                                  [roleId]: {
+                                    ...current[roleId],
+                                    count: Math.max(0, Number.parseInt(event.target.value, 10) || 0),
+                                  },
+                                })),
+                            }),
+                          ),
                         ),
-                      ),
-                  !isPlaybackRunning && !isPlaybackPaused
+                      )
+                    : null,
+                  canEditPlan
                     ? h(
                         "div",
                         { className: "truck-time-controls" },
@@ -2279,40 +3732,35 @@ export function RigMovePage({
                             onInput: (event) => setPlanningStartDate(normalizePlanningDate(event.target.value, move?.createdAt)),
                           }),
                         ),
-                        h(
-                          "label",
-                          { className: "truck-time-card" },
-                          h(
-                            "div",
-                            { className: "truck-slider-head" },
-                            h("span", null, "Start Time"),
-                            h("strong", null, planningStartTime),
-                          ),
-                          h("input", {
-                            className: "truck-time-input",
-                            type: "time",
-                            value: planningStartTime,
-                            step: "300",
-                            onInput: (event) => setPlanningStartTime(normalizePlanningTime(event.target.value)),
-                          }),
-                        ),
                       )
                     : null,
                 ),
+                executionStatusRow,
+                executionSummary,
                 simulationError ? h("p", { className: "field-error section-spacing" }, simulationError) : null,
-                h(
-                  "div",
-                  { className: "scene-panel-actions" },
-                  h(PlaybackActionButton, {
-                    isRunning: isPlaybackRunning,
-                    isBusy: isSimulating,
-                    isPaused: isPlaybackPaused,
-                    onRun: () => onRunCustomPlan({ moveId: move.id, truckSetup }),
-                    onEnd: onEndPlayback,
-                    onPauseToggle: onPausePlayback,
-                    label: "Run",
-                  }),
-                ),
+                readOnlyBanner,
+                !readOnly && isPlanningStage
+                  ? h(
+                      "div",
+                      { className: "scene-panel-actions" },
+                      h(PlaybackActionButton, {
+                        isRunning: isPlaybackRunning,
+                        isBusy: isSimulating,
+                        isPaused: isPlaybackPaused,
+                        onRun: () => onRunCustomPlan({ moveId: move.id, truckSetup, availableWorkers: customAvailableWorkers }),
+                        onEnd: onEndPlayback,
+                        onPauseToggle: onPausePlayback,
+                        label: canResumePlayback ? "Resume Simulation" : "Run Simulation",
+                      }),
+                      h(Button, {
+                        type: "button",
+                        variant: "ghost",
+                        className: "scene-top-action-button",
+                        onClick: () => onStartExecution?.(move.id),
+                        children: "Start Execution",
+                      }),
+                    )
+                  : executionActions,
               ]
             : [
                 h(
@@ -2328,41 +3776,71 @@ export function RigMovePage({
                 h(
                   "section",
                   { className: "scene-panel-section scene-panel-section-plain scene-passive-overlay" },
-                  [
-                    ...displayedTruckCounts.map((truck) =>
-                      h(
-                        "div",
-                        { key: truck.id, className: "truck-count-row scene-passive-overlay" },
-                        h("span", null, truck.type || "Truck"),
-                        h("strong", null, String(truck.count)),
-                      ),
-                    ),
-                    h(
-                      "div",
-                      { key: "planning-start-date", className: "truck-count-row scene-passive-overlay" },
-                      h("span", null, "Start Date"),
-                      h("strong", null, planningStartDateLabel),
-                    ),
-                    h(
-                      "div",
-                      { key: "planning-start-time", className: "truck-count-row scene-passive-overlay" },
-                      h("span", null, "Start Time"),
-                      h("strong", null, planningStartTime),
-                    ),
-                  ],
+                  isPlanningStage
+                    ? [
+                        h(
+                          "div",
+                          { className: "worker-slider-grid scene-passive-overlay" },
+                          [
+                            ...displayedTruckCounts.map((truck) =>
+                              h(
+                                "div",
+                                { key: `summary-${truck.id}`, className: "truck-slider-card truck-slider-card-compact" },
+                                h(
+                                  "div",
+                                  { className: "truck-slider-head truck-slider-head-compact" },
+                                  h("span", { title: truck.type || "Truck" }, getTruckShortLabel(truck.type)),
+                                  h("strong", null, `${truck.count}/${getFleetCapacityForType(availableFleet, truck.type)}`),
+                                ),
+                              ),
+                            ),
+                            ...workerRoleSummaryRows.map((role) =>
+                              h(
+                                "div",
+                                { key: `summary-worker-${role.id}`, className: "truck-slider-card truck-slider-card-compact" },
+                                h(
+                                  "div",
+                                  { className: "truck-slider-head truck-slider-head-compact" },
+                                  h("span", { title: role.label }, getWorkerRoleShortLabel(role.id, role.label)),
+                                  h("strong", null, `${role.used}/${role.available}`),
+                                ),
+                              ),
+                            ),
+                          ],
+                        ),
+                        h(
+                          "div",
+                          { key: "planning-start-date", className: "truck-count-row scene-passive-overlay" },
+                          h("span", null, "Start Date"),
+                          h("strong", null, planningStartDateLabel),
+                        ),
+                      ]
+                    : [],
                 ),
-                h(
-                  "div",
-                  { className: "scene-panel-actions" },
-                  h(PlaybackActionButton, {
-                    isRunning: isPlaybackRunning,
-                    isPaused: isPlaybackPaused,
-                    onRun: onRunPlayback,
-                    onEnd: onEndPlayback,
-                    onPauseToggle: onPausePlayback,
-                    label: canResumePlayback ? "Resume" : "Run",
-                  }),
-                ),
+                executionStatusOverlayRow,
+                executionSummary,
+                readOnlyBanner,
+                !readOnly && isPlanningStage
+                  ? h(
+                      "div",
+                      { className: "scene-panel-actions" },
+                      h(PlaybackActionButton, {
+                        isRunning: isPlaybackRunning,
+                        isPaused: isPlaybackPaused,
+                        onRun: onRunPlayback,
+                        onEnd: onEndPlayback,
+                        onPauseToggle: onPausePlayback,
+                        label: canResumePlayback ? "Resume Playback" : "Run Playback",
+                      }),
+                      h(Button, {
+                        type: "button",
+                        variant: "ghost",
+                        className: "scene-top-action-button",
+                        onClick: () => onStartExecution?.(move.id),
+                        children: "Start Execution",
+                      }),
+                    )
+                  : executionActions,
               ],
         )
           : null,
@@ -2449,9 +3927,9 @@ export function RigMovePage({
               h(
                 "div",
                 { className: "scene-plan-kpis" },
-                h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Total Completion"), h("strong", null, `${completion}%`)),
+                h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Execution Completion"), h("strong", null, `${completion}%`)),
                 h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Hours Left"), h("strong", null, formatMinutes(Math.max(0, Math.round(totalMinutes - visibleMinute))))),
-                h("div", { className: "scene-dashboard-stack-item" }, h("span", { className: "scene-dashboard-label" }, "Last Operation"), h("strong", null, lastLog?.title || "Waiting for simulation"), h("p", { className: "scene-dashboard-copy" }, lastLog?.description || "No events yet.")),
+                h("div", { className: "scene-dashboard-stack-item" }, h("span", { className: "scene-dashboard-label" }, "Last Operation"), h("strong", null, lastLog?.title || "Waiting for execution"), h("p", { className: "scene-dashboard-copy" }, lastLog?.description || "No events yet.")),
               ),
               h(
                 "div",
@@ -2459,8 +3937,8 @@ export function RigMovePage({
                 h(
                   "div",
                   { className: "scene-plan-summary-card scene-plan-summary-card-title" },
-                  h("span", { className: "scene-panel-kicker" }, "Live Progress"),
-                  h("strong", { className: "scene-plan-summary-title" }, isPlaybackPaused ? "Paused" : "Running"),
+                  h("span", { className: "scene-panel-kicker" }, "Execution Progress"),
+                  h("strong", { className: "scene-plan-summary-title" }, isPlaybackPaused ? "Tracking Paused" : "Execution Active"),
                 ),
                 h(
                   "div",
@@ -2484,6 +3962,26 @@ export function RigMovePage({
                     h(ProgressBar, { value: phases.up }),
                   ),
                 ),
+                h(
+                  "div",
+                  { className: "scene-dashboard-pair" },
+                  h("div", { className: "scene-dashboard-inline scene-dashboard-pair-item" }, h("span", { className: "scene-dashboard-label" }, "Needed Loads"), h("strong", null, String(operatingSnapshot.startupSummary.totalUnits))),
+                  h("div", { className: "scene-dashboard-inline scene-dashboard-pair-item" }, h("span", { className: "scene-dashboard-label" }, "Sourced"), h("strong", null, String(operatingSnapshot.startupSummary.coveredUnits))),
+                ),
+                h(
+                  "div",
+                  { className: "scene-dashboard-pair" },
+                  h("div", { className: "scene-dashboard-inline scene-dashboard-pair-item" }, h("span", { className: "scene-dashboard-label" }, "Missing"), h("strong", null, String(operatingSnapshot.startupSummary.missingUnits))),
+                  h("div", { className: "scene-dashboard-inline scene-dashboard-pair-item" }, h("span", { className: "scene-dashboard-label" }, "Readiness"), h("strong", null, `${drillingReadinessPercent}%`)),
+                ),
+                isOperationsStage
+                  ? h(
+                      "div",
+                      { className: "scene-dashboard-pair" },
+                      h("div", { className: "scene-dashboard-inline scene-dashboard-pair-item" }, h("span", { className: "scene-dashboard-label" }, "Reusable Units"), h("strong", null, String(operatingSnapshot.reusableSummary.totalUnits))),
+                      h("div", { className: "scene-dashboard-inline scene-dashboard-pair-item" }, h("span", { className: "scene-dashboard-label" }, "Critical"), h("strong", null, String(operatingSnapshot.reusableSummary.criticalUnits))),
+                    )
+                  : null,
               ),
             )
           : !isTimelineMode ? h(
@@ -2493,10 +3991,6 @@ export function RigMovePage({
                 "div",
                 { className: "scene-plan-kpis" },
                 h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "ETA"), h("strong", null, planEtaLabel)),
-                h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Time Saved vs Avg"), h("strong", null, formatMinutes(planComparisonStats.timeSavedMinutes))),
-                h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Faster Than Avg"), h("strong", null, `${planComparisonStats.timeSavedPercent}%`)),
-                h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Avg Completion"), h("strong", null, formatMinutes(planComparisonStats.averageMinutes))),
-                h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Loads / Day"), h("strong", null, planComparisonStats.throughputLoadsPerDay)),
               ),
               h(
                 "div",
@@ -2504,45 +3998,36 @@ export function RigMovePage({
                 h(
                   "div",
                   { className: "scene-plan-summary-card scene-plan-summary-card-title" },
-                  h("span", { className: "scene-panel-kicker" }, "Plan Dashboard"),
-                  h("strong", { className: "scene-plan-summary-title" }, isCustomizeActive ? "Custom Plan Overview" : "Plan Overview"),
+                  h("span", { className: "scene-panel-kicker" }, "Execution Plan"),
+                  h("strong", { className: "scene-plan-summary-title" }, isCustomizeActive ? "Custom Execution Plan" : "Plan Overview"),
                 ),
                 h(
                   "div",
                   { className: "scene-dashboard-pair" },
-                  h("div", { className: "scene-dashboard-inline scene-dashboard-pair-item" }, h("span", { className: "scene-dashboard-label" }, "Total Time"), h("strong", null, formatMinutes(activePlanSummary.totalMinutes))),
+                  h("div", { className: "scene-dashboard-inline scene-dashboard-pair-item" }, h("span", { className: "scene-dashboard-label" }, "Total Time"), h("strong", null, formatDaysHours(activePlanSummary.totalMinutes))),
                   h("div", { className: "scene-dashboard-inline scene-dashboard-pair-item" }, h("span", { className: "scene-dashboard-label" }, "Round Trips"), h("strong", null, String(activePlanSummary.roundTrips))),
                 ),
                 h(
                   "div",
                   { className: "scene-dashboard-pair" },
-                  h("div", { className: "scene-dashboard-inline scene-dashboard-pair-item" }, h("span", { className: "scene-dashboard-label" }, "Fleet Active Now"), h("strong", null, `${planComparisonStats.activeFleet}/${effectiveTruckCount}`)),
-                  h("div", { className: "scene-dashboard-inline scene-dashboard-pair-item" }, h("span", { className: "scene-dashboard-label" }, "Cost / Load"), h("strong", null, planComparisonStats.costPerLoad)),
+                  h("div", { className: "scene-dashboard-inline scene-dashboard-pair-item" }, h("span", { className: "scene-dashboard-label" }, "Plan Cost"), h("strong", null, activePlanDashboard.costEstimate)),
+                  h("div", { className: "scene-dashboard-inline scene-dashboard-pair-item" }, h("span", { className: "scene-dashboard-label" }, "Critical Path"), h("strong", null, `${activePlanDashboard.criticalPathHours}h`)),
                 ),
                 h(
                   "div",
                   { className: "scene-dashboard-pair" },
-                  h("div", { className: "scene-dashboard-inline scene-dashboard-pair-item" }, h("span", { className: "scene-dashboard-label" }, "Crew Hours"), h("strong", null, activePlanDashboard.crewHours)),
-                  h("div", { className: "scene-dashboard-inline scene-dashboard-pair-item" }, h("span", { className: "scene-dashboard-label" }, "Loads / Truck"), h("strong", null, activePlanDashboard.loadsPerTruck)),
+                  h("div", { className: "scene-dashboard-inline scene-dashboard-pair-item" }, h("span", { className: "scene-dashboard-label" }, "Utilization"), h("strong", null, activePlanDashboard.utilization)),
+                  h("div", { className: "scene-dashboard-inline scene-dashboard-pair-item" }, h("span", { className: "scene-dashboard-label" }, "Truck Utilization"), h("strong", null, activePlanDashboard.truckUtilization)),
                 ),
                 h(
                   "div",
                   { className: "scene-dashboard-pair" },
-                  h("div", { className: "scene-dashboard-inline scene-dashboard-pair-item" }, h("span", { className: "scene-dashboard-label" }, "Load-Km Planned"), h("strong", null, planComparisonStats.routeDistance)),
-                ),
-                h(
-                  "div",
-                  { className: "scene-dashboard-phase-stack" },
-                  h(
-                    "div",
-                    { className: "scene-dashboard-phase-row" },
-                    h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Utilization"), h("strong", null, activePlanDashboard.utilization)),
-                    h(ProgressBar, { value: activePlanDashboard.utilizationValue }),
-                  ),
+                  h("div", { className: "scene-dashboard-inline scene-dashboard-pair-item" }, h("span", { className: "scene-dashboard-label" }, "Worker Utilization"), h("strong", null, activePlanDashboard.workerUtilization)),
+                  h("div", { className: "scene-dashboard-inline scene-dashboard-pair-item" }, h("span", { className: "scene-dashboard-label" }, " "), h("strong", null, " ")),
                 ),
               ),
             ) : null,
-        !isTimelineMode && !isPlaybackRunning && !isPlaybackPaused
+        !readOnly && executionState === "planning" && !isTimelineMode && !isPlaybackRunning && !isPlaybackPaused
           ? h(
               "div",
               { className: "scene-plan-switcher-wrap" },
@@ -2552,9 +4037,14 @@ export function RigMovePage({
                 h(PlanSwitcher, {
                   scenarios: scenarioPlans,
                   activePlanKey,
+                  includeCustomize: !readOnly,
                   onSelect: (planKey) => {
                     setActivePlanKey(planKey);
                     if (planKey === "customize") {
+                      setTruckSetup(normalizeTruckSetup({
+                        ...move,
+                        truckSetup: activeScenario?.allocatedTruckSetup || activeScenario?.truckSetup || move?.truckSetup || [],
+                      }, availableFleet));
                       return;
                     }
                     setActiveScenarioName(planKey);
@@ -2594,32 +4084,75 @@ export function RigMovePage({
             h(
               Card,
               { className: "dashboard-section-card" },
-              h("div", { className: "section-heading" }, h("h2", null, "Simulation Setup"), h("span", { className: "section-pill" }, `${totalTrucks} trucks`)),
-              h("p", { className: "muted-copy section-spacing" }, "Set truck types and counts, then run the move using exactly this fleet."),
-              h(TruckSetupEditor, {
-                truckSetup,
-                onChange: (truckId, field, value) =>
-                  field === "count"
-                    ? updateTruckCount(truckId, value)
-                    : setTruckSetup((current) =>
-                        current.map((item) => (item.id === truckId ? { ...item, [field]: value } : item)),
+              h("div", { className: "section-heading" }, h("h2", null, "Execution Plan"), h("span", { className: "section-pill" }, `${effectiveTruckCount} trucks`)),
+              h("p", { className: "muted-copy section-spacing" }, readOnly ? "Assigned fleet summary for this rig." : "Choose the plan for this rig. Trucks remain unreserved until execution starts."),
+              !canEditPlan || readOnly
+                ? h(
+                    "section",
+                    { className: "scene-panel-section scene-panel-section-plain" },
+                    [
+                      ...displayedTruckCounts.map((truck) =>
+                        h(
+                          "div",
+                          { key: truck.id, className: "truck-count-row" },
+                          h("span", null, truck.type || "Truck"),
+                          h("strong", null, `${truck.count}/${getFleetCapacityForType(availableFleet, truck.type)}`),
+                        ),
                       ),
-                onAddRow: () =>
-                  setTruckSetup((current) => [...current, { id: `truck-${Date.now()}`, type: "", count: "0" }]),
-                onRemoveRow: (truckId) =>
-                  setTruckSetup((current) => current.filter((item) => item.id !== truckId)),
-              }),
+                      ...workerRoleSummaryRows.map((role) =>
+                        h(
+                          "div",
+                          { key: `worker-${role.id}`, className: "truck-count-row" },
+                          h("span", null, role.label),
+                          h("strong", null, `${role.used}/${role.available}`),
+                        ),
+                      ),
+                      h(
+                        "div",
+                        { key: "planning-start-date", className: "truck-count-row" },
+                        h("span", null, "Start Date"),
+                        h("strong", null, planningStartDateLabel),
+                      ),
+                    ],
+                  )
+                : h(TruckSetupEditor, {
+                    truckSetup,
+                    onChange: (truckId, field, value) =>
+                      field === "count"
+                        ? updateTruckCount(truckId, value)
+                        : setTruckSetup((current) =>
+                            current.map((item) => (item.id === truckId ? { ...item, [field]: value } : item)),
+                          ),
+                    onAddRow: () =>
+                      setTruckSetup((current) => [...current, { id: `truck-${Date.now()}`, type: "", count: "0", hourlyCost: 0 }]),
+                    onRemoveRow: (truckId) =>
+                      setTruckSetup((current) => current.filter((item) => item.id !== truckId)),
+                  }),
+              executionStatusRow,
+              executionSummary,
               simulationError ? h("p", { className: "field-error section-spacing" }, simulationError) : null,
-              h(
-                "div",
-                { className: "move-setup-actions" },
-                h(Button, {
-                  type: "button",
-                  isBusy: isSimulating,
-                  onClick: () => onRunCustomPlan({ moveId: move.id, truckSetup }),
-                  children: "Run",
-                }),
-              ),
+              readOnlyBanner,
+              !readOnly && isPlanningStage
+                ? h(
+                    "div",
+                    { className: "move-setup-actions" },
+                    h(PlaybackActionButton, {
+                      isRunning: isPlaybackRunning,
+                      isBusy: isSimulating,
+                      isPaused: isPlaybackPaused,
+                      onRun: () => onRunCustomPlan({ moveId: move.id, truckSetup, availableWorkers: customAvailableWorkers }),
+                      onEnd: onEndPlayback,
+                      onPauseToggle: onPausePlayback,
+                      label: canResumePlayback ? "Resume Simulation" : "Run Simulation",
+                    }),
+                    h(Button, {
+                      type: "button",
+                      variant: "ghost",
+                      onClick: () => onStartExecution?.(move.id),
+                      children: "Start Execution",
+                    }),
+                  )
+                : executionActions,
             ),
           ),
           h(
@@ -2700,7 +4233,7 @@ export function RigMovePage({
               Card,
               { className: "dashboard-section-card latest-log-card" },
               h("div", { className: "section-heading" }, h("h2", null, "Latest Log")),
-              h("p", { className: "muted-copy section-spacing" }, lastLog?.title || "Waiting for simulation"),
+              h("p", { className: "muted-copy section-spacing" }, lastLog?.title || "Waiting for execution"),
               h("p", { className: "muted-copy" }, lastLog?.description || "No events yet."),
             ),
           ),
@@ -2716,12 +4249,13 @@ export function RigMovePage({
                 h(
                   "div",
                   { className: "scenario-breakdown-copy" },
-                  h("div", { className: "section-heading" }, h("h2", null, "Scenario Breakdown")),
-                  h("p", { className: "muted-copy section-spacing" }, "Switch between automatically generated fleet plans with different truck counts."),
+                  h("div", { className: "section-heading" }, h("h2", null, "Plan Selection")),
+                  h("p", { className: "muted-copy section-spacing" }, readOnly ? "The selected foreman plan is shown for inspection only." : "Compare candidate plans before starting execution. Planning does not reserve trucks."),
                 ),
                 h(ScenarioBreakdown, {
                   scenarios: scenarioPlans,
                   activeScenarioName: activeScenario.name,
+                  disabled: readOnly,
                   onSelect: (scenarioName) => {
                     setActivePlanKey(scenarioName);
                     setActiveScenarioName(scenarioName);
@@ -2748,7 +4282,8 @@ export function RigMovePage({
     React.Fragment,
     null,
     pageContent,
-    isDeleteConfirmOpen
+    simulationOverlay,
+    !readOnly && isDeleteConfirmOpen
       ? h(
           Modal,
           {

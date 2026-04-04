@@ -2,7 +2,7 @@ import { React, h } from "../lib/react.js";
 import { Button } from "../components/ui/Button.js";
 import { Card } from "../components/ui/Card.js";
 import { Field, TextInput } from "../components/ui/Field.js";
-import { TEST_USER } from "../features/auth/auth.js";
+import { TEST_USERS, TEST_USER } from "../features/auth/auth.js";
 
 const { useState } = React;
 
@@ -60,14 +60,34 @@ export function LoginPage({ isAuthenticated, onLogin, onBackHome }) {
       { className: "auth-card" },
       h("p", { className: "eyebrow" }, "Welcome"),
       h("h1", { className: "auth-title" }, isAuthenticated ? "Session already active" : "Login"),
-      h(
-        "p",
-        { className: "muted-copy" },
-        "Sign in to access the dashboard and operational workspace.",
-      ),
-      h(
-        "form",
-        { className: "auth-form", onSubmit: handleSubmit },
+        h(
+          "p",
+          { className: "muted-copy" },
+          "Sign in to access the dashboard and operational workspace.",
+        ),
+        h(
+          "div",
+          { className: "auth-demo-accounts" },
+          TEST_USERS.map((user) =>
+            h(
+              "button",
+              {
+                key: user.id,
+                type: "button",
+                className: "auth-demo-account",
+                onClick: () => {
+                  setEmail(user.email);
+                  setPassword(user.password);
+                },
+              },
+              h("strong", null, user.role),
+              h("span", null, `${user.name} - ${user.email}`),
+            ),
+          ),
+        ),
+        h(
+          "form",
+          { className: "auth-form", onSubmit: handleSubmit },
         h(
           Field,
           { label: "Email" },

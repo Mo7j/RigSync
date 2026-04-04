@@ -1,153 +1,209 @@
-import math
-import re
-from pathlib import Path
-
-import pandas as pd
+from sqlalchemy import text
 
 from database import Base, SessionLocal, engine
-from models import LoadDependency, LoadTemplate
+from models import (
+    LoadAllowedTruckType,
+    LoadDependency,
+    LoadRoleRequirement,
+    LoadTemplate,
+    ManagerResourceState,
+    MoveRecord,
+    RigInventoryState,
+    TruckSpec,
+)
+from planning_dataset import DATASET_PATH, load_planning_dataset
 
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-DATASET_PATH = PROJECT_ROOT / "DataSet.xlsx"
-SHEET_NAME = "S1"
-
-EXCEL_TO_DB_COLUMNS = {
-    "ID": "id",
-    "Phase": "phase",
-    "Category": "category",
-    "Load Description": "description",
-    "Priority": "priority",
-    "Truck Type": "truck_type",
-    "Critical Operation": "is_critical",
-    "Floor Men": "floor_men",
-    "Roustabouts": "roustabouts",
-    "Electrician": "electricians",
-    "Mechanics": "mechanics",
-    "Welder/Safety": "welders",
-}
+def _dimension_value(dimensions, key):
+    return float((dimensions or {}).get(key) or 0)
 
 
-def normalize_text(value):
-    if pd.isna(value):
-        return None
-
-    text = str(value).strip()
-    return text or None
-
-
-def normalize_int(value):
-    if pd.isna(value):
-        return None
-
-    if isinstance(value, str):
-        value = value.strip()
-        if not value or value.lower() == "none":
-            return None
-
-    return int(float(value))
-
-
-def parse_duration_minutes(value):
-    text = normalize_text(value)
-    if text is None or text.lower() == "not specified":
-        return None
-
-    match = re.search(r"(\d+(?:\.\d+)?)\s*hr", text, flags=re.IGNORECASE)
-    if not match:
-        return None
-
-    hours = float(match.group(1))
-    return int(math.ceil(hours * 60))
-
-
-def parse_is_critical(value):
-    text = normalize_text(value)
-    return bool(text and text.lower() in {"yes", "true", "1"})
-
-
-def parse_dependency_ids(value):
-    if pd.isna(value):
-        return []
-
-    if isinstance(value, (int, float)) and not isinstance(value, bool):
-        return [int(value)]
-
-    text = str(value).strip()
-    if not text or text.lower() == "none":
-        return []
-
-    dependency_ids = []
-    for part in re.split(r"[;,/|]+", text):
-        candidate = part.strip()
-        if not candidate:
-            continue
-        match = re.search(r"\d+", candidate)
-        if match:
-            dependency_ids.append(int(match.group()))
-
-    return dependency_ids
-
-
-def build_load_template(row):
-    template_data = {
-        db_column: row.get(excel_column)
-        for excel_column, db_column in EXCEL_TO_DB_COLUMNS.items()
+def _build_load_template_payload(row, source_kind):
+    return {
+        "source_kind": source_kind,
+        "code": row["code"],
+        "load_type": row.get("load_type"),
+        "description": row.get("description"),
+        "category": row.get("category"),
+        "load_count": row.get("load_count") or row.get("count") or 1,
+        "weight_tons": row.get("weight_tons"),
+        "weight_text": row.get("weight_text"),
+        "length_m": _dimension_value(row.get("dimensions"), "length") or None,
+        "width_m": _dimension_value(row.get("dimensions"), "width") or None,
+        "height_m": _dimension_value(row.get("dimensions"), "height") or None,
+        "dimensions_text": row.get("dimensions_text"),
+        "priority": row.get("priority") or 0,
+        "avg_rig_down_minutes": row.get("avg_rig_down_minutes"),
+        "avg_rig_up_minutes": row.get("avg_rig_up_minutes"),
+        "optimal_rig_down_minutes": row.get("optimal_rig_down_minutes"),
+        "optimal_rig_up_minutes": row.get("optimal_rig_up_minutes"),
+        "is_critical": bool(row.get("is_critical")),
+        "minimum_crew_down_count": row.get("minimum_crew_down_count") or 0,
+        "minimum_crew_up_count": row.get("minimum_crew_up_count") or 0,
+        "optimal_crew_down_count": row.get("optimal_crew_down_count") or 0,
+        "optimal_crew_up_count": row.get("optimal_crew_up_count") or 0,
+        "dependency_label": row.get("dependencyLabel"),
+        "is_reusable": bool(row.get("isReusable")),
     }
 
-    return LoadTemplate(
-        id=normalize_int(template_data["id"]),
-        phase=normalize_text(template_data["phase"]),
-        category=normalize_text(template_data["category"]),
-        description=normalize_text(template_data["description"]),
-        priority=normalize_text(template_data["priority"]),
-        truck_type=normalize_text(template_data["truck_type"]),
-        avg_duration_minutes=parse_duration_minutes(row.get("Avg Time (ą Margin)")),
-        is_critical=parse_is_critical(template_data["is_critical"]),
-        floor_men=normalize_int(template_data["floor_men"]),
-        roustabouts=normalize_int(template_data["roustabouts"]),
-        electricians=normalize_int(template_data["electricians"]),
-        mechanics=normalize_int(template_data["mechanics"]),
-        welders=normalize_int(template_data["welders"]),
-    )
+
+def _validate_fit(load_template, compatible_types, truck_specs_by_type):
+    for truck_type in compatible_types:
+        truck_spec = truck_specs_by_type.get(truck_type)
+        if not truck_spec:
+            continue
+
+        fits_weight = (
+            load_template.weight_tons is None
+            or load_template.weight_tons <= truck_spec.max_weight_tons
+        )
+        fits_length = (
+            load_template.length_m is None
+            or load_template.length_m <= truck_spec.max_length_m
+        )
+        fits_width = (
+            load_template.width_m is None
+            or load_template.width_m <= truck_spec.max_width_m
+        )
+        fits_height = (
+            load_template.height_m is None
+            or load_template.height_m <= truck_spec.max_height_m
+        )
+
+        if fits_weight and fits_length and fits_width and fits_height:
+            return True
+
+    return False
 
 
 def import_dataset():
     if not DATASET_PATH.exists():
         raise FileNotFoundError(f"Dataset not found: {DATASET_PATH}")
 
-    df = pd.read_excel(DATASET_PATH, sheet_name=SHEET_NAME)
-    records = df.to_dict(orient="records")
-
+    dataset = load_planning_dataset()
+    with engine.begin() as connection:
+        for table_name in [
+            "load_dependencies",
+            "load_allowed_truck_types",
+            "load_role_requirements",
+            "load_templates",
+            "truck_specs",
+            "rig_loads",
+            "startup_loads",
+        ]:
+            connection.execute(text(f"DROP TABLE IF EXISTS {table_name} CASCADE"))
     Base.metadata.create_all(bind=engine)
 
     session = SessionLocal()
     try:
-        session.query(LoadDependency).delete()
-        session.query(LoadTemplate).delete()
-
-        for row in records:
-            load_template = build_load_template(row)
-            if load_template.id is None:
-                continue
-            session.add(load_template)
+        for row in dataset["truck_specs"]:
+            session.add(
+                TruckSpec(
+                    type=row["type"],
+                    max_weight_tons=row.get("max_weight_tons") or 0,
+                    max_length_m=_dimension_value(row.get("dimensions"), "length"),
+                    max_width_m=_dimension_value(row.get("dimensions"), "width"),
+                    max_height_m=_dimension_value(row.get("dimensions"), "height"),
+                    average_speed_kmh=row.get("average_speed_kmh") or 0,
+                    alpha=row.get("alpha") or 0.3,
+                )
+            )
 
         session.flush()
 
-        for row in records:
-            load_id = normalize_int(row.get("ID"))
-            if load_id is None:
-                continue
+        truck_specs_by_type = {
+            truck_spec.type: truck_spec
+            for truck_spec in session.query(TruckSpec).all()
+        }
 
-            for depends_on_load_id in parse_dependency_ids(row.get("Dependency ID")):
+        all_rows = [
+            *[("rig", row) for row in dataset["rig_loads"]],
+            *[("startup", row) for row in dataset["startup_loads"]],
+        ]
+
+        templates_by_code = {}
+
+        for source_kind, row in all_rows:
+            template = LoadTemplate(**_build_load_template_payload(row, source_kind))
+            session.add(template)
+            session.flush()
+            templates_by_code[template.code] = template
+
+            compatible_types = row.get("truck_types") or row.get("truckTypes") or []
+            for truck_type in compatible_types:
+                if truck_type not in truck_specs_by_type:
+                    continue
                 session.add(
-                    LoadDependency(
-                        load_id=load_id,
-                        depends_on_load_id=depends_on_load_id,
+                    LoadAllowedTruckType(
+                        load_template_id=template.id,
+                        truck_type=truck_type,
                     )
                 )
 
+            role_requirement_sets = [
+                ("rig_down", "minimum", row.get("minimum_crew_down_roles") or {}),
+                ("rig_up", "minimum", row.get("minimum_crew_up_roles") or {}),
+                ("rig_down", "optimal", row.get("optimal_crew_down_roles") or {}),
+                ("rig_up", "optimal", row.get("optimal_crew_up_roles") or {}),
+            ]
+            for phase, requirement_kind, role_requirements in role_requirement_sets:
+                for role_id, required_count in (role_requirements or {}).items():
+                    session.add(
+                        LoadRoleRequirement(
+                            load_template_id=template.id,
+                            phase=phase,
+                            role_id=role_id,
+                            requirement_kind=requirement_kind,
+                            required_count=max(0, int(required_count or 0)),
+                        )
+                    )
+
+        session.flush()
+
+        for source_kind, row in all_rows:
+            template = templates_by_code[row["code"]]
+
+            if source_kind == "rig":
+                dependency_sets = [
+                    ("rig_down", row.get("rig_down_dependency_codes") or []),
+                    ("rig_up", row.get("rig_up_dependency_codes") or []),
+                ]
+            else:
+                dependency_sets = [("rig_up", row.get("rig_up_dependency_codes") or [])]
+
+            for dependency_phase, dependency_codes in dependency_sets:
+                for dependency_code in dependency_codes:
+                    depends_on = templates_by_code.get(dependency_code)
+                    if not depends_on or depends_on.id == template.id:
+                        continue
+                    session.add(
+                        LoadDependency(
+                            load_template_id=template.id,
+                            depends_on_load_template_id=depends_on.id,
+                            dependency_phase=dependency_phase,
+                        )
+                    )
+
+        session.flush()
+
+        invalid_codes = []
+        for template in templates_by_code.values():
+            compatible_types = [row.truck_type for row in template.allowed_truck_types]
+            if compatible_types and not _validate_fit(template, compatible_types, truck_specs_by_type):
+                invalid_codes.append(template.code)
+
+        if invalid_codes:
+            raise ValueError(
+                "The dataset contains infeasible load/truck mappings: "
+                + ", ".join(sorted(invalid_codes))
+            )
+
         session.commit()
+        return {
+            "load_templates": len(templates_by_code),
+            "truck_specs": len(truck_specs_by_type),
+            "source": str(DATASET_PATH),
+        }
     except Exception:
         session.rollback()
         raise
@@ -156,5 +212,8 @@ def import_dataset():
 
 
 if __name__ == "__main__":
-    import_dataset()
-    print("Imported dataset into rigsync.db")
+    result = import_dataset()
+    print(
+        f"Imported {result['load_templates']} load templates and "
+        f"{result['truck_specs']} truck specs from {result['source']}"
+    )

@@ -1,7 +1,7 @@
 import { React, h } from "../../lib/react.js";
-import { DEFAULT_CENTER, getTruckPosition, getTruckStatus } from "../../features/rigMoves/simulation.js";
+import { DEFAULT_CENTER, fetchRouteData, fallbackRouteData, getTruckPosition, getTruckStatus } from "../../features/rigMoves/simulation.js";
 
-const { useEffect, useRef, useState } = React;
+const { useEffect, useMemo, useRef, useState } = React;
 
 function createTruckIcon(truckId) {
   const svg = `
@@ -48,6 +48,22 @@ function createDestinationIcon() {
     html: svg,
     iconSize: [26, 34],
     iconAnchor: [13, 31],
+  });
+}
+
+function createSupportSourceIcon() {
+  const svg = `
+    <svg width="26" height="26" viewBox="0 0 26 26" fill="none" xmlns="http://www.w3.org/2000/svg">
+      <circle cx="13" cy="13" r="8" fill="#8bc7ff"/>
+      <circle cx="13" cy="13" r="11" stroke="rgba(139,199,255,0.28)" stroke-width="1.5"/>
+      <path d="M9.5 13H16.5M13 9.5V16.5" stroke="#0f1216" stroke-width="1.8" stroke-linecap="round"/>
+    </svg>`;
+
+  return window.L.divIcon({
+    className: "endpoint-marker-icon endpoint-marker-icon-support",
+    html: svg,
+    iconSize: [26, 26],
+    iconAnchor: [13, 13],
   });
 }
 
@@ -136,7 +152,7 @@ function bindClampedTooltip(layer, content, options) {
 }
 
 function shouldShowTruckMarker(status) {
-  return status?.startsWith("In transit") || status === "Returning";
+  return status?.startsWith("In transit") || status?.startsWith("Heading to pickup") || status === "Returning";
 }
 
 function focusMapOnPoint(map, point, zoom = 12) {
@@ -194,6 +210,7 @@ export function LeafletMap({
   endPoint,
   simulation,
   currentMinute = 0,
+  supportRoutes = [],
   pickerTarget = null,
   onPickPoint,
   onRigFocusChange = null,
@@ -203,13 +220,28 @@ export function LeafletMap({
 }) {
   const [locationRequestState, setLocationRequestState] = useState("idle");
   const [locationRequestError, setLocationRequestError] = useState("");
+  const [supportRouteGeometryMap, setSupportRouteGeometryMap] = useState({});
   const mapElementRef = useRef(null);
   const mapRef = useRef(null);
   const markersRef = useRef({ start: null, end: null });
   const routeLineRef = useRef(null);
+  const supportRouteLinesRef = useRef([]);
+  const supportMarkersRef = useRef(new Map());
   const truckMarkersRef = useRef(new Map());
   const routeKeyRef = useRef("");
   const pointBoundsKeyRef = useRef("");
+  const supportRouteCacheRef = useRef(new Map());
+  const supportRouteRequestKey = useMemo(
+    () =>
+      JSON.stringify({
+        endPoint: endPoint ? [endPoint.lat, endPoint.lng] : null,
+        supportRoutes: (supportRoutes || []).map((route) => ({
+          key: route?.key || "",
+          sourcePoint: route?.sourcePoint ? [route.sourcePoint.lat, route.sourcePoint.lng] : null,
+        })),
+      }),
+    [supportRoutes, endPoint],
+  );
 
   useEffect(() => {
     if (!mapElementRef.current || mapRef.current || !window.L) {
@@ -267,6 +299,89 @@ export function LeafletMap({
       setLocationRequestError("");
     }
   }, [pickerTarget]);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    async function loadSupportRoutes() {
+      if (!endPoint || !(supportRoutes || []).length) {
+        setSupportRouteGeometryMap({});
+        return;
+      }
+
+      const supportedRoutes = supportRoutes.filter((route) => route?.sourcePoint && route?.key);
+      const nextMap = {};
+
+      supportedRoutes.forEach((route) => {
+        if (route?.geometry?.length > 2) {
+          nextMap[route.key] = route.geometry;
+          return;
+        }
+
+        const cacheKey = `${route.sourcePoint.lat},${route.sourcePoint.lng}->${endPoint.lat},${endPoint.lng}`;
+        const cachedGeometry = supportRouteCacheRef.current.get(cacheKey);
+        if (cachedGeometry?.length > 2) {
+          nextMap[route.key] = cachedGeometry;
+          return;
+        }
+
+        nextMap[route.key] = fallbackRouteData(route.sourcePoint, endPoint).geometry;
+      });
+
+      if (!cancelled) {
+        setSupportRouteGeometryMap(nextMap);
+      }
+
+      const uncachedRoutes = supportedRoutes.filter((route) => {
+        if (route?.geometry?.length > 2) {
+          return false;
+        }
+
+        const cacheKey = `${route.sourcePoint.lat},${route.sourcePoint.lng}->${endPoint.lat},${endPoint.lng}`;
+        return !(supportRouteCacheRef.current.get(cacheKey)?.length > 2);
+      });
+
+      if (uncachedRoutes.length) {
+        const results = await Promise.all(
+          uncachedRoutes.map(async (route) => {
+            const cacheKey = `${route.sourcePoint.lat},${route.sourcePoint.lng}->${endPoint.lat},${endPoint.lng}`;
+
+            try {
+              const routeData = await fetchRouteData(route.sourcePoint, endPoint);
+              if (routeData?.geometry?.length > 2) {
+                return { key: route.key, cacheKey, geometry: routeData.geometry };
+              }
+            } catch {
+              // Fall back below.
+            }
+
+            return {
+              key: route.key,
+              cacheKey,
+              geometry: fallbackRouteData(route.sourcePoint, endPoint).geometry,
+            };
+          }),
+        );
+
+        results.forEach((result) => {
+          nextMap[result.key] = result.geometry;
+          if (result.geometry?.length > 2) {
+            supportRouteCacheRef.current.set(result.cacheKey, result.geometry);
+          }
+        });
+      }
+
+      if (!cancelled) {
+        setSupportRouteGeometryMap(nextMap);
+      }
+    }
+
+    loadSupportRoutes();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [supportRouteRequestKey]);
 
   useEffect(() => {
     const map = mapRef.current;
@@ -336,6 +451,73 @@ export function LeafletMap({
       markersRef.current.end = null;
     }
   }, [startPoint, endPoint, simulation, currentMinute, onRigFocusChange, onTruckFocusChange]);
+
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || !window.L) {
+      return;
+    }
+
+    supportRouteLinesRef.current.forEach((line) => line.remove());
+    supportRouteLinesRef.current = [];
+
+    const activeSupportKeys = new Set();
+
+    (supportRoutes || []).forEach((route) => {
+      if (!route?.sourcePoint || !endPoint) {
+        return;
+      }
+
+      activeSupportKeys.add(route.key);
+
+      const existingMarker = supportMarkersRef.current.get(route.key);
+      if (existingMarker) {
+        existingMarker.setLatLng([route.sourcePoint.lat, route.sourcePoint.lng]);
+        bindClampedTooltip(
+          existingMarker,
+          `<div class="rig-tooltip"><strong>${route.sourceLabel}</strong><p>${route.quantity}x ${route.loadLabel}</p></div>`,
+          createSceneTooltipOptions(),
+        );
+      } else {
+        const marker = window.L.marker([route.sourcePoint.lat, route.sourcePoint.lng], {
+          icon: createSupportSourceIcon(),
+        }).addTo(map);
+        bindClampedTooltip(
+          marker,
+          `<div class="rig-tooltip"><strong>${route.sourceLabel}</strong><p>${route.quantity}x ${route.loadLabel}</p></div>`,
+          createSceneTooltipOptions(),
+        );
+        supportMarkersRef.current.set(route.key, marker);
+      }
+
+      const geometry =
+        supportRouteGeometryMap[route.key] || [
+          [route.sourcePoint.lat, route.sourcePoint.lng],
+          [endPoint.lat, endPoint.lng],
+        ];
+
+      const line = window.L.polyline(
+        geometry,
+        {
+          color: "#8bc7ff",
+          weight: 2,
+          opacity: 0.75,
+          dashArray: "10 10",
+          lineCap: "round",
+          lineJoin: "round",
+        },
+      ).addTo(map);
+
+      supportRouteLinesRef.current.push(line);
+    });
+
+    supportMarkersRef.current.forEach((marker, key) => {
+      if (!activeSupportKeys.has(key)) {
+        marker.remove();
+        supportMarkersRef.current.delete(key);
+      }
+    });
+  }, [supportRoutes, endPoint, supportRouteGeometryMap]);
 
   useEffect(() => {
     const map = mapRef.current;

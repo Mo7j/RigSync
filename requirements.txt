@@ -2,3 +2,5 @@ pandas
 openpyxl
 sqlalchemy
 flask
+psycopg[binary]
+python-dotenv

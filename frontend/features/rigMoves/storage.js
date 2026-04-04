@@ -1,8 +1,7 @@
-import { MOVES_STORAGE_KEY } from "../../lib/constants.js";
 import { clampPercentage, formatCoordinate, formatMinutes, formatShortDate } from "../../lib/format.js";
-import { haversineKilometers, parseCoordinateString } from "./simulation.js";
+import { haversineKilometers } from "./simulation.js";
 
-const MOVE_SESSIONS_STORAGE_KEY = `${MOVES_STORAGE_KEY}:sessions`;
+let movesCache = [];
 
 function roundCoordinate(value) {
   return Math.round(value * 100000) / 100000;
@@ -40,16 +39,63 @@ function compactPlayback(playback) {
 
   return {
     totalMinutes: playback.totalMinutes,
+    journeys: (playback.journeys || []).map((journey) => ({
+      id: journey.id,
+      truckId: journey.truckId,
+      truckType: journey.truckType,
+      loadIds: [...(journey.loadIds || [])],
+      loadCodes: [...(journey.loadCodes || [])],
+      description: journey.description || null,
+      dispatchStart: journey.dispatchStart ?? 0,
+      moveStart: journey.moveStart ?? 0,
+      arrivalAtDestination: journey.arrivalAtDestination ?? 0,
+      returnStart: journey.returnStart ?? 0,
+      returnToSource: journey.returnToSource ?? 0,
+      routeMinutes: journey.routeMinutes || null,
+    })),
     trips: (playback.trips || []).map((trip) => ({
       truckId: trip.truckId,
       truckType: trip.truckType,
+      journeyId: trip.journeyId || null,
       loadId: trip.loadId,
+      loadCode: trip.loadCode || null,
       description: trip.description,
+      sourceLabel: trip.sourceLabel || null,
+      destinationLabel: trip.destinationLabel || null,
+      dispatchStart: trip.dispatchStart ?? trip.loadStart,
+      pickupRouteMinutes: trip.pickupRouteMinutes || null,
+      pickupRouteGeometry: compactGeometry(trip.pickupRouteGeometry || []),
+      routeMinutes: trip.routeMinutes || null,
+      routeGeometry: compactGeometry(trip.routeGeometry || []),
+      moveStart: trip.moveStart ?? null,
       loadStart: trip.loadStart,
+      rigDownStart: trip.rigDownStart ?? trip.loadStart,
       rigDownFinish: trip.rigDownFinish,
+      pickupLoadStart: trip.pickupLoadStart ?? trip.rigDownFinish,
+      pickupLoadFinish: trip.pickupLoadFinish ?? trip.moveStart ?? trip.rigDownFinish,
+      rigDownWorkerCount: trip.rigDownWorkerCount || 0,
+      rigDownWorkerRoles: trip.rigDownWorkerRoles || {},
       arrivalAtDestination: trip.arrivalAtDestination,
+      unloadDropStart: trip.unloadDropStart ?? trip.arrivalAtDestination,
+      unloadDropFinish: trip.unloadDropFinish ?? trip.arrivalAtDestination,
+      rigUpStart: trip.rigUpStart ?? trip.arrivalAtDestination,
       rigUpFinish: trip.rigUpFinish,
+      rigUpWorkerCount: trip.rigUpWorkerCount || 0,
+      rigUpWorkerRoles: trip.rigUpWorkerRoles || {},
+      returnStart: trip.returnStart ?? trip.arrivalAtDestination,
       returnToSource: trip.returnToSource,
+    })),
+    workerAssignments: (playback.workerAssignments || []).map((assignment) => ({
+      workerId: assignment.workerId,
+      workerLabel: assignment.workerLabel,
+      roleId: assignment.roleId,
+      shiftType: assignment.shiftType,
+      phase: assignment.phase,
+      loadId: assignment.loadId,
+      loadCode: assignment.loadCode || null,
+      description: assignment.description,
+      startMinute: assignment.startMinute,
+      endMinute: assignment.endMinute,
     })),
     steps: (playback.steps || []).map((step) => ({
       type: step.type,
@@ -57,6 +103,28 @@ function compactPlayback(playback) {
       title: step.title,
       description: step.description,
     })),
+    tasks: (playback.tasks || []).map((task) => ({
+      id: task.id,
+      loadId: task.loadId,
+      loadCode: task.loadCode || null,
+      description: task.description,
+      phase: task.phase,
+      predecessorIds: [...(task.predecessorIds || [])],
+      startMinute: task.startMinute,
+      endMinute: task.endMinute,
+      earliestStart: task.earliestStart ?? task.startMinute ?? 0,
+      earliestFinish: task.earliestFinish ?? task.endMinute ?? 0,
+      latestStart: task.latestStart ?? ((task.startMinute ?? 0) + (task.slack ?? 0)),
+      latestFinish: task.latestFinish ?? ((task.endMinute ?? 0) + (task.slack ?? 0)),
+      slack: task.slack ?? 0,
+      isCritical: Boolean(task.isCritical),
+    })),
+    planningAnalysis: playback.planningAnalysis
+      ? {
+          projectFinish: playback.planningAnalysis.projectFinish ?? playback.totalMinutes ?? 0,
+          criticalTaskIds: [...(playback.planningAnalysis.criticalTaskIds || [])],
+        }
+      : null,
   };
 }
 
@@ -75,6 +143,17 @@ function compactScenarioPlan(plan) {
     routeSource: plan.routeSource,
     routeGeometry: compactGeometry(plan.routeGeometry || []),
     totalMinutes: plan.totalMinutes,
+    workerShifts: plan.workerShifts || null,
+    truckSetup: plan.truckSetup || [],
+    allocatedTruckSetup: plan.allocatedTruckSetup || [],
+    usedTruckSetup: plan.usedTruckSetup || [],
+    allocatedTruckCount: plan.allocatedTruckCount,
+    utilization: plan.utilization,
+    truckUtilization: plan.truckUtilization,
+    workerUtilization: plan.workerUtilization,
+    idleMinutes: plan.idleMinutes,
+    workerIdleMinutes: plan.workerIdleMinutes,
+    costEstimate: plan.costEstimate,
     bestVariant: plan.bestVariant
       ? {
           name: plan.bestVariant.name,
@@ -108,8 +187,28 @@ function compactSimulation(simulation) {
     routeDistanceKm: simulation.routeDistanceKm,
     routeMinutes: simulation.routeMinutes,
     routeSource: simulation.routeSource,
+    routeGeometry: compactGeometry(simulation.routeGeometry || []),
+    supportRoutes: (simulation.supportRoutes || []).map((route) => ({
+      key: route.key,
+      loadLabel: route.loadLabel,
+      quantity: route.quantity,
+      sourceLabel: route.sourceLabel,
+      sourcePoint: route.sourcePoint || null,
+      destinationLabel: route.destinationLabel,
+      truckLabel: route.truckLabel,
+      routeSource: route.routeSource || "",
+      geometry: compactGeometry(route.geometry || []),
+      routeMinutes: route.routeMinutes || null,
+      routeDistanceKm: route.routeDistanceKm || null,
+      pickupGeometry: compactGeometry(route.pickupGeometry || []),
+      pickupRouteSource: route.pickupRouteSource || "",
+      pickupRouteMinutes: route.pickupRouteMinutes || null,
+      pickupRouteDistanceKm: route.pickupRouteDistanceKm || null,
+    })),
     preferredScenarioName,
     scenarioPlans,
+    bestScenario: simulation.bestScenario || null,
+    bestPlan: simulation.bestPlan ? { ...simulation.bestPlan, playback: compactPlayback(simulation.bestPlan.playback) } : null,
   };
 }
 
@@ -140,91 +239,84 @@ function normalizeStoredMove(move) {
 
   return {
     ...move,
+    createdBy: move.createdBy || {
+      id: "foreman-fahad",
+      name: "Fahad Al-Qahtani",
+      role: "Foreman",
+      managerId: "manager-nasser",
+    },
+    executionState: move.executionState || "planning",
+    operatingState: move.operatingState || (move.executionState === "completed" ? "drilling" : "standby"),
+    executionProgress: {
+      managerNotified: Boolean(move.executionProgress?.managerNotified),
+      trucksReserved: Boolean(move.executionProgress?.trucksReserved),
+      liveDataRequested: Boolean(move.executionProgress?.liveDataRequested),
+      rigDownCompleted: Boolean(move.executionProgress?.rigDownCompleted),
+      rigUpCompleted: Boolean(move.executionProgress?.rigUpCompleted),
+    },
     simulation: normalizeStoredSimulation(move.simulation),
   };
 }
 
-function readMoveSessions() {
-  try {
-    const raw = window.localStorage.getItem(MOVE_SESSIONS_STORAGE_KEY);
-    const parsed = raw ? JSON.parse(raw) : {};
-    return parsed && typeof parsed === "object" ? parsed : {};
-  } catch {
-    return {};
-  }
+function sortMoves(moves) {
+  return [...moves].sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt));
 }
 
-function writeMoveSessions(nextSessions) {
-  window.localStorage.setItem(MOVE_SESSIONS_STORAGE_KEY, JSON.stringify(nextSessions));
-}
-
-function applyMoveSessions(moves) {
-  const sessions = readMoveSessions();
-  return moves.map((move) => {
-    const session = sessions[move.id];
-    if (!session) {
-      return move;
-    }
-
-    return {
-      ...move,
-      progressMinute: session.progressMinute ?? move.progressMinute ?? 0,
-      completionPercentage: session.completionPercentage ?? move.completionPercentage ?? 0,
-      playbackSpeed: session.playbackSpeed ?? move.playbackSpeed,
-      planningStartDate: session.planningStartDate ?? move.planningStartDate,
-      planningStartTime: session.planningStartTime ?? move.planningStartTime,
-    };
+async function saveMoveRemote(move) {
+  const response = await fetch(`/api/moves/${encodeURIComponent(move.id)}`, {
+    method: "PUT",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ move: normalizeStoredMove(move) }),
   });
+
+  if (!response.ok) {
+    throw new Error(`Move save failed with ${response.status}`);
+  }
+
+  return normalizeStoredMove(await response.json());
 }
 
-function safeReadStorage() {
-  try {
-    const raw = window.localStorage.getItem(MOVES_STORAGE_KEY);
-    const parsed = raw ? JSON.parse(raw) : [];
-    if (!Array.isArray(parsed)) {
-      return [];
-    }
-
-    const normalized = parsed.map(normalizeStoredMove).filter(Boolean);
-    const compactRaw = JSON.stringify(normalized);
-    if (raw !== compactRaw) {
-      window.localStorage.setItem(MOVES_STORAGE_KEY, compactRaw);
-    }
-
-    return normalized;
-  } catch {
+export async function hydrateMoves(managerId) {
+  if (!managerId) {
+    movesCache = [];
     return [];
   }
-}
 
-function saveMoves(nextMoves) {
-  const compactMoves = nextMoves.map(normalizeStoredMove);
-  window.localStorage.setItem(MOVES_STORAGE_KEY, JSON.stringify(compactMoves));
-  return compactMoves;
+  const params = new URLSearchParams({ managerId });
+  const response = await fetch(`/api/moves?${params.toString()}`);
+  if (!response.ok) {
+    throw new Error(`Moves request failed with ${response.status}`);
+  }
+
+  const payload = await response.json();
+  movesCache = sortMoves((payload || []).map(normalizeStoredMove).filter(Boolean));
+  return movesCache;
 }
 
 export function readMoves() {
-  return applyMoveSessions(safeReadStorage())
-    .sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt));
+  return sortMoves(movesCache);
 }
 
-export function upsertMove(move) {
-  const current = readMoves().filter((item) => item.id !== move.id);
-  return applyMoveSessions(saveMoves([move, ...current]));
+export async function upsertMove(move) {
+  const savedMove = await saveMoveRemote(move);
+  const current = readMoves().filter((item) => item.id !== savedMove.id);
+  movesCache = sortMoves([savedMove, ...current]);
+  return movesCache;
 }
 
-export function removeMove(moveId) {
-  const nextMoves = readMoves().filter((move) => move.id !== moveId);
-  saveMoves(nextMoves);
+export async function removeMove(moveId) {
+  const response = await fetch(`/api/moves/${encodeURIComponent(moveId)}`, {
+    method: "DELETE",
+  });
 
-  const currentSessions = readMoveSessions();
-  if (currentSessions[moveId]) {
-    const nextSessions = { ...currentSessions };
-    delete nextSessions[moveId];
-    writeMoveSessions(nextSessions);
+  if (!response.ok) {
+    throw new Error(`Move delete failed with ${response.status}`);
   }
 
-  return nextMoves;
+  movesCache = readMoves().filter((move) => move.id !== moveId);
+  return movesCache;
 }
 
 export function updateMoveProgress(moveId, progressMinute) {
@@ -246,24 +338,30 @@ export function updateMoveProgress(moveId, progressMinute) {
     };
   });
 
-  return saveMoves(nextMoves);
+  movesCache = nextMoves;
+  return nextMoves;
 }
 
-export function persistMoveSession(moveId, sessionState) {
-  const currentSessions = readMoveSessions();
-  const nextSessions = {
-    ...currentSessions,
-    [moveId]: {
-      ...(currentSessions[moveId] || {}),
-      ...sessionState,
+export async function persistMoveSession(moveId, sessionState) {
+  const targetMove = readMoves().find((move) => move.id === moveId);
+  if (!targetMove) {
+    return null;
+  }
+
+  const updatedMove = normalizeStoredMove({
+    ...targetMove,
+    ...sessionState,
+    executionProgress: {
+      ...(targetMove.executionProgress || {}),
+      ...(sessionState.executionProgress || {}),
     },
-  };
+  });
 
-  writeMoveSessions(nextSessions);
-  return nextSessions[moveId];
+  await upsertMove(updatedMove);
+  return updatedMove;
 }
 
-export function createMoveRecord({ name, startPoint, endPoint, startLabel, endLabel, simulation, routeMode, loadCount }) {
+export function createMoveRecord({ name, startPoint, endPoint, startLabel, endLabel, simulation, routeMode, loadCount, createdBy = null }) {
   const totalMinutes = simulation.bestPlan.totalMinutes;
   const routeKm =
     simulation?.routeDistanceKm ||
@@ -278,6 +376,7 @@ export function createMoveRecord({ name, startPoint, endPoint, startLabel, endLa
     updatedAt: now.toISOString(),
     routeMode,
     loadCount,
+    createdBy,
     startPoint,
     endPoint,
     startLabel: startLabel || formatCoordinate(startPoint),
@@ -285,61 +384,25 @@ export function createMoveRecord({ name, startPoint, endPoint, startLabel, endLa
     routeKm,
     eta: formatMinutes(totalMinutes),
     routeTime: formatMinutes(simulation.routeMinutes),
+    planningStartDate: now.toISOString().slice(0, 10),
+    planningStartTime: "06:00",
     progressMinute: 0,
     completionPercentage: 0,
+    executionState: "planning",
+    operatingState: "standby",
+    executionProgress: {
+      managerNotified: false,
+      trucksReserved: false,
+      liveDataRequested: false,
+      rigDownCompleted: false,
+      rigUpCompleted: false,
+    },
     truckSetup: simulation.truckSetup || [],
     simulation,
     createdLabel: formatShortDate(now),
   };
 }
 
-export function migrateLegacyHistory(historyStorageKey) {
-  const existingMoves = readMoves();
-  if (existingMoves.length) {
-    return;
-  }
-
-  try {
-    const raw = window.localStorage.getItem(historyStorageKey);
-    const parsed = raw ? JSON.parse(raw) : [];
-    if (!Array.isArray(parsed) || !parsed.length) {
-      return;
-    }
-
-    const migrated = parsed
-      .map((entry) => {
-        const startPoint = parseCoordinateString(entry.start);
-        const endPoint = parseCoordinateString(entry.end);
-        if (!startPoint || !endPoint) {
-          return null;
-        }
-
-        return {
-          id: entry.id || crypto.randomUUID(),
-          name: entry.title || "Imported rig move",
-          createdAt: new Date(entry.createdAt || Date.now()).toISOString(),
-          updatedAt: new Date(entry.createdAt || Date.now()).toISOString(),
-          routeMode: "estimated",
-          loadCount: 0,
-          startPoint,
-          endPoint,
-          startLabel: entry.start,
-          endLabel: entry.end,
-          routeKm: Math.max(1, Math.round(haversineKilometers(startPoint, endPoint) * 10) / 10),
-          eta: entry.eta || "--",
-          routeTime: entry.routeTime || "--",
-          progressMinute: 0,
-          completionPercentage: 0,
-          simulation: null,
-          createdLabel: entry.createdAt || "--",
-        };
-      })
-      .filter(Boolean);
-
-    if (migrated.length) {
-      saveMoves(migrated);
-    }
-  } catch {
-    // Ignore invalid legacy data.
-  }
+export function migrateLegacyHistory() {
+  return [];
 }

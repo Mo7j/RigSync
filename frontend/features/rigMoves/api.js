@@ -1,13 +1,39 @@
 const locationLabelCache = new Map();
 
 export async function fetchLoads() {
-  const response = await fetch("/api/loads");
+  const [loadsResponse, startupResponse, truckSpecsResponse, workerRolesResponse] = await Promise.all([
+    fetch("/api/loads"),
+    fetch("/api/startup-loads"),
+    fetch("/api/truck-specs"),
+    fetch("/api/worker-roles"),
+  ]);
 
-  if (!response.ok) {
-    throw new Error(`Load request failed with ${response.status}`);
+  if (!loadsResponse.ok) {
+    throw new Error(`Load request failed with ${loadsResponse.status}`);
+  }
+  if (!startupResponse.ok) {
+    throw new Error(`Startup load request failed with ${startupResponse.status}`);
+  }
+  if (!truckSpecsResponse.ok) {
+    throw new Error(`Truck spec request failed with ${truckSpecsResponse.status}`);
+  }
+  if (!workerRolesResponse.ok) {
+    throw new Error(`Worker roles request failed with ${workerRolesResponse.status}`);
   }
 
-  return response.json();
+  const [rigLoads, startupLoads, truckSpecs, workerRoles] = await Promise.all([
+    loadsResponse.json(),
+    startupResponse.json(),
+    truckSpecsResponse.json(),
+    workerRolesResponse.json(),
+  ]);
+
+  return {
+    rigLoads,
+    startupLoads,
+    truckSpecs,
+    workerRoles,
+  };
 }
 
 export async function fetchLocationLabel(point) {

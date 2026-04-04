@@ -945,6 +945,29 @@ p {
   margin-top: var(--space-4);
 }
 
+.auth-demo-accounts {
+  display: grid;
+  gap: 10px;
+  margin-top: var(--space-4);
+}
+
+.auth-demo-account {
+  display: grid;
+  gap: 4px;
+  width: 100%;
+  padding: 12px 14px;
+  border: 1px solid rgba(148, 163, 184, 0.16);
+  border-radius: 16px;
+  background: rgba(255, 255, 255, 0.03);
+  color: inherit;
+  text-align: left;
+}
+
+.auth-demo-account span {
+  color: var(--muted);
+  font-size: 0.88rem;
+}
+
 .auth-actions {
   display: flex;
   gap: var(--space-2);
@@ -1506,6 +1529,68 @@ p {
 .rig-load-grid .stat-card-meta {
   font-size: 0.78rem;
   line-height: 1.4;
+}
+
+.manager-rig-list,
+.manager-team-list,
+.manager-note-list {
+  display: grid;
+  gap: 12px;
+}
+
+.manager-rig-card,
+.manager-team-row {
+  display: grid;
+  gap: 12px;
+  padding: 16px;
+  border: 1px solid rgba(148, 163, 184, 0.14);
+  border-radius: 18px;
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.startup-load-card-covered {
+  border-color: rgba(54, 179, 126, 0.35);
+}
+
+.startup-load-card-partial {
+  border-color: rgba(245, 182, 58, 0.35);
+}
+
+.startup-load-card-missing {
+  border-color: rgba(255, 107, 107, 0.35);
+}
+
+.manager-rig-head,
+.manager-rig-footer,
+.manager-team-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.manager-rig-stats {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.manager-rig-stat {
+  display: grid;
+  gap: 4px;
+}
+
+.manager-rig-stat span,
+.manager-team-meta,
+.manager-note-list p {
+  color: var(--muted);
+  font-size: 0.88rem;
+}
+
+@media (max-width: 980px) {
+  .manager-rig-stats {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
 }
 
 .modal-backdrop {
@@ -2873,6 +2958,7 @@ p {
   background: transparent;
   backdrop-filter: none;
   box-shadow: none;
+  pointer-events: auto;
 }
 
 .scene-panel-left-merged .scene-panel-section-plain {
@@ -3243,10 +3329,17 @@ p {
 .scene-panel-actions {
   display: grid;
   gap: 10px;
+  pointer-events: auto;
 }
 
 .scene-panel-actions-inline {
   grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.scene-panel-actions .button,
+.scene-panel-actions button,
+.scene-top-action-button {
+  pointer-events: auto;
 }
 
 .scene-panel-actions .button-primary {
@@ -3508,6 +3601,16 @@ p {
   gap: 8px;
 }
 
+.worker-slider-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px 12px;
+}
+
+.truck-slider-card-compact {
+  min-width: 0;
+}
+
 .truck-time-controls {
   display: grid;
   gap: 10px;
@@ -3526,6 +3629,18 @@ p {
   gap: 12px;
   color: var(--muted-strong);
   font-size: 0.88rem;
+}
+
+.truck-slider-head-compact {
+  gap: 8px;
+  font-size: 0.76rem;
+}
+
+.truck-slider-head-compact span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .truck-slider-input {
