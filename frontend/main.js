@@ -6,17 +6,19 @@ import {
 import { fetchLoads, fetchLocationLabel } from "./features/rigMoves/api.js";
 import { buildLogicalLoads, buildScenarioPlans, fetchRouteData, fallbackRouteData } from "./features/rigMoves/simulation.js";
 import { buildOperatingSnapshot, buildStartupTransferLoads, buildStartupTransferSchedule } from "./features/rigMoves/operations.js";
-import { applyRigInventoryAdjustments, hydrateRigInventoryAdjustments, readRigInventoryAdjustments, writeRigInventoryAdjustments } from "./features/rigInventory/storage.js";
+import { applyRigInventoryAdjustments, hydrateRigInventoryAdjustments, readRigInventoryAdjustments, setRigInventoryCache, writeRigInventoryAdjustments } from "./features/rigInventory/storage.js";
 import {
+  authenticateUser,
+  createDriverAccount,
   createSession,
   getSession,
+  refreshSession,
   clearSession,
-  findUserByCredentials,
   getManagedForemen,
 } from "./features/auth/auth.js";
 import {
   readMoves,
-  hydrateMoves,
+  setMovesCache,
   fetchMove,
   createMoveRecord,
   upsertMove,
@@ -24,17 +26,21 @@ import {
   removeMove,
 } from "./features/rigMoves/storage.js";
 import {
-  hydrateManagerResources,
+  setManagerResourcesCache,
+  readManagerResources,
   readManagerFleet,
+  writeManagerResources,
   writeManagerFleet,
   buildFleetAvailability,
   getAvailabilityValidationError,
   sumTruckCounts,
 } from "./features/resources/storage.js";
+import { subscribeManagerMoves, subscribeManagerResources, subscribeRigInventoryDoc } from "./lib/firebaseOperations.js";
 import { HomePage } from "./pages/HomePage.js";
 import { LoginPage } from "./pages/LoginPage.js";
 import { DashboardPage } from "./pages/DashboardPage.js";
 import { ManagerDashboardPage } from "./pages/ManagerDashboardPage.js";
+import { DriverDashboardPage } from "./pages/DriverDashboardPage.js";
 import { RigMovePage } from "./pages/RigMovePage.js";
 import { Card } from "./components/ui/Card.js";
 import { AppLayout } from "./layouts/AppLayout.js";
@@ -152,6 +158,175 @@ function getSessionManagerId(session) {
   return session.role === "Manager" ? session.id : session.managerId || null;
 }
 
+function getAssignmentStageLabel(stageState = {}) {
+  if (!stageState.rigDownCompleted) {
+    return "rigDown";
+  }
+  if (!stageState.rigMoveCompleted) {
+    return "rigMove";
+  }
+  if (!stageState.rigUpCompleted) {
+    return "rigUp";
+  }
+  return "completed";
+}
+
+function getMovePlayback(move) {
+  const preferredScenarioName = move?.simulation?.preferredScenarioName || "";
+  const preferredScenario =
+    (move?.simulation?.scenarioPlans || []).find((scenario) => scenario.name === preferredScenarioName) ||
+    move?.simulation?.bestScenario ||
+    move?.simulation?.scenarioPlans?.[0] ||
+    null;
+
+  return move?.simulation?.bestPlan?.playback || preferredScenario?.bestVariant?.playback || null;
+}
+
+function pruneTaskAssignments(taskAssignments = [], moves = []) {
+  const moveById = new Map((moves || []).filter(Boolean).map((move) => [move.id, move]));
+
+  return (taskAssignments || []).filter((assignment) => {
+    if (!assignment?.moveId) {
+      return false;
+    }
+
+    const move = moveById.get(assignment.moveId);
+    if (!move) {
+      return false;
+    }
+
+    if (move.executionState !== "active") {
+      return false;
+    }
+
+    if (!assignment.driverId || !assignment.loadId) {
+      return false;
+    }
+
+    return true;
+  });
+}
+
+function buildDriverAssignmentsForMove({ move, managerResources }) {
+  const activeAssignments = (managerResources?.taskAssignments || []).filter((assignment) => assignment.status !== "completed");
+  const busyDriverIds = new Set(activeAssignments.map((assignment) => assignment.driverId));
+  const drivers = managerResources?.drivers || [];
+  const freeDrivers = drivers.filter((driver) => !busyDriverIds.has(driver.id));
+  const assignedAt = new Date().toISOString();
+  const playback = getMovePlayback(move);
+  const trips = [...(playback?.trips || [])]
+    .filter((trip) => trip?.loadId != null)
+    .sort((left, right) => (left.loadStart ?? 0) - (right.loadStart ?? 0) || (left.loadId ?? 0) - (right.loadId ?? 0));
+  const primaryPool = (freeDrivers.length ? freeDrivers : drivers).filter(Boolean);
+  if (!primaryPool.length || !trips.length) {
+    return [];
+  }
+  const tripsByPlannedTruck = new Map();
+  trips.forEach((trip) => {
+    const plannedTruckKey = `${trip.truckType || "Truck"}::${trip.truckId ?? "0"}`;
+    if (!tripsByPlannedTruck.has(plannedTruckKey)) {
+      tripsByPlannedTruck.set(plannedTruckKey, []);
+    }
+    tripsByPlannedTruck.get(plannedTruckKey).push(trip);
+  });
+
+  const plannedTruckLanes = [...tripsByPlannedTruck.entries()]
+    .map(([plannedTruckKey, plannedTrips]) => ({
+      plannedTruckKey,
+      truckType: plannedTrips[0]?.truckType || "Truck",
+      plannedTruckId: plannedTrips[0]?.truckId ?? null,
+      trips: [...plannedTrips].sort(
+        (left, right) => (left.loadStart ?? 0) - (right.loadStart ?? 0) || (left.loadId ?? 0) - (right.loadId ?? 0),
+      ),
+    }))
+    .sort(
+      (left, right) => (left.trips[0]?.loadStart ?? 0) - (right.trips[0]?.loadStart ?? 0) || ((left.plannedTruckId ?? 0) - (right.plannedTruckId ?? 0)),
+    );
+
+  const usedDriverIds = new Set();
+  function pickDriverForLane(type) {
+    const typeKey = String(type || "").trim().toLowerCase();
+    const exactPrimary = primaryPool.find(
+      (driver) => !usedDriverIds.has(driver.id) && String(driver.truckType || "").trim().toLowerCase() === typeKey,
+    );
+    if (exactPrimary) {
+      usedDriverIds.add(exactPrimary.id);
+      return exactPrimary;
+    }
+
+    const exactAny = drivers.find(
+      (driver) => !usedDriverIds.has(driver.id) && String(driver.truckType || "").trim().toLowerCase() === typeKey,
+    );
+    if (exactAny) {
+      usedDriverIds.add(exactAny.id);
+      return exactAny;
+    }
+
+    const fallbackPrimary = primaryPool.find((driver) => !usedDriverIds.has(driver.id));
+    if (fallbackPrimary) {
+      usedDriverIds.add(fallbackPrimary.id);
+      return fallbackPrimary;
+    }
+
+    const fallbackAny = drivers.find((driver) => !usedDriverIds.has(driver.id));
+    if (fallbackAny) {
+      usedDriverIds.add(fallbackAny.id);
+      return fallbackAny;
+    }
+
+    return null;
+  }
+
+  const assignmentQueues = new Map();
+  plannedTruckLanes.forEach((lane) => {
+    const driver = pickDriverForLane(lane.truckType);
+    if (!driver) {
+      return;
+    }
+
+    const driverAssignments = lane.trips.map((trip, index) => ({
+      id: `assignment-${move.id}-${driver.id}-${trip.loadId}-${index + 1}`,
+      moveId: move.id,
+      moveName: move.name,
+      driverId: driver.id,
+      driverName: driver.name,
+      truckId: driver.truckId || "",
+      truckType: driver.truckType || lane.truckType || "Truck",
+      plannedTruckType: lane.truckType || driver.truckType || "",
+      plannedTruckId: lane.plannedTruckId,
+      startLabel: move.startLabel || "",
+      endLabel: move.endLabel || "",
+      loadId: trip.loadId,
+      loadCode: trip.loadCode || "",
+      tripLabel: trip.description || `Load ${trip.loadCode || trip.loadId}`,
+      tripNumber: index + 1,
+      plannedTripCount: lane.trips.length,
+      sequence: index + 1,
+      plannedStartMinute: trip.loadStart ?? trip.dispatchStart ?? 0,
+      plannedFinishMinute: trip.rigUpFinish ?? trip.returnToSource ?? trip.arrivalAtDestination ?? 0,
+      journeyId: trip.journeyId || null,
+      stageStatus: {
+        rigDownCompleted: false,
+        rigMoveCompleted: false,
+        rigUpCompleted: false,
+      },
+      stageCompletedAt: {
+        rigDown: null,
+        rigMove: null,
+        rigUp: null,
+      },
+      currentStage: "rigDown",
+      status: index === 0 ? "active" : "queued",
+      assignedAt,
+      updatedAt: assignedAt,
+    }));
+
+    assignmentQueues.set(driver.id, driverAssignments);
+  });
+
+  return [...assignmentQueues.values()].flat();
+}
+
 function getLatestMoveByState(moves, predicate) {
   return moves
     .filter(predicate)
@@ -227,6 +402,12 @@ function App() {
   const [isActiveMoveHydrated, setIsActiveMoveHydrated] = useState(false);
   const [createError, setCreateError] = useState("");
   const [isCreatingMove, setIsCreatingMove] = useState(false);
+  const [managerResources, setManagerResources] = useState({
+    fleet: [],
+    trucks: [],
+    drivers: [],
+    taskAssignments: [],
+  });
   const [managerFleet, setManagerFleet] = useState([]);
   const [isSimulatingMove, setIsSimulatingMove] = useState(false);
   const [simulationProgress, setSimulationProgress] = useState(
@@ -244,6 +425,14 @@ function App() {
   const animationStartedAtRef = useRef(null);
   const lastPersistedMinuteRef = useRef(0);
   const lastSavedMoveSessionRef = useRef("");
+
+  useEffect(() => {
+    void refreshSession().then((nextSession) => {
+      if (nextSession) {
+        setSession(nextSession);
+      }
+    }).catch(() => {});
+  }, []);
 
   useEffect(() => {
     if ("scrollRestoration" in window.history) {
@@ -407,18 +596,21 @@ function App() {
   const managerId = getSessionManagerId(session);
   const managerScopedMoves = managerId
     ? moves.filter((move) => {
+        if (!move) {
+          return false;
+        }
         const moveManagerId = move.createdBy?.role === "Manager" ? move.createdBy?.id : move.createdBy?.managerId;
         return moveManagerId === managerId;
       })
     : [];
   const visibleMoves = session?.role === "Foreman"
-    ? moves.filter((move) => move.createdBy?.id === session.id)
+    ? moves.filter((move) => move?.createdBy?.id === session.id)
     : session?.role === "Manager"
-      ? moves.filter((move) => session.teamForemanIds?.includes(move.createdBy?.id))
-      : moves;
+      ? moves.filter((move) => move && session.teamForemanIds?.includes(move.createdBy?.id))
+      : moves.filter(Boolean);
   const activeMove =
     route.page === "move"
-      ? visibleMoves.find((move) => String(move.id) === String(route.moveId)) || null
+      ? visibleMoves.find((move) => move && String(move.id) === String(route.moveId)) || null
       : null;
   const activeScenario = getActiveScenario(activeMove);
   const activeTotalMinutes = activeScenario?.bestVariant?.totalMinutes || 0;
@@ -447,44 +639,86 @@ function App() {
           rigInventoryRevision,
         })
       : null;
+  const driverAssignments = session?.role === "Driver"
+    ? (managerResources?.taskAssignments || []).filter((assignment) => assignment.driverId === session.id)
+    : [];
+  const moveExecutionAssignments = activeMove
+    ? (managerResources?.taskAssignments || []).filter((assignment) => assignment.moveId === activeMove.id)
+    : [];
 
   useEffect(() => {
-    let cancelled = false;
-
-    async function hydrateAppState() {
-      if (!managerId) {
-        setMoves([]);
-        setManagerFleet([]);
-        setAreMovesHydrated(true);
-        return;
-      }
-
-      setAreMovesHydrated(false);
-      try {
-        const [hydratedMoves, resources] = await Promise.all([
-          hydrateMoves(managerId, { summary: session?.role === "Manager" }),
-          hydrateManagerResources(managerId),
-        ]);
-        if (!cancelled) {
-          setMoves(hydratedMoves);
-          setManagerFleet(resources.fleet || readManagerFleet(managerId));
-          setAreMovesHydrated(true);
-        }
-      } catch {
-        if (!cancelled) {
-          setMoves(readMoves());
-          setManagerFleet(readManagerFleet(managerId));
-          setAreMovesHydrated(true);
-        }
-      }
+    if (!managerId) {
+      setMoves([]);
+      setManagerResources({ fleet: [], trucks: [], drivers: [], taskAssignments: [] });
+      setManagerFleet([]);
+      setAreMovesHydrated(true);
+      return undefined;
     }
 
-    hydrateAppState();
+    setAreMovesHydrated(false);
+
+    const unsubscribeMoves = subscribeManagerMoves(managerId, (remoteMoves) => {
+      const normalizedMoves = setMovesCache(remoteMoves);
+      setMoves(normalizedMoves);
+      setAreMovesHydrated(true);
+    });
+
+    const unsubscribeResources = subscribeManagerResources(managerId, (remoteResources) => {
+      const normalizedResources = setManagerResourcesCache(managerId, remoteResources || readManagerResources(managerId));
+      setManagerResources(normalizedResources);
+      setManagerFleet(normalizedResources.fleet || readManagerFleet(managerId));
+      setAreMovesHydrated(true);
+    });
 
     return () => {
-      cancelled = true;
+      unsubscribeMoves?.();
+      unsubscribeResources?.();
     };
   }, [managerId, session?.role]);
+
+  useEffect(() => {
+    if (!managerId || !activeMove || activeMove.executionState !== "active") {
+      return;
+    }
+
+    if (moveExecutionAssignments.length || !(managerResources?.drivers || []).length) {
+      return;
+    }
+
+    const recoveredAssignments = buildDriverAssignmentsForMove({
+      move: activeMove,
+      managerResources,
+    });
+
+    if (!recoveredAssignments.length) {
+      return;
+    }
+
+    void handleSaveManagerResources({
+      ...managerResources,
+      taskAssignments: [
+        ...(managerResources?.taskAssignments || []).filter((assignment) => assignment.moveId !== activeMove.id),
+        ...recoveredAssignments,
+      ],
+    });
+  }, [managerId, activeMove?.id, activeMove?.executionState, moveExecutionAssignments.length, managerResources]);
+
+  useEffect(() => {
+    if (!managerId || !areMovesHydrated) {
+      return;
+    }
+
+    const currentAssignments = managerResources?.taskAssignments || [];
+    const prunedAssignments = pruneTaskAssignments(currentAssignments, moves);
+    if (prunedAssignments.length === currentAssignments.length) {
+      return;
+    }
+
+    void handleSaveManagerResources({
+      ...managerResources,
+      taskAssignments: prunedAssignments,
+    });
+  }, [managerId, areMovesHydrated, managerResources, moves]);
 
   useEffect(() => {
     let cancelled = false;
@@ -526,27 +760,21 @@ function App() {
   }, [route.page, route.moveId, activeMove?.id, activeMove?.updatedAt]);
 
   useEffect(() => {
-    let cancelled = false;
-
-    async function hydrateRigInventory() {
-      if (!foremanRigContext?.rig?.id) {
-        return;
-      }
-
-      try {
-        await hydrateRigInventoryAdjustments(foremanRigContext.rig.id);
-        if (!cancelled) {
-          setRigInventoryRevision((value) => value + 1);
-        }
-      } catch {
-        // Keep empty adjustments if remote inventory is unavailable.
-      }
+    if (!foremanRigContext?.rig?.id) {
+      return undefined;
     }
 
-    hydrateRigInventory();
+    const unsubscribe = subscribeRigInventoryDoc(foremanRigContext.rig.id, (payload) => {
+      setRigInventoryCache(foremanRigContext.rig.id, payload?.adjustments || {});
+      setRigInventoryRevision((value) => value + 1);
+    });
+
+    void hydrateRigInventoryAdjustments(foremanRigContext.rig.id)
+      .then(() => setRigInventoryRevision((value) => value + 1))
+      .catch(() => {});
 
     return () => {
-      cancelled = true;
+      unsubscribe?.();
     };
   }, [foremanRigContext?.rig?.id]);
 
@@ -735,12 +963,9 @@ function App() {
   }, [activeMove?.id, activeMove?.updatedAt, route.page, playbackSpeed, activeTotalMinutes, areSceneAssetsReady, isSimulatingMove, isPlaybackRunning]);
 
   async function handleLogin({ email, password }) {
-    const matchedUser = findUserByCredentials(email, password);
-    if (!matchedUser) {
-      throw new Error("Invalid credentials. Please check your email and password.");
-    }
-
-    const nextSession = createSession(matchedUser);
+    const matchedUser = await authenticateUser(email, password);
+    const nextSession = getSession()?.id === matchedUser.id ? getSession() : matchedUser;
+    createSession(nextSession);
     setSession(nextSession);
     navigateTo("/dashboard");
   }
@@ -1285,11 +1510,20 @@ function App() {
       return null;
     }
 
+    const nowIso = new Date().toISOString();
     const updatedMove = {
       ...targetMove,
       ...extra,
-      updatedAt: new Date().toISOString(),
+      updatedAt: nowIso,
       executionState,
+      executionStartedAt:
+        executionState === "active"
+          ? extra.executionStartedAt || targetMove.executionStartedAt || nowIso
+          : targetMove.executionStartedAt || extra.executionStartedAt || null,
+      executionCompletedAt:
+        executionState === "completed"
+          ? extra.executionCompletedAt || nowIso
+          : extra.executionCompletedAt || targetMove.executionCompletedAt || null,
       operatingState:
         extra.operatingState ||
         (executionState === "completed"
@@ -1330,7 +1564,9 @@ function App() {
       operatingState: executionProgress.rigUpCompleted ? "drilling" : targetMove.operatingState || "standby",
       executionProgress,
       completionPercentage: executionProgress.rigUpCompleted ? 100 : targetMove.completionPercentage,
-      progressMinute: executionProgress.rigUpCompleted ? activeTotalMinutes : targetMove.progressMinute,
+      progressMinute: executionProgress.rigUpCompleted
+        ? targetMove?.simulation?.bestPlan?.totalMinutes || targetMove.progressMinute
+        : targetMove.progressMinute,
     };
 
     setMoves((current) =>
@@ -1344,6 +1580,101 @@ function App() {
     return updatedMove;
   }
 
+  async function handleDriverStageComplete({ assignmentId, stage }) {
+    if (!managerId || !session?.id) {
+      return;
+    }
+
+    const targetAssignment = (managerResources?.taskAssignments || []).find(
+      (assignment) => assignment.id === assignmentId && assignment.driverId === session.id,
+    );
+    if (!targetAssignment) {
+      return;
+    }
+
+    const currentStage = getAssignmentStageLabel(targetAssignment.stageStatus || {});
+    if (currentStage === "completed" || currentStage !== stage) {
+      return;
+    }
+
+    const nextTaskAssignments = (managerResources?.taskAssignments || []).map((assignment) => {
+      if (assignment.id !== assignmentId) {
+        return assignment;
+      }
+
+      const completedAt = new Date().toISOString();
+      const nextStageStatus = {
+        ...(assignment.stageStatus || {}),
+        ...(stage === "rigDown" ? { rigDownCompleted: true } : null),
+        ...(stage === "rigMove" ? { rigMoveCompleted: true } : null),
+        ...(stage === "rigUp" ? { rigUpCompleted: true } : null),
+      };
+      const nextStage = getAssignmentStageLabel(nextStageStatus);
+
+      return {
+        ...assignment,
+        stageStatus: nextStageStatus,
+        stageCompletedAt: {
+          rigDown: assignment.stageCompletedAt?.rigDown || (stage === "rigDown" ? completedAt : null),
+          rigMove: assignment.stageCompletedAt?.rigMove || (stage === "rigMove" ? completedAt : null),
+          rigUp: assignment.stageCompletedAt?.rigUp || (stage === "rigUp" ? completedAt : null),
+        },
+        currentStage: nextStage,
+        status: nextStage === "completed" ? "completed" : "active",
+        updatedAt: completedAt,
+      };
+    });
+
+    const completedAssignment = nextTaskAssignments.find((assignment) => assignment.id === assignmentId);
+    if (completedAssignment?.status === "completed") {
+      const nextQueuedAssignment = nextTaskAssignments
+        .filter(
+          (assignment) =>
+            assignment.moveId === completedAssignment.moveId &&
+            assignment.driverId === completedAssignment.driverId &&
+            assignment.status === "queued",
+        )
+        .sort((left, right) => left.sequence - right.sequence)[0];
+
+      if (nextQueuedAssignment) {
+        for (let index = 0; index < nextTaskAssignments.length; index += 1) {
+          if (nextTaskAssignments[index].id === nextQueuedAssignment.id) {
+            nextTaskAssignments[index] = {
+              ...nextQueuedAssignment,
+              status: "active",
+              updatedAt: new Date().toISOString(),
+            };
+            break;
+          }
+        }
+      }
+    }
+
+    await handleSaveManagerResources({
+      ...managerResources,
+      taskAssignments: nextTaskAssignments,
+    });
+
+    const moveAssignments = nextTaskAssignments.filter((assignment) => assignment.moveId === targetAssignment.moveId);
+    const patch = {};
+    if (moveAssignments.length && moveAssignments.every((assignment) => assignment.stageStatus?.rigDownCompleted)) {
+      patch.rigDownCompleted = true;
+    }
+    if (moveAssignments.length && moveAssignments.every((assignment) => assignment.stageStatus?.rigMoveCompleted)) {
+      patch.rigMoveCompleted = true;
+    }
+    if (moveAssignments.length && moveAssignments.every((assignment) => assignment.stageStatus?.rigUpCompleted)) {
+      patch.rigDownCompleted = true;
+      patch.rigMoveCompleted = true;
+      patch.rigUpCompleted = true;
+      patch.executionCompletedAt = new Date().toISOString();
+    }
+
+    if (Object.keys(patch).length) {
+      updateMoveExecutionProgress(targetAssignment.moveId, patch);
+    }
+  }
+
   async function handleSaveManagerFleet(nextFleet) {
     if (!managerId) {
       return;
@@ -1351,6 +1682,39 @@ function App() {
 
     const savedFleet = await writeManagerFleet(managerId, nextFleet);
     setManagerFleet(savedFleet);
+    setManagerResources((current) => ({
+      ...current,
+      fleet: savedFleet,
+    }));
+  }
+
+  async function handleSaveManagerResources(nextResources) {
+    if (!managerId) {
+      return;
+    }
+
+    const savedResources = await writeManagerResources(managerId, nextResources);
+    setManagerResources(savedResources);
+    setManagerFleet(savedResources.fleet || []);
+  }
+
+  async function handleCreateManagerDriverAccount(driverPayload) {
+    if (!managerId) {
+      return null;
+    }
+
+    const createdDriver = await createDriverAccount({
+      ...driverPayload,
+      managerId,
+    });
+
+    const savedResources = await writeManagerResources(managerId, {
+      ...(managerResources || {}),
+      drivers: [...(managerResources?.drivers || []), createdDriver],
+    });
+    setManagerResources(savedResources);
+    setManagerFleet(savedResources.fleet || []);
+    return createdDriver;
   }
 
   async function handleSaveRigInventory(rigId, adjustments) {
@@ -1413,14 +1777,35 @@ function App() {
     setSceneFocusResetKey((value) => value + 1);
   }
 
-  function handleStartExecution(moveId) {
+  async function handleStartExecution(moveId) {
+    const moveToAssign = readMoves().find((move) => move.id === moveId);
+    if (!moveToAssign) {
+      return;
+    }
+
+    const nextAssignments = buildDriverAssignmentsForMove({
+      move: moveToAssign,
+      managerResources,
+    });
+
+    await handleSaveManagerResources({
+      ...managerResources,
+      taskAssignments: [
+        ...(managerResources?.taskAssignments || []).filter((assignment) => assignment.moveId !== moveId),
+        ...nextAssignments,
+      ],
+    });
+
     const updatedMove = updateMoveExecutionState(moveId, "active", {
       operatingState: "standby",
+      executionStartedAt: new Date().toISOString(),
+      executionCompletedAt: null,
       executionProgress: {
         managerNotified: true,
         trucksReserved: true,
         liveDataRequested: true,
         rigDownCompleted: false,
+        rigMoveCompleted: false,
         rigUpCompleted: false,
       },
     });
@@ -1433,23 +1818,6 @@ function App() {
     setIsPlaybackPaused(false);
     setCurrentMinute(0);
     lastPersistedMinuteRef.current = 0;
-  }
-
-  function handleCompleteExecutionStage({ moveId, stage }) {
-    if (stage === "rigDown") {
-      updateMoveExecutionProgress(moveId, {
-        rigDownCompleted: true,
-      });
-      return;
-    }
-
-    if (stage === "rigUp") {
-      updateMoveExecutionProgress(moveId, {
-        rigDownCompleted: true,
-        rigUpCompleted: true,
-      });
-      navigateTo("/dashboard");
-    }
   }
 
   if (route.page === "login") {
@@ -1492,11 +1860,24 @@ function App() {
       return h(ManagerDashboardPage, {
         moves: visibleMoves,
         foremen: getManagedForemen(session.id),
+        managerResources,
         managerFleet,
         currentUser: session,
         currentDate: new Date(),
         onOpenMove: handleOpenMove,
+        onCreateDriver: handleCreateManagerDriverAccount,
+        onSaveResources: handleSaveManagerResources,
         onSaveFleet: handleSaveManagerFleet,
+        onLogout: handleLogout,
+      });
+    }
+
+    if (session.role === "Driver") {
+      return h(DriverDashboardPage, {
+        assignments: driverAssignments,
+        currentUser: session,
+        currentDate: new Date(),
+        onCompleteStage: handleDriverStageComplete,
         onLogout: handleLogout,
       });
     }
@@ -1526,11 +1907,24 @@ function App() {
       return h(ManagerDashboardPage, {
         moves: visibleMoves,
         foremen: getManagedForemen(session.id),
+        managerResources,
         managerFleet,
         currentUser: session,
         currentDate: new Date(),
         onOpenMove: handleOpenMove,
+        onCreateDriver: handleCreateManagerDriverAccount,
+        onSaveResources: handleSaveManagerResources,
         onSaveFleet: handleSaveManagerFleet,
+        onLogout: handleLogout,
+      });
+    }
+
+    if (session.role === "Driver") {
+      return h(DriverDashboardPage, {
+        assignments: driverAssignments,
+        currentUser: session,
+        currentDate: new Date(),
+        onCompleteStage: handleDriverStageComplete,
         onLogout: handleLogout,
       });
     }
@@ -1587,7 +1981,6 @@ function App() {
       onPausePlayback: handlePauseTogglePlayback,
       onEndPlayback: handleEndPlayback,
       onStartExecution: handleStartExecution,
-      onCompleteExecutionStage: handleCompleteExecutionStage,
       onDeleteMove: handleDeleteMove,
       onBack: () => navigateTo("/dashboard"),
       onLogout: handleLogout,
@@ -1598,6 +1991,7 @@ function App() {
       executionState: activeExecutionState,
       operatingState: activeMove?.operatingState || "standby",
       executionProgress: activeMove?.executionProgress || {},
+      executionAssignments: moveExecutionAssignments,
       teamMoves: managerScopedMoves,
       startupRequirements,
     });

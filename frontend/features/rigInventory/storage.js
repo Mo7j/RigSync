@@ -1,3 +1,5 @@
+import { fetchRigInventoryDoc, saveRigInventoryDoc } from "../../lib/firebaseOperations.js";
+
 const rigInventoryCache = new Map();
 
 function normalizeInventoryEntry(value) {
@@ -15,6 +17,11 @@ function normalizeInventoryEntry(value) {
   };
 }
 
+export function setRigInventoryCache(rigId, adjustments) {
+  rigInventoryCache.set(rigId, adjustments || {});
+  return adjustments || {};
+}
+
 export function readRigInventoryAdjustments(rigId) {
   const rigInventory = rigInventoryCache.get(rigId);
   return rigInventory && typeof rigInventory === "object" ? rigInventory : {};
@@ -25,12 +32,7 @@ export async function hydrateRigInventoryAdjustments(rigId) {
     return {};
   }
 
-  const response = await fetch(`/api/rig-inventory/${encodeURIComponent(rigId)}`);
-  if (!response.ok) {
-    throw new Error(`Rig inventory request failed with ${response.status}`);
-  }
-
-  const payload = await response.json();
+  const payload = await fetchRigInventoryDoc(rigId);
   const adjustments = payload?.adjustments && typeof payload.adjustments === "object" ? payload.adjustments : {};
   rigInventoryCache.set(rigId, adjustments);
   return adjustments;
@@ -41,18 +43,7 @@ export async function writeRigInventoryAdjustments(rigId, adjustments) {
     Object.entries(adjustments || {}).map(([key, value]) => [key, normalizeInventoryEntry(value)]),
   );
 
-  const response = await fetch(`/api/rig-inventory/${encodeURIComponent(rigId)}`, {
-    method: "PUT",
-    headers: {
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({ adjustments: normalized }),
-  });
-
-  if (!response.ok) {
-    throw new Error(`Rig inventory save failed with ${response.status}`);
-  }
-
+  await saveRigInventoryDoc(rigId, normalized);
   rigInventoryCache.set(rigId, normalized);
   return normalized;
 }

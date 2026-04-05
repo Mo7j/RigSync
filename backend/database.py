@@ -7,13 +7,11 @@ from dotenv import load_dotenv
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(PROJECT_ROOT / ".env")
+LOCAL_DATABASE_PATH = PROJECT_ROOT / "backend" / "rigsync_local.db"
 
 DATABASE_URL = os.getenv("DATABASE_URL")
-if not DATABASE_URL:
-    raise RuntimeError(
-        "DATABASE_URL is not set. Create a .env file in the project root and add your Supabase "
-        "connection string."
-    )
+if not DATABASE_URL or str(DATABASE_URL).strip().lower() == "local":
+    DATABASE_URL = f"sqlite:///{LOCAL_DATABASE_PATH.as_posix()}"
 
 if DATABASE_URL.startswith("postgresql://"):
     DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+psycopg://", 1)

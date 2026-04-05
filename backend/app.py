@@ -225,11 +225,20 @@ def ensure_state_tables():
     if STATE_TABLES_READY:
         return
 
-    from database import Base, engine
+    from database import engine
+
+    if engine.dialect.name == "sqlite":
+        STATE_TABLES_READY = True
+        return
+
+    from database import Base
 
     Base.metadata.create_all(bind=engine)
     with engine.begin() as connection:
         connection.execute(text("ALTER TABLE move_records ADD COLUMN IF NOT EXISTS summary_payload JSON"))
+        connection.execute(text("ALTER TABLE manager_resource_states ADD COLUMN IF NOT EXISTS trucks JSON"))
+        connection.execute(text("ALTER TABLE manager_resource_states ADD COLUMN IF NOT EXISTS drivers JSON"))
+        connection.execute(text("ALTER TABLE manager_resource_states ADD COLUMN IF NOT EXISTS task_assignments JSON"))
         connection.execute(text("ALTER TABLE manager_resource_states DROP COLUMN IF EXISTS workers"))
     STATE_TABLES_READY = True
 
@@ -241,14 +250,13 @@ def initialize_app_state_tables():
 def get_default_resource_state(manager_id):
     defaults = {
         "manager-nasser": {
-            "fleet": [
-                {"id": "heavy-haul", "type": "Heavy Hauler", "count": 6, "hourlyCost": 260},
-                {"id": "flatbed", "type": "Flat-bed", "count": 4, "hourlyCost": 105},
-                {"id": "low-bed", "type": "Low-bed", "count": 3, "hourlyCost": 155},
-            ],
+            "fleet": [],
+            "trucks": [],
+            "drivers": [],
+            "task_assignments": [],
         }
     }
-    return defaults.get(manager_id, {"fleet": []})
+    return defaults.get(manager_id, {"fleet": [], "trucks": [], "drivers": [], "task_assignments": []})
 
 
 def build_move_summary(payload):
@@ -418,15 +426,27 @@ def get_manager_resources(manager_id):
             record = ManagerResourceState(
                 manager_id=manager_id,
                 fleet=defaults["fleet"],
+                trucks=defaults["trucks"],
+                drivers=defaults["drivers"],
+                task_assignments=defaults["task_assignments"],
             )
             session.add(record)
             session.commit()
-        response = jsonify({"fleet": record.fleet or []})
+        response = jsonify(
+            {
+                "fleet": record.fleet or [],
+                "trucks": record.trucks or [],
+                "drivers": record.drivers or [],
+                "taskAssignments": record.task_assignments or [],
+            }
+        )
         log_timing(
             "/api/manager-resources/<manager_id>",
             started_at,
             manager_id=manager_id,
             fleet=len(record.fleet or []),
+            trucks=len(record.trucks or []),
+            drivers=len(record.drivers or []),
         )
         return response
     finally:
@@ -436,20 +456,51 @@ def get_manager_resources(manager_id):
 @app.put("/api/manager-resources/<manager_id>")
 def put_manager_resources(manager_id):
     payload = request.get_json(silent=True) or {}
+    defaults = get_default_resource_state(manager_id)
     fleet = payload.get("fleet")
-    if not isinstance(fleet, list):
-        return jsonify({"error": "fleet list is required"}), 400
+    trucks = payload.get("trucks")
+    drivers = payload.get("drivers")
+    task_assignments = payload.get("taskAssignments", payload.get("task_assignments"))
+
+    if fleet is not None and not isinstance(fleet, list):
+        return jsonify({"error": "fleet must be a list"}), 400
+    if trucks is not None and not isinstance(trucks, list):
+        return jsonify({"error": "trucks must be a list"}), 400
+    if drivers is not None and not isinstance(drivers, list):
+        return jsonify({"error": "drivers must be a list"}), 400
+    if task_assignments is not None and not isinstance(task_assignments, list):
+        return jsonify({"error": "taskAssignments must be a list"}), 400
 
     session = SessionLocal()
     try:
         record = session.get(ManagerResourceState, manager_id)
         if not record:
-            record = ManagerResourceState(manager_id=manager_id, fleet=fleet)
+            record = ManagerResourceState(
+                manager_id=manager_id,
+                fleet=fleet if fleet is not None else defaults["fleet"],
+                trucks=trucks if trucks is not None else defaults["trucks"],
+                drivers=drivers if drivers is not None else defaults["drivers"],
+                task_assignments=task_assignments if task_assignments is not None else defaults["task_assignments"],
+            )
             session.add(record)
         else:
-            record.fleet = fleet
+            if fleet is not None:
+                record.fleet = fleet
+            if trucks is not None:
+                record.trucks = trucks
+            if drivers is not None:
+                record.drivers = drivers
+            if task_assignments is not None:
+                record.task_assignments = task_assignments
         session.commit()
-        return jsonify({"fleet": record.fleet})
+        return jsonify(
+            {
+                "fleet": record.fleet or [],
+                "trucks": record.trucks or [],
+                "drivers": record.drivers or [],
+                "taskAssignments": record.task_assignments or [],
+            }
+        )
     finally:
         session.close()
 

@@ -1,37 +1,11 @@
 import { clampPercentage, formatCoordinate, formatMinutes, formatShortDate } from "../../lib/format.js";
 import { haversineKilometers } from "./simulation.js";
-import { MOVES_STORAGE_KEY } from "../../lib/constants.js";
+import { deleteMoveDoc, fetchMoveDoc, saveMoveDoc } from "../../lib/firebaseOperations.js";
 
 let movesCache = [];
 
-function loadMovesCache() {
-  if (movesCache.length) {
-    return movesCache;
-  }
-
-  try {
-    const stored = window.localStorage.getItem(MOVES_STORAGE_KEY);
-    if (!stored) {
-      return movesCache;
-    }
-
-    movesCache = sortMoves((JSON.parse(stored) || []).map(normalizeStoredMove).filter(Boolean));
-  } catch {
-    movesCache = [];
-  }
-
-  return movesCache;
-}
-
-function persistMovesCache(nextMoves) {
+export function setMovesCache(nextMoves = []) {
   movesCache = sortMoves((nextMoves || []).map(normalizeStoredMove).filter(Boolean));
-
-  try {
-    window.localStorage.setItem(MOVES_STORAGE_KEY, JSON.stringify(movesCache));
-  } catch {
-    // Ignore storage failures and keep runtime cache.
-  }
-
   return movesCache;
 }
 
@@ -39,7 +13,7 @@ function roundCoordinate(value) {
   return Math.round(value * 100000) / 100000;
 }
 
-function compactGeometry(geometry, maxPoints = 1200) {
+function compactGeometry(geometry, maxPoints = 240) {
   if (!Array.isArray(geometry) || geometry.length <= maxPoints) {
     return geometry;
   }
@@ -175,9 +149,22 @@ function compactScenarioPlan(plan) {
           routeMinutes: plan.bestVariant.routeMinutes,
           processingMinutes: plan.bestVariant.processingMinutes,
           totalMinutes: plan.bestVariant.totalMinutes,
-          playback: compactPlayback(plan.bestVariant.playback),
         }
       : null,
+  };
+}
+
+function compactBestPlan(plan) {
+  if (!plan) {
+    return null;
+  }
+
+  return {
+    name: plan.name,
+    routeMinutes: plan.routeMinutes,
+    processingMinutes: plan.processingMinutes,
+    totalMinutes: plan.totalMinutes,
+    playback: compactPlayback(plan.playback),
   };
 }
 
@@ -221,8 +208,8 @@ function compactSimulation(simulation) {
     })),
     preferredScenarioName,
     scenarioPlans,
-    bestScenario: simulation.bestScenario || null,
-    bestPlan: simulation.bestPlan ? { ...simulation.bestPlan, playback: compactPlayback(simulation.bestPlan.playback) } : null,
+    bestScenario: compactScenarioPlan(simulation.bestScenario),
+    bestPlan: compactBestPlan(simulation.bestPlan),
   };
 }
 
@@ -240,8 +227,26 @@ function normalizeStoredSimulation(simulation) {
     compacted.scenarioPlans.find((plan) => plan.name === compacted.preferredScenarioName) ||
     compacted.scenarioPlans[0];
 
+  const hydratedScenarioPlans = compacted.scenarioPlans.map((plan) => (
+    plan.name === preferredScenario?.name
+      ? {
+          ...plan,
+          bestVariant: compacted.bestPlan
+            ? {
+                ...plan.bestVariant,
+                ...compacted.bestPlan,
+              }
+            : plan.bestVariant,
+        }
+      : plan
+  ));
+
   return {
     ...compacted,
+    scenarioPlans: hydratedScenarioPlans,
+    bestScenario:
+      hydratedScenarioPlans.find((plan) => plan.name === preferredScenario?.name) ||
+      compacted.bestScenario,
     preferredScenarioName: preferredScenario?.name || "",
   };
 }
@@ -266,6 +271,7 @@ function normalizeStoredMove(move) {
       trucksReserved: Boolean(move.executionProgress?.trucksReserved),
       liveDataRequested: Boolean(move.executionProgress?.liveDataRequested),
       rigDownCompleted: Boolean(move.executionProgress?.rigDownCompleted),
+      rigMoveCompleted: Boolean(move.executionProgress?.rigMoveCompleted),
       rigUpCompleted: Boolean(move.executionProgress?.rigUpCompleted),
     },
     simulation: normalizeStoredSimulation(move.simulation),
@@ -276,70 +282,41 @@ function sortMoves(moves) {
   return [...moves].sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt));
 }
 
-async function saveMoveRemote(move) {
-  const response = await fetch(`/api/moves/${encodeURIComponent(move.id)}`, {
-    method: "PUT",
-    headers: {
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({ move: normalizeStoredMove(move) }),
-  });
-
-  if (!response.ok) {
-    throw new Error(`Move save failed with ${response.status}`);
-  }
-
-  return normalizeStoredMove(await response.json());
-}
-
 export async function hydrateMoves(managerId, { summary = false } = {}) {
+  void summary;
   if (!managerId) {
-    persistMovesCache([]);
-    return [];
+    return setMovesCache([]);
   }
 
-  const params = new URLSearchParams({ managerId, summary: summary ? "1" : "0" });
-  const response = await fetch(`/api/moves?${params.toString()}`);
-  if (!response.ok) {
-    throw new Error(`Moves request failed with ${response.status}`);
-  }
-
-  const payload = await response.json();
-  return persistMovesCache(payload || []);
+  return readMoves().filter((move) => {
+    const moveManagerId = move.createdBy?.role === "Manager" ? move.createdBy?.id : move.createdBy?.managerId;
+    return moveManagerId === managerId;
+  });
 }
 
 export async function fetchMove(moveId) {
-  const response = await fetch(`/api/moves/${encodeURIComponent(moveId)}`);
-  if (!response.ok) {
-    throw new Error(`Move request failed with ${response.status}`);
+  const payload = normalizeStoredMove(await fetchMoveDoc(moveId));
+  if (!payload) {
+    return null;
   }
-
-  const payload = normalizeStoredMove(await response.json());
   const current = readMoves().filter((item) => item.id !== payload.id);
-  persistMovesCache([payload, ...current]);
+  setMovesCache([payload, ...current]);
   return payload;
 }
 
 export function readMoves() {
-  return sortMoves(loadMovesCache());
+  return sortMoves(movesCache);
 }
 
 export async function upsertMove(move) {
-  const savedMove = await saveMoveRemote(move);
+  const savedMove = normalizeStoredMove(await saveMoveDoc(normalizeStoredMove(move)));
   const current = readMoves().filter((item) => item.id !== savedMove.id);
-  return persistMovesCache([savedMove, ...current]);
+  return setMovesCache([savedMove, ...current]);
 }
 
 export async function removeMove(moveId) {
-  const response = await fetch(`/api/moves/${encodeURIComponent(moveId)}`, {
-    method: "DELETE",
-  });
-
-  if (!response.ok) {
-    throw new Error(`Move delete failed with ${response.status}`);
-  }
-
-  return persistMovesCache(readMoves().filter((move) => move.id !== moveId));
+  await deleteMoveDoc(moveId);
+  return setMovesCache(readMoves().filter((move) => move.id !== moveId));
 }
 
 export function updateMoveProgress(moveId, progressMinute) {
@@ -361,7 +338,7 @@ export function updateMoveProgress(moveId, progressMinute) {
     };
   });
 
-  return persistMovesCache(nextMoves);
+  return setMovesCache(nextMoves);
 }
 
 export async function persistMoveSession(moveId, sessionState) {
@@ -379,7 +356,14 @@ export async function persistMoveSession(moveId, sessionState) {
     },
   });
 
-  await upsertMove(updatedMove);
+  await saveMoveDoc({
+    id: moveId,
+    ...sessionState,
+    executionProgress: updatedMove.executionProgress,
+    updatedAt: new Date().toISOString(),
+  });
+  const current = readMoves().filter((item) => item.id !== updatedMove.id);
+  setMovesCache([updatedMove, ...current]);
   return updatedMove;
 }
 
@@ -398,6 +382,7 @@ export function createMoveRecord({ name, startPoint, endPoint, startLabel, endLa
     updatedAt: now.toISOString(),
     routeMode,
     loadCount,
+    managerId: createdBy?.role === "Manager" ? createdBy.id : createdBy?.managerId || null,
     createdBy,
     startPoint,
     endPoint,
@@ -417,6 +402,7 @@ export function createMoveRecord({ name, startPoint, endPoint, startLabel, endLa
       trucksReserved: false,
       liveDataRequested: false,
       rigDownCompleted: false,
+      rigMoveCompleted: false,
       rigUpCompleted: false,
     },
     truckSetup: simulation.truckSetup || [],

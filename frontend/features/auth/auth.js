@@ -1,4 +1,11 @@
 import { AUTH_STORAGE_KEY } from "../../lib/constants.js";
+import {
+  FIREBASE_USER_ROLES,
+  createFirebaseUserAccount,
+  getUserProfileById,
+  signInFirebaseUser,
+  upsertUserProfile,
+} from "../../lib/firebaseOperations.js";
 
 export const TEST_USERS = [
   {
@@ -71,12 +78,78 @@ function persistSession(session) {
   }
 }
 
-export function findUserByCredentials(email, password) {
-  return (
-    TEST_USERS.find(
-      (user) => user.email.toLowerCase() === String(email || "").trim().toLowerCase() && user.password === password,
-    ) || null
+function buildSessionFromUser(user = {}) {
+  return {
+    id: user.id,
+    name: user.name,
+    email: user.email,
+    role: user.role,
+    managerId: user.managerId || null,
+    teamForemanIds: user.teamForemanIds || [],
+    assignedRig: user.assignedRig || null,
+    truckId: user.truckId || null,
+    truckType: user.truckType || null,
+  };
+}
+
+export async function authenticateUser(email, password) {
+  const normalizedEmail = String(email || "").trim().toLowerCase();
+  const staticUser = TEST_USERS.find(
+    (user) => user.email.toLowerCase() === normalizedEmail && user.password === password,
   );
+
+  if (staticUser) {
+    await upsertUserProfile({
+      id: staticUser.id,
+      role: staticUser.role,
+      name: staticUser.name,
+      email: staticUser.email,
+      managerId: staticUser.managerId || null,
+      teamForemanIds: staticUser.teamForemanIds || [],
+      assignedRig: staticUser.assignedRig || null,
+      active: true,
+    });
+
+    return buildSessionFromUser(staticUser);
+  }
+
+  try {
+    const { profile } = await signInFirebaseUser(email, password);
+    if (profile) {
+      return buildSessionFromUser(profile);
+    }
+  } catch {
+    // Fall through to invalid credentials.
+  }
+
+  if (!staticUser) {
+    throw new Error("Invalid credentials. Please check your email and password.");
+  }
+}
+
+export async function createDriverAccount({ name, email, password, managerId, truckId, truckType }) {
+  const result = await createFirebaseUserAccount({
+    email,
+    password,
+    profile: {
+      name,
+      role: FIREBASE_USER_ROLES.driver,
+      managerId,
+      truckId: truckId || null,
+      truckType: truckType || null,
+      active: true,
+    },
+  });
+
+  return {
+    id: result.uid,
+    name,
+    email: String(email || "").trim().toLowerCase(),
+    role: FIREBASE_USER_ROLES.driver,
+    managerId,
+    truckId: truckId || null,
+    truckType: truckType || null,
+  };
 }
 
 export function getManagedForemen(managerId) {
@@ -88,40 +161,27 @@ export function getSession() {
     currentSession = readStoredSession();
   }
 
-  if (!currentSession) {
+  return currentSession;
+}
+
+export async function refreshSession() {
+  const storedSession = getSession();
+  if (!storedSession?.id) {
     return null;
   }
 
-  const matchedUser = TEST_USERS.find((user) => user.id === currentSession?.id);
-
-  if (!matchedUser) {
-    return currentSession;
+  const remoteProfile = await getUserProfileById(storedSession.id);
+  if (!remoteProfile) {
+    return storedSession;
   }
 
-  currentSession = {
-    ...currentSession,
-    name: matchedUser.name,
-    email: matchedUser.email,
-    role: matchedUser.role,
-    managerId: matchedUser.managerId || null,
-    teamForemanIds: matchedUser.teamForemanIds || [],
-    assignedRig: matchedUser.assignedRig || currentSession?.assignedRig || null,
-  };
+  currentSession = buildSessionFromUser(remoteProfile);
   persistSession(currentSession);
-
   return currentSession;
 }
 
 export function createSession(user = TEST_USER) {
-  currentSession = {
-    id: user.id,
-    name: user.name,
-    email: user.email,
-    role: user.role,
-    managerId: user.managerId || null,
-    teamForemanIds: user.teamForemanIds || [],
-    assignedRig: user.assignedRig || null,
-  };
+  currentSession = buildSessionFromUser(user);
   persistSession(currentSession);
   return currentSession;
 }

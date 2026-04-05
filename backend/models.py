@@ -173,6 +173,9 @@ class ManagerResourceState(Base):
 
     manager_id: Mapped[str] = mapped_column(String, primary_key=True)
     fleet: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+    trucks: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+    drivers: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+    task_assignments: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
 
 
 class RigInventoryState(Base):

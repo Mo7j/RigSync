@@ -6,9 +6,6 @@ from models import (
     LoadDependency,
     LoadRoleRequirement,
     LoadTemplate,
-    ManagerResourceState,
-    MoveRecord,
-    RigInventoryState,
     TruckSpec,
 )
 from planning_dataset import DATASET_PATH, load_planning_dataset
@@ -20,6 +17,12 @@ PLANNING_TABLES = [
     "load_role_requirements",
     "load_templates",
     "truck_specs",
+]
+
+APP_STATE_TABLES = [
+    "move_records",
+    "manager_resource_states",
+    "rig_inventory_states",
 ]
 
 
@@ -105,9 +108,22 @@ def import_dataset():
 
     dataset = load_planning_dataset()
     with engine.begin() as connection:
-        for table_name in [*PLANNING_TABLES, "rig_loads", "startup_loads"]:
-            connection.execute(text(f"DROP TABLE IF EXISTS {table_name} CASCADE"))
-    Base.metadata.create_all(bind=engine)
+        is_sqlite = engine.dialect.name == "sqlite"
+        for table_name in [*PLANNING_TABLES, *APP_STATE_TABLES, "rig_loads", "startup_loads"]:
+            drop_sql = f"DROP TABLE IF EXISTS {table_name}"
+            if not is_sqlite:
+                drop_sql += " CASCADE"
+            connection.execute(text(drop_sql))
+    Base.metadata.create_all(
+        bind=engine,
+        tables=[
+            TruckSpec.__table__,
+            LoadTemplate.__table__,
+            LoadAllowedTruckType.__table__,
+            LoadDependency.__table__,
+            LoadRoleRequirement.__table__,
+        ],
+    )
 
     session = SessionLocal()
     try:
