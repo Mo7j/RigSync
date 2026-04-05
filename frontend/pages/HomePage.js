@@ -3,6 +3,7 @@ import { MarketingLayout } from "../layouts/MarketingLayout.js";
 import { Button } from "../components/ui/Button.js";
 import { Card, StatCard } from "../components/ui/Card.js";
 import { HeroNetwork } from "../components/map/HeroNetwork.js";
+import { translate } from "../lib/language.js";
 
 const { useEffect } = React;
 
@@ -37,13 +38,16 @@ const FAQ_ITEMS = [
 ];
 
 export function HomePage({
+  language = "en",
   moveCount,
   loadCount,
   isLoadingLoads,
   hasSession,
   onOpenLogin,
   onOpenDashboard,
+  onToggleLanguage,
 }) {
+  const t = (key, fallback) => translate(language, key, fallback);
   useEffect(() => {
     const scenes = Array.from(document.querySelectorAll(".marketing-scene"));
     if (!scenes.length) {
@@ -230,8 +234,8 @@ export function HomePage({
   return h(
     MarketingLayout,
     {
-      onPrimaryAction: hasSession ? onOpenDashboard : onOpenLogin,
-      primaryLabel: "Ask Us",
+      language,
+      onToggleLanguage,
       className: "marketing-shell-home",
     },
     h(
@@ -253,12 +257,12 @@ export function HomePage({
           h(
             "h1",
             { className: "hero-title" },
-            "Operational Precision at Scale",
+            t("heroTitle", "Operational Precision at Scale"),
           ),
           h(
             "p",
             { className: "hero-text" },
-            "Plan and execute rig moves with simulation-driven logistics and full operational visibility.",
+            t("heroText", "Plan and execute rig moves with simulation-driven logistics and full operational visibility."),
           ),
           h(
             "div",
@@ -267,7 +271,7 @@ export function HomePage({
               type: "button",
               className: "hero-primary",
               onClick: hasSession ? onOpenDashboard : onOpenLogin,
-              children: hasSession ? "Open Workspace" : "Digitize Now",
+              children: hasSession ? t("openWorkspace", "Open Workspace") : t("digitizeNow", "Digitize Now"),
             }),
           ),
         ),
@@ -278,8 +282,8 @@ export function HomePage({
         h(
           "div",
           { className: "home-scene-panel home-scene-panel-left" },
-          h("p", { className: "eyebrow" }, "Features"),
-          h("h2", { className: "section-title features-section-title" }, "Operations software designed for move clarity"),
+          h("p", { className: "eyebrow" }, t("featuresTitle", "Features")),
+          h("h2", { className: "section-title features-section-title" }, t("featuresHeadline", "Operations software designed for move clarity")),
           h(
             "div",
             { className: "feature-grid" },
@@ -307,12 +311,12 @@ export function HomePage({
             h(
               "div",
               null,
-              h("p", { className: "eyebrow" }, "About Us"),
-              h("h2", { className: "section-title" }, "Built for crews that need speed without losing control"),
+              h("p", { className: "eyebrow" }, t("aboutTitle", "About Us")),
+              h("h2", { className: "section-title" }, t("aboutHeadline", "Built for crews that need speed without losing control")),
               h(
                 "p",
                 { className: "muted-copy section-copy" },
-                "RigSync keeps the dark, command-center visual language of the existing product while turning it into a scalable operational frontend. The experience is tuned for pre-move planning, confident dashboarding, and production-grade readability on desktop and tablet.",
+                t("aboutCopy", "RigSync keeps the dark, command-center visual language of the existing product while turning it into a scalable operational frontend. The experience is tuned for pre-move planning, confident dashboarding, and production-grade readability on desktop and tablet."),
               ),
             ),
             h(
@@ -320,20 +324,21 @@ export function HomePage({
               { className: "about-stats" },
               h(StatCard, {
                 label: "Rig moves tracked",
+                label: t("rigMovesTracked", "Rig moves tracked"),
                 value: moveCount ? `${moveCount}+` : "0",
-                meta: "Saved operational runs",
+                meta: t("savedOperationalRuns", "Saved operational runs"),
                 tone: "green",
               }),
               h(StatCard, {
-                label: "Logical loads",
+                label: t("logicalLoads", "Logical loads"),
                 value: isLoadingLoads ? "..." : String(loadCount),
-                meta: "Available for planning",
+                meta: t("availableForPlanning", "Available for planning"),
                 tone: "default",
               }),
               h(StatCard, {
-                label: "Routing mode",
-                value: "Live + fallback",
-                meta: "Resilient by default",
+                label: t("routingMode", "Routing mode"),
+                value: t("liveFallback", "Live + fallback"),
+                meta: t("resilientDefault", "Resilient by default"),
                 tone: "green",
               }),
             ),
@@ -381,12 +386,12 @@ export function HomePage({
             "div",
             { className: "marketing-footer-brand" },
             h("strong", { className: "footer-brand" }, "RigSync"),
-            h("p", { className: "muted-copy" }, "Premium SaaS frontend for modern rig move operations, from planning through execution."),
+            h("p", { className: "muted-copy" }, t("footerCopy", "Premium SaaS frontend for modern rig move operations, from planning through execution.")),
           ),
           h(
             "div",
             { className: "marketing-footer-column" },
-            h("span", { className: "marketing-footer-heading" }, "Product"),
+            h("span", { className: "marketing-footer-heading" }, t("product", "Product")),
             h(
               "button",
               {
@@ -394,7 +399,7 @@ export function HomePage({
                 className: "footer-link",
                 onClick: () => document.getElementById("features")?.scrollIntoView({ behavior: "smooth" }),
               },
-              "Features",
+              t("brandNavFeatures", "Features"),
             ),
             h(
               "button",
@@ -403,13 +408,13 @@ export function HomePage({
                 className: "footer-link",
                 onClick: hasSession ? onOpenDashboard : onOpenLogin,
               },
-              hasSession ? "Dashboard" : "Login",
+              hasSession ? t("dashboard", "Dashboard") : t("login", "Login"),
             ),
           ),
           h(
             "div",
             { className: "marketing-footer-column" },
-            h("span", { className: "marketing-footer-heading" }, "Company"),
+            h("span", { className: "marketing-footer-heading" }, t("company", "Company")),
             h(
               "button",
               {

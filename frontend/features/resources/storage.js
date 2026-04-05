@@ -17,6 +17,20 @@ function normalizeTypeKey(type) {
   return String(type || "").trim().toLowerCase().replace(/[^a-z]/g, "");
 }
 
+function normalizePlannerTruckType(type) {
+  const normalized = normalizeTypeKey(type);
+  if (normalized.includes("heavy")) {
+    return "Heavy Hauler";
+  }
+  if (normalized.includes("flat")) {
+    return "Flat-bed";
+  }
+  if (normalized.includes("low") || normalized.includes("support")) {
+    return "Low-bed";
+  }
+  return "";
+}
+
 function getDefaultTruckHourlyCost(type) {
   const normalizedType = normalizeTypeKey(type);
   const defaults = Object.values(DEFAULT_MANAGER_FLEETS)
@@ -27,7 +41,7 @@ function getDefaultTruckHourlyCost(type) {
 }
 
 function getTypePrefix(type) {
-  const normalizedType = normalizeTypeKey(type);
+  const normalizedType = normalizeTypeKey(normalizePlannerTruckType(type) || type);
   if (normalizedType.includes("heavy")) {
     return "HH";
   }
@@ -61,31 +75,34 @@ function buildDefaultTruckRecords(managerId) {
 }
 
 function normalizeFleetEntry(entry, index) {
+  const truckType = normalizePlannerTruckType(entry.type);
   const defaultHourlyCost = getDefaultTruckHourlyCost(entry.type);
   const parsedHourlyCost = Math.max(0, Number.parseFloat(entry.hourlyCost) || 0);
 
   return {
     id: entry.id || `fleet-${index + 1}`,
-    type: String(entry.type || "").trim() || `Truck Type ${index + 1}`,
+    type: truckType || "",
     count: Math.max(0, Number.parseInt(entry.count, 10) || 0),
     hourlyCost: parsedHourlyCost > 0 ? parsedHourlyCost : defaultHourlyCost,
   };
 }
 
 function normalizeTruckEntry(entry, index) {
+  const truckType = normalizePlannerTruckType(entry.type);
   return {
     id: entry.id || `truck-${index + 1}`,
     name: String(entry.name || "").trim() || `Truck ${index + 1}`,
-    type: String(entry.type || "").trim() || "Truck",
+    type: truckType || "",
   };
 }
 
 function normalizeDriverEntry(entry, index, managerId) {
+  const truckType = normalizePlannerTruckType(entry.truckType || entry.type);
   return {
     id: entry.id || `driver-${index + 1}`,
     name: String(entry.name || "").trim() || `Driver ${index + 1}`,
     email: String(entry.email || "").trim().toLowerCase(),
-    truckType: String(entry.truckType || entry.type || "").trim() || "Truck",
+    truckType: truckType || "",
     truckId: String(entry.truckId || "").trim(),
     managerId,
     role: "Driver",
@@ -94,6 +111,8 @@ function normalizeDriverEntry(entry, index, managerId) {
 
 function normalizeTaskAssignmentEntry(entry, index) {
   const stageStatus = entry.stageStatus || {};
+  const stagePlan = entry.stagePlan || {};
+  const stageDelayNotes = entry.stageDelayNotes || {};
   const currentStage =
     String(entry.currentStage || "").trim() ||
     (!stageStatus.rigDownCompleted ? "rigDown" : !stageStatus.rigMoveCompleted ? "rigMove" : !stageStatus.rigUpCompleted ? "rigUp" : "completed");
@@ -105,8 +124,8 @@ function normalizeTaskAssignmentEntry(entry, index) {
     driverId: String(entry.driverId || "").trim(),
     driverName: String(entry.driverName || "").trim(),
     truckId: String(entry.truckId || "").trim(),
-    truckType: String(entry.truckType || "").trim(),
-    plannedTruckType: String(entry.plannedTruckType || "").trim(),
+    truckType: normalizePlannerTruckType(entry.truckType) || "",
+    plannedTruckType: normalizePlannerTruckType(entry.plannedTruckType) || "",
     startLabel: String(entry.startLabel || "").trim(),
     endLabel: String(entry.endLabel || "").trim(),
     loadId: entry.loadId ?? null,
@@ -128,9 +147,47 @@ function normalizeTaskAssignmentEntry(entry, index) {
       rigMove: entry.stageCompletedAt?.rigMove || null,
       rigUp: entry.stageCompletedAt?.rigUp || null,
     },
+    stagePlan: {
+      rigDown: {
+        startMinute: Number.isFinite(Number(stagePlan.rigDown?.startMinute)) ? Number(stagePlan.rigDown.startMinute) : null,
+        finishMinute: Number.isFinite(Number(stagePlan.rigDown?.finishMinute)) ? Number(stagePlan.rigDown.finishMinute) : null,
+      },
+      rigMove: {
+        startMinute: Number.isFinite(Number(stagePlan.rigMove?.startMinute)) ? Number(stagePlan.rigMove.startMinute) : null,
+        finishMinute: Number.isFinite(Number(stagePlan.rigMove?.finishMinute)) ? Number(stagePlan.rigMove.finishMinute) : null,
+      },
+      rigUp: {
+        startMinute: Number.isFinite(Number(stagePlan.rigUp?.startMinute)) ? Number(stagePlan.rigUp.startMinute) : null,
+        finishMinute: Number.isFinite(Number(stagePlan.rigUp?.finishMinute)) ? Number(stagePlan.rigUp.finishMinute) : null,
+      },
+    },
+    stageDelayNotes: {
+      rigDown: stageDelayNotes.rigDown
+        ? {
+            reason: String(stageDelayNotes.rigDown.reason || "").trim(),
+            lateMinutes: Math.max(0, Number(stageDelayNotes.rigDown.lateMinutes) || 0),
+            notedAt: stageDelayNotes.rigDown.notedAt || null,
+          }
+        : null,
+      rigMove: stageDelayNotes.rigMove
+        ? {
+            reason: String(stageDelayNotes.rigMove.reason || "").trim(),
+            lateMinutes: Math.max(0, Number(stageDelayNotes.rigMove.lateMinutes) || 0),
+            notedAt: stageDelayNotes.rigMove.notedAt || null,
+          }
+        : null,
+      rigUp: stageDelayNotes.rigUp
+        ? {
+            reason: String(stageDelayNotes.rigUp.reason || "").trim(),
+            lateMinutes: Math.max(0, Number(stageDelayNotes.rigUp.lateMinutes) || 0),
+            notedAt: stageDelayNotes.rigUp.notedAt || null,
+          }
+        : null,
+    },
     status: String(entry.status || "").trim() || (currentStage === "completed" ? "completed" : "queued"),
     sequence: Math.max(1, Number.parseInt(entry.sequence, 10) || index + 1),
     assignedAt: entry.assignedAt || null,
+    executionStartedAt: entry.executionStartedAt || entry.assignedAt || null,
     updatedAt: entry.updatedAt || null,
   };
 }
@@ -146,7 +203,7 @@ function normalizeTrucks(trucks) {
 function normalizeDrivers(drivers, managerId) {
   return (drivers || [])
     .map((entry, index) => normalizeDriverEntry(entry, index, managerId))
-    .filter((entry) => entry.name && entry.email);
+    .filter((entry) => entry.name && entry.email && entry.truckType);
 }
 
 function normalizeTaskAssignments(taskAssignments) {
@@ -157,7 +214,7 @@ function normalizeTaskAssignments(taskAssignments) {
 
 function deriveTrucksFromDrivers(drivers) {
   return normalizeDrivers(drivers, null).map((driver, index) => {
-    const truckType = driver.truckType || "Truck";
+    const truckType = normalizePlannerTruckType(driver.truckType) || "";
     const prefix = getTypePrefix(truckType);
     return {
       id: driver.truckId || `truck-${normalizeTypeKey(truckType)}-${index + 1}`,

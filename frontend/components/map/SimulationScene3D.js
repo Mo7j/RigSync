@@ -13,7 +13,7 @@ const MODEL_PATHS = {
   flatbedTruck: "/assets/models/FlatBed.glb",
   lowbedTruck: "/assets/models/LowBed.glb",
   heavyHaulerTruck: "/assets/models/HeavyHauler.glb",
-  rig: "/assets/models/rig.glb",
+  rig: "/assets/models/fRig.glb",
   terrain: "/assets/models/mountain.glb",
   lamp: "/assets/models/lamp.glb",
   siteLamp: "/assets/models/siteLamp.glb",
@@ -1053,20 +1053,20 @@ function createRouteObjects(routeDefinitions) {
 }
 
 function createRigBoard(position, routeDirection, radius = 18) {
-  const boardHeight = 2.4;
+  const boardHeight = 1.2;
   const boardRotation = Math.atan2(routeDirection.x || 0, routeDirection.z || 1) + Math.PI;
-  const boardWidth = radius * 3.6;
-  const boardDepth = radius * 2.45;
+  const boardWidth = radius * 4.6;
+  const boardDepth = radius * 2.9;
+  const shoulderWidth = boardWidth * 1.12;
+  const shoulderDepth = boardDepth * 1.08;
   const board = new THREE.Mesh(
     new THREE.BoxGeometry(boardWidth, boardHeight, boardDepth),
     new THREE.MeshStandardMaterial({
-      color: 0x2d3339,
-      emissive: 0x050608,
-      emissiveIntensity: 0.03,
-      metalness: 0.12,
-      roughness: 0.78,
-      transparent: true,
-      opacity: 0.94,
+      color: 0x32373d,
+      emissive: 0x06080b,
+      emissiveIntensity: 0.025,
+      metalness: 0.08,
+      roughness: 0.88,
     }),
   );
   board.position.copy(position);
@@ -1074,54 +1074,22 @@ function createRigBoard(position, routeDirection, radius = 18) {
   board.rotation.y = boardRotation;
   board.receiveShadow = true;
 
-  const railMaterial = new THREE.MeshStandardMaterial({
-    color: 0x2d3339,
-    emissive: 0x050608,
-    emissiveIntensity: 0.03,
-    metalness: 0.12,
-    roughness: 0.78,
-  });
-  const railHeight = 1.4;
-  const railThickness = 0.34;
-  const sideRail = new THREE.BoxGeometry(railThickness, railHeight, boardDepth);
-  const endRail = new THREE.BoxGeometry(boardWidth, railHeight, railThickness);
-  const rotatedOffset = (x, y, z) => new THREE.Vector3(x, y, z).applyAxisAngle(new THREE.Vector3(0, 1, 0), boardRotation).add(position);
-  const leftRail = new THREE.Mesh(sideRail, railMaterial);
-  leftRail.position.copy(rotatedOffset(-(boardWidth * 0.5), boardHeight + 0.7, 0));
-  leftRail.rotation.y = boardRotation;
-  const rightRail = new THREE.Mesh(sideRail, railMaterial);
-  rightRail.position.copy(rotatedOffset(boardWidth * 0.5, boardHeight + 0.7, 0));
-  rightRail.rotation.y = boardRotation;
-  const frontRail = new THREE.Mesh(endRail, railMaterial);
-  frontRail.position.copy(rotatedOffset(0, boardHeight + 0.7, -(boardDepth * 0.5)));
-  frontRail.rotation.y = boardRotation;
-  const backRail = new THREE.Mesh(endRail, railMaterial);
-  backRail.position.copy(rotatedOffset(0, boardHeight + 0.7, boardDepth * 0.5));
-  backRail.rotation.y = boardRotation;
+  const shoulder = new THREE.Mesh(
+    new THREE.BoxGeometry(shoulderWidth, 0.16, shoulderDepth),
+    new THREE.MeshStandardMaterial({
+      color: 0x1b1f24,
+      emissive: 0x050608,
+      emissiveIntensity: 0.02,
+      metalness: 0.04,
+      roughness: 0.96,
+    }),
+  );
+  shoulder.position.copy(position);
+  shoulder.position.y = 0.08;
+  shoulder.rotation.y = boardRotation;
+  shoulder.receiveShadow = true;
 
-  const fencePosts = [];
-  const xOffsets = [-boardWidth * 0.5, boardWidth * 0.5];
-  const zOffsets = [-boardDepth * 0.5, boardDepth * 0.5];
-  xOffsets.forEach((xOffset) => {
-    zOffsets.forEach((zOffset) => {
-    const post = new THREE.Mesh(
-      new THREE.CylinderGeometry(0.16, 0.16, 1.4, 12),
-      new THREE.MeshStandardMaterial({
-        color: 0x2d3339,
-        emissive: 0x050608,
-        emissiveIntensity: 0.03,
-        metalness: 0.12,
-        roughness: 0.78,
-      }),
-    );
-    const localPosition = new THREE.Vector3(xOffset, boardHeight + 0.7, zOffset);
-    localPosition.applyAxisAngle(new THREE.Vector3(0, 1, 0), boardRotation);
-    post.position.copy(position.clone().add(localPosition));
-    fencePosts.push(post);
-    });
-  });
-
-  return [board, leftRail, rightRail, frontRail, backRail, ...fencePosts];
+  return [shoulder, board];
 }
 
 function getRigBoardRotation(routeDirection) {
@@ -1153,8 +1121,8 @@ function getRigBoardParkingWorld(position, routeDirection, radius, truckId) {
 
 function getRigBoardRigWorld(position, routeDirection, radius, height = 1.6) {
   const boardRotation = getRigBoardRotation(routeDirection);
-  const boardWidth = radius * 3.6;
-  const worldOffset = new THREE.Vector3(-(boardWidth * 0.2), height, 0)
+  const boardWidth = radius * 4.6;
+  const worldOffset = new THREE.Vector3(-(boardWidth * 0.1), height, 0)
     .applyAxisAngle(new THREE.Vector3(0, 1, 0), boardRotation);
   return position.clone().add(worldOffset);
 }
@@ -1774,8 +1742,15 @@ function buildRouteTooltip(routeInfo) {
     controls.minPolarAngle = Math.PI * 0.2;
     const handleControlsStart = () => {
       cameraTransitioningRef.current = false;
-      if (focusedTruckIdRef.current != null) {
+      if (focusedTruckIdRef.current != null || focusedRigSideRef.current != null) {
+        focusedRigSideRef.current = null;
+        focusedTruckIdRef.current = null;
+        focusedTruckOffsetRef.current = null;
+        focusedTruckLastTargetRef.current = null;
         focusedTruckFollowConfigRef.current = null;
+        onRigFocusChange?.(null);
+        onTruckFocusChange?.(null);
+        onFocusChange?.(null);
       }
       zoomState.currentTarget.copy(controls.target);
       zoomState.desiredTarget.copy(controls.target);
@@ -2076,16 +2051,16 @@ function buildRouteTooltip(routeInfo) {
             routeDirectionWorld,
             24,
             siteLampTemplate,
-            getRigBoardRigWorld(straightStartWorld.clone().setY(0), routeDirectionWorld, 24, 3.6),
+            getRigBoardRigWorld(straightStartWorld.clone().setY(0), routeDirectionWorld, 24, 4.8),
           );
         }
         const startAsset = rigTemplate
-          ? centerAndScaleModel(cloneModelWithUniqueMaterials(rigTemplate), { targetWidth: 62, targetHeight: 34, lift: 0 })
+          ? centerAndScaleModel(cloneModelWithUniqueMaterials(rigTemplate), { targetWidth: 148, targetHeight: 82, lift: 0 })
           : createPadFallback(straightStartWorld.clone().setY(0), 0x1de9d5, -6);
         if (rigTemplate) {
           tintModel(startAsset, 0x596069);
           startAsset.rotation.y = Math.PI * 0.18;
-          startAsset.position.copy(getRigBoardRigWorld(straightStartWorld.clone().setY(0), routeDirectionWorld, 24, 1.8));
+          startAsset.position.copy(getRigBoardRigWorld(straightStartWorld.clone().setY(0), routeDirectionWorld, 24, 2.1));
           const statusMeshes = collectStatusMeshes(startAsset);
           statusMeshes.forEach((mesh, index) => {
             mesh.userData.rigComponent = {
@@ -2170,17 +2145,17 @@ function buildRouteTooltip(routeInfo) {
             routeDirectionWorld.clone().multiplyScalar(-1),
             28,
             siteLampTemplate,
-            getRigBoardRigWorld(straightEndWorld.clone().setY(0), routeDirectionWorld.clone().multiplyScalar(-1), 28, 3.6),
+            getRigBoardRigWorld(straightEndWorld.clone().setY(0), routeDirectionWorld.clone().multiplyScalar(-1), 28, 5.1),
             Math.PI,
           );
         }
         const endAsset = rigTemplate
-          ? centerAndScaleModel(cloneModelWithUniqueMaterials(rigTemplate), { targetWidth: 78, targetHeight: 44, lift: 0 })
+          ? centerAndScaleModel(cloneModelWithUniqueMaterials(rigTemplate), { targetWidth: 188, targetHeight: 106, lift: 0 })
           : createPadFallback(straightEndWorld.clone().setY(0), 0xc6ff00, 6);
         if (rigTemplate) {
           tintModel(endAsset, 0x596069);
           endAsset.rotation.y = -Math.PI * 0.12;
-          endAsset.position.copy(getRigBoardRigWorld(straightEndWorld.clone().setY(0), routeDirectionWorld.clone().multiplyScalar(-1), 28, 1.8));
+          endAsset.position.copy(getRigBoardRigWorld(straightEndWorld.clone().setY(0), routeDirectionWorld.clone().multiplyScalar(-1), 28, 2.3));
           const statusMeshes = collectStatusMeshes(endAsset);
           statusMeshes.forEach((mesh, index) => {
             mesh.userData.rigComponent = {

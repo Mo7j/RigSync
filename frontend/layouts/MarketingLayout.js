@@ -1,5 +1,6 @@
 import { h } from "../lib/react.js";
 import { Button } from "../components/ui/Button.js";
+import { translate } from "../lib/language.js";
 
 function scrollToSection(sectionId) {
   const section = document.getElementById(sectionId);
@@ -8,7 +9,7 @@ function scrollToSection(sectionId) {
   }
 }
 
-export function MarketingLayout({ onPrimaryAction, primaryLabel, children, className = "" }) {
+export function MarketingLayout({ language = "en", onToggleLanguage, children, className = "" }) {
   return h(
     "div",
     { className: `marketing-shell${className ? ` ${className}` : ""}` },
@@ -37,7 +38,11 @@ export function MarketingLayout({ onPrimaryAction, primaryLabel, children, class
               className: "nav-link",
               onClick: () => scrollToSection(item),
             },
-            item === "faq" ? "FAQ" : item === "about" ? "About Us" : "Features",
+            item === "faq"
+              ? translate(language, "brandNavFaq", "FAQ")
+              : item === "about"
+                ? translate(language, "brandNavAbout", "About Us")
+                : translate(language, "brandNavFeatures", "Features"),
           ),
         ),
       ),
@@ -46,8 +51,8 @@ export function MarketingLayout({ onPrimaryAction, primaryLabel, children, class
         variant: "ghost",
         size: "sm",
         className: "marketing-cta",
-        onClick: onPrimaryAction,
-        children: primaryLabel,
+        onClick: onToggleLanguage,
+        children: translate(language, "langToggle", "AR"),
       }),
     ),
     children,

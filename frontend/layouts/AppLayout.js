@@ -1,5 +1,6 @@
 import { h } from "../lib/react.js";
 import { Button } from "../components/ui/Button.js";
+import { translate } from "../lib/language.js";
 
 function SettingsGlyph() {
   return h(
@@ -22,6 +23,8 @@ export function AppLayout({
   currentUser,
   onLogout,
   onBack,
+  language = "en",
+  onToggleLanguage,
   fullBleed = false,
   background = null,
   className = "",
@@ -50,14 +53,14 @@ export function AppLayout({
                   size: "sm",
                   className: "back-button",
                   onClick: onBack,
-                  children: "Back",
+                  children: translate(language, "back", "Back"),
                 },
               )
             : null,
           h(
             "div",
             null,
-            h("p", { className: "eyebrow" }, "RigSync Workspace"),
+            h("p", { className: "eyebrow" }, translate(language, "workspace", "RigSync Workspace")),
             h("h1", { className: "app-title" }, title),
             subtitle ? h("p", { className: "muted-copy" }, subtitle) : null,
           ),
@@ -75,12 +78,20 @@ export function AppLayout({
               h("span", null, currentUser?.role || "Control room"),
             ),
           ),
+          h(Button, {
+            type: "button",
+            variant: "ghost",
+            size: "sm",
+            className: "header-ghost-button",
+            onClick: onToggleLanguage,
+            children: translate(language, "langToggle", "AR"),
+          }),
           h(
             "button",
             {
               type: "button",
               className: "icon-button settings-button",
-              "aria-label": "Settings",
+              "aria-label": translate(language, "settings", "Settings"),
             },
             h(SettingsGlyph),
           ),
@@ -90,7 +101,7 @@ export function AppLayout({
             size: "sm",
             className: "header-ghost-button",
             onClick: onLogout,
-            children: "Logout",
+            children: translate(language, "logout", "Logout"),
           }),
         ),
       ),

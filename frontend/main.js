@@ -45,8 +45,17 @@ import { RigMovePage } from "./pages/RigMovePage.js";
 import { Card } from "./components/ui/Card.js";
 import { AppLayout } from "./layouts/AppLayout.js";
 import { formatCoordinate, formatDate, formatMinutes } from "./lib/format.js";
+import { DEFAULT_LANGUAGE, LANGUAGE_STORAGE_KEY, getLanguageDirection } from "./lib/language.js";
 
 const { useEffect, useRef, useState } = React;
+
+function readStoredLanguage() {
+  try {
+    return window.localStorage.getItem(LANGUAGE_STORAGE_KEY) || DEFAULT_LANGUAGE;
+  } catch {
+    return DEFAULT_LANGUAGE;
+  }
+}
 
 function yieldForUiPaint() {
   return new Promise((resolve) => {
@@ -54,6 +63,20 @@ function yieldForUiPaint() {
       window.setTimeout(resolve, 0);
     });
   });
+}
+
+function normalizePlannerTruckType(type) {
+  const normalized = String(type || "").trim().toLowerCase().replace(/[^a-z]/g, "");
+  if (normalized.includes("heavy")) {
+    return "Heavy Hauler";
+  }
+  if (normalized.includes("flat")) {
+    return "Flat-bed";
+  }
+  if (normalized.includes("low") || normalized.includes("support")) {
+    return "Low-bed";
+  }
+  return "";
 }
 
 function createSimulationProgressState({
@@ -169,6 +192,18 @@ function getAssignmentStageLabel(stageState = {}) {
     return "rigUp";
   }
   return "completed";
+}
+
+function getStageDelayMinutes({ assignment, stage, completedAt = new Date().toISOString() }) {
+  const plannedFinishMinute = assignment?.stagePlan?.[stage]?.finishMinute;
+  const executionStartedAt = assignment?.executionStartedAt || assignment?.assignedAt;
+  if (!Number.isFinite(Number(plannedFinishMinute)) || !executionStartedAt) {
+    return 0;
+  }
+
+  const actualElapsedMinutes =
+    Math.max(0, new Date(completedAt).getTime() - new Date(executionStartedAt).getTime()) / 60000;
+  return Math.max(0, Math.round(actualElapsedMinutes - Number(plannedFinishMinute)));
 }
 
 function getMovePlayback(move) {
@@ -304,6 +339,25 @@ function buildDriverAssignmentsForMove({ move, managerResources }) {
       sequence: index + 1,
       plannedStartMinute: trip.loadStart ?? trip.dispatchStart ?? 0,
       plannedFinishMinute: trip.rigUpFinish ?? trip.returnToSource ?? trip.arrivalAtDestination ?? 0,
+      stagePlan: {
+        rigDown: {
+          startMinute: trip.rigDownStart ?? trip.loadStart ?? 0,
+          finishMinute: trip.rigDownFinish ?? trip.loadStart ?? 0,
+        },
+        rigMove: {
+          startMinute: trip.moveStart ?? trip.pickupLoadFinish ?? trip.rigDownFinish ?? 0,
+          finishMinute: trip.arrivalAtDestination ?? trip.moveFinish ?? trip.returnToSource ?? 0,
+        },
+        rigUp: {
+          startMinute: trip.rigUpStart ?? trip.unloadDropFinish ?? trip.arrivalAtDestination ?? 0,
+          finishMinute: trip.rigUpFinish ?? trip.returnToSource ?? trip.arrivalAtDestination ?? 0,
+        },
+      },
+      stageDelayNotes: {
+        rigDown: null,
+        rigMove: null,
+        rigUp: null,
+      },
       journeyId: trip.journeyId || null,
       stageStatus: {
         rigDownCompleted: false,
@@ -318,6 +372,7 @@ function buildDriverAssignmentsForMove({ move, managerResources }) {
       currentStage: "rigDown",
       status: index === 0 ? "active" : "queued",
       assignedAt,
+      executionStartedAt: assignedAt,
       updatedAt: assignedAt,
     }));
 
@@ -391,6 +446,7 @@ function buildPlanningLoadsForMove({ baseLogicalLoads, move, teamMoves, startupR
 function App() {
   const route = useHashRoute();
   const [session, setSession] = useState(getSession);
+  const [language, setLanguage] = useState(readStoredLanguage);
   const [loads, setLoads] = useState([]);
   const [startupRequirements, setStartupRequirements] = useState([]);
   const [truckSpecs, setTruckSpecs] = useState([]);
@@ -424,7 +480,23 @@ function App() {
   const animationFrameRef = useRef(null);
   const animationStartedAtRef = useRef(null);
   const lastPersistedMinuteRef = useRef(0);
+  const lastPlaybackUiUpdateRef = useRef(0);
   const lastSavedMoveSessionRef = useRef("");
+
+  useEffect(() => {
+    const normalizedLanguage = language === "ar" ? "ar" : "en";
+    document.documentElement.lang = normalizedLanguage;
+    document.documentElement.dir = getLanguageDirection(normalizedLanguage);
+    try {
+      window.localStorage.setItem(LANGUAGE_STORAGE_KEY, normalizedLanguage);
+    } catch {
+      // Ignore storage errors.
+    }
+  }, [language]);
+
+  function handleToggleLanguage() {
+    setLanguage((current) => (current === "ar" ? "en" : "ar"));
+  }
 
   useEffect(() => {
     void refreshSession().then((nextSession) => {
@@ -639,8 +711,18 @@ function App() {
           rigInventoryRevision,
         })
       : null;
+  const matchedDriverIds = session?.role === "Driver"
+    ? new Set(
+        [
+          session.id,
+          ...(managerResources?.drivers || [])
+            .filter((driver) => String(driver.email || "").trim().toLowerCase() === String(session.email || "").trim().toLowerCase())
+            .map((driver) => driver.id),
+        ].filter(Boolean),
+      )
+    : new Set();
   const driverAssignments = session?.role === "Driver"
-    ? (managerResources?.taskAssignments || []).filter((assignment) => assignment.driverId === session.id)
+    ? (managerResources?.taskAssignments || []).filter((assignment) => matchedDriverIds.has(assignment.driverId))
     : [];
   const moveExecutionAssignments = activeMove
     ? (managerResources?.taskAssignments || []).filter((assignment) => assignment.moveId === activeMove.id)
@@ -924,6 +1006,7 @@ function App() {
 
     setCurrentMinute(startingMinute);
     lastPersistedMinuteRef.current = startingMinute;
+    lastPlaybackUiUpdateRef.current = 0;
     animationStartedAtRef.current = null;
 
     const animate = (timestamp) => {
@@ -938,14 +1021,22 @@ function App() {
         (elapsedSeconds / 60) * effectivePlaybackSpeed;
       const nextMinute = Math.min(activeTotalMinutes, simulatedMinutes);
 
-      setCurrentMinute(nextMinute);
       lastPersistedMinuteRef.current = nextMinute;
+      if (
+        lastPlaybackUiUpdateRef.current === 0 ||
+        (timestamp - lastPlaybackUiUpdateRef.current) >= 80 ||
+        nextMinute >= activeTotalMinutes
+      ) {
+        lastPlaybackUiUpdateRef.current = timestamp;
+        setCurrentMinute(nextMinute);
+      }
 
       if (nextMinute < activeTotalMinutes) {
         animationFrameRef.current = window.requestAnimationFrame(animate);
       } else {
         animationFrameRef.current = null;
         animationStartedAtRef.current = null;
+        lastPlaybackUiUpdateRef.current = 0;
         setIsPlaybackRunning(false);
         setIsPlaybackPaused(false);
       }
@@ -959,8 +1050,9 @@ function App() {
       }
       animationFrameRef.current = null;
       animationStartedAtRef.current = null;
+      lastPlaybackUiUpdateRef.current = 0;
     };
-  }, [activeMove?.id, activeMove?.updatedAt, route.page, playbackSpeed, activeTotalMinutes, areSceneAssetsReady, isSimulatingMove, isPlaybackRunning]);
+  }, [activeMove?.id, route.page, playbackSpeed, activeTotalMinutes, areSceneAssetsReady, isSimulatingMove, isPlaybackRunning]);
 
   async function handleLogin({ email, password }) {
     const matchedUser = await authenticateUser(email, password);
@@ -1097,6 +1189,7 @@ function App() {
     const sanitizedTruckSetup = truckSetup
       .map((item) => ({
         ...item,
+        type: normalizePlannerTruckType(item.type),
         count: Math.max(0, Number.parseInt(item.count, 10) || 0),
         hourlyCost: Math.max(
           0,
@@ -1106,7 +1199,7 @@ function App() {
           ) || 0,
         ),
       }))
-      .filter((item) => item.type.trim() && item.count > 0);
+      .filter((item) => item.type && item.count > 0);
     const availabilityError = getAvailabilityValidationError(sanitizedTruckSetup, availability);
     if (availabilityError) {
       throw new Error(availabilityError);
@@ -1254,10 +1347,11 @@ function App() {
     const normalizedScenarioTruckSetup = (scenarioTruckSetup || sanitizedTruckSetup)
       .map((item) => ({
         ...item,
+        type: normalizePlannerTruckType(item.type),
         count: Math.max(0, Number.parseInt(item.count ?? item.available, 10) || 0),
         hourlyCost: Math.max(0, Number(item.hourlyCost) || 0),
       }))
-      .filter((item) => item.type?.trim() && item.count > 0);
+      .filter((item) => item.type && item.count > 0);
     const scenarioPlans = await buildScenarioPlans(planningLoads, routeData, planningCrewBaseline, truckCount, normalizedScenarioTruckSetup, truckSpecs, {
       dayShift: planningCrewBaseline,
       nightShift: planningCrewBaseline,
@@ -1384,6 +1478,7 @@ function App() {
       }
       animationFrameRef.current = null;
       animationStartedAtRef.current = null;
+      lastPlaybackUiUpdateRef.current = 0;
       lastPersistedMinuteRef.current = 0;
       setCurrentMinute(0);
       setIsPlaybackRunning(false);
@@ -1426,6 +1521,7 @@ function App() {
       setMoves(nextMoves);
       setCurrentMinute(0);
       lastPersistedMinuteRef.current = 0;
+      lastPlaybackUiUpdateRef.current = 0;
       setPlaybackSpeed(15000);
       setIsPlaybackRunning(false);
       setIsPlaybackPaused(false);
@@ -1457,6 +1553,7 @@ function App() {
     setIsScenePlaybackReady(false);
     setIsPlaybackRunning(false);
     lastPersistedMinuteRef.current = 0;
+    lastPlaybackUiUpdateRef.current = 0;
     setCurrentMinute(0);
     setIsPlaybackPaused(false);
     navigateTo(`/move/${moveId}`);
@@ -1488,6 +1585,7 @@ function App() {
     const nextMoves = await upsertMove(updatedMove);
     setMoves(nextMoves);
     lastPersistedMinuteRef.current = 0;
+    lastPlaybackUiUpdateRef.current = 0;
     setCurrentMinute(0);
     setIsPlaybackRunning(false);
     setIsPlaybackPaused(false);
@@ -1580,13 +1678,21 @@ function App() {
     return updatedMove;
   }
 
-  async function handleDriverStageComplete({ assignmentId, stage }) {
+  async function handleDriverStageComplete({ assignmentId, stage, delayReason = "" }) {
     if (!managerId || !session?.id) {
       return;
     }
 
+    const allowedDriverIds = new Set(
+      [
+        session.id,
+        ...(managerResources?.drivers || [])
+          .filter((driver) => String(driver.email || "").trim().toLowerCase() === String(session.email || "").trim().toLowerCase())
+          .map((driver) => driver.id),
+      ].filter(Boolean),
+    );
     const targetAssignment = (managerResources?.taskAssignments || []).find(
-      (assignment) => assignment.id === assignmentId && assignment.driverId === session.id,
+      (assignment) => assignment.id === assignmentId && allowedDriverIds.has(assignment.driverId),
     );
     if (!targetAssignment) {
       return;
@@ -1597,12 +1703,26 @@ function App() {
       return;
     }
 
+    const projectedLateMinutes = getStageDelayMinutes({
+      assignment: targetAssignment,
+      stage,
+    });
+    if (projectedLateMinutes > 20 && !String(delayReason || "").trim()) {
+      return;
+    }
+
+    const completionStamp = new Date().toISOString();
     const nextTaskAssignments = (managerResources?.taskAssignments || []).map((assignment) => {
       if (assignment.id !== assignmentId) {
         return assignment;
       }
 
-      const completedAt = new Date().toISOString();
+      const completedAt = completionStamp;
+      const lateMinutes = getStageDelayMinutes({
+        assignment,
+        stage,
+        completedAt,
+      });
       const nextStageStatus = {
         ...(assignment.stageStatus || {}),
         ...(stage === "rigDown" ? { rigDownCompleted: true } : null),
@@ -1618,6 +1738,18 @@ function App() {
           rigDown: assignment.stageCompletedAt?.rigDown || (stage === "rigDown" ? completedAt : null),
           rigMove: assignment.stageCompletedAt?.rigMove || (stage === "rigMove" ? completedAt : null),
           rigUp: assignment.stageCompletedAt?.rigUp || (stage === "rigUp" ? completedAt : null),
+        },
+        stageDelayNotes: {
+          ...(assignment.stageDelayNotes || {}),
+          ...(lateMinutes > 20
+            ? {
+                [stage]: {
+                  reason: String(delayReason || "").trim(),
+                  lateMinutes,
+                  notedAt: completedAt,
+                },
+              }
+            : {}),
         },
         currentStage: nextStage,
         status: nextStage === "completed" ? "completed" : "active",
@@ -1771,6 +1903,7 @@ function App() {
     animationFrameRef.current = null;
     animationStartedAtRef.current = null;
     lastPersistedMinuteRef.current = 0;
+    lastPlaybackUiUpdateRef.current = 0;
     setCurrentMinute(0);
     setIsPlaybackRunning(false);
     setIsPlaybackPaused(false);
@@ -1818,6 +1951,7 @@ function App() {
     setIsPlaybackPaused(false);
     setCurrentMinute(0);
     lastPersistedMinuteRef.current = 0;
+    lastPlaybackUiUpdateRef.current = 0;
   }
 
   if (route.page === "login") {
@@ -1825,6 +1959,8 @@ function App() {
       isAuthenticated: Boolean(session),
       onLogin: handleLogin,
       onBackHome: () => navigateTo("/home"),
+      language,
+      onToggleLanguage: handleToggleLanguage,
     });
   }
 
@@ -1837,6 +1973,8 @@ function App() {
           subtitle: formatDate(new Date()),
           currentUser: session,
           onLogout: handleLogout,
+          language,
+          onToggleLanguage: handleToggleLanguage,
           fullBleed: true,
         },
         h(
@@ -1869,6 +2007,8 @@ function App() {
         onSaveResources: handleSaveManagerResources,
         onSaveFleet: handleSaveManagerFleet,
         onLogout: handleLogout,
+        language,
+        onToggleLanguage: handleToggleLanguage,
       });
     }
 
@@ -1879,6 +2019,8 @@ function App() {
         currentDate: new Date(),
         onCompleteStage: handleDriverStageComplete,
         onLogout: handleLogout,
+        language,
+        onToggleLanguage: handleToggleLanguage,
       });
     }
 
@@ -1899,6 +2041,8 @@ function App() {
       onSaveRigInventory: handleSaveRigInventory,
       onOpenMove: handleOpenMove,
       onLogout: handleLogout,
+      language,
+      onToggleLanguage: handleToggleLanguage,
     });
   }
 
@@ -1916,6 +2060,8 @@ function App() {
         onSaveResources: handleSaveManagerResources,
         onSaveFleet: handleSaveManagerFleet,
         onLogout: handleLogout,
+        language,
+        onToggleLanguage: handleToggleLanguage,
       });
     }
 
@@ -1926,6 +2072,8 @@ function App() {
         currentDate: new Date(),
         onCompleteStage: handleDriverStageComplete,
         onLogout: handleLogout,
+        language,
+        onToggleLanguage: handleToggleLanguage,
       });
     }
 
@@ -1946,6 +2094,8 @@ function App() {
       onSaveRigInventory: handleSaveRigInventory,
       onOpenMove: handleOpenMove,
       onLogout: handleLogout,
+      language,
+      onToggleLanguage: handleToggleLanguage,
     });
   }
 
@@ -1994,16 +2144,20 @@ function App() {
       executionAssignments: moveExecutionAssignments,
       teamMoves: managerScopedMoves,
       startupRequirements,
+      language,
+      onToggleLanguage: handleToggleLanguage,
     });
   }
 
   return h(HomePage, {
+    language,
     moveCount: moves.length,
     loadCount: logicalLoads.length,
     isLoadingLoads,
     hasSession: Boolean(session),
     onOpenLogin: () => navigateTo("/login"),
     onOpenDashboard: () => navigateTo(session ? "/dashboard" : "/login"),
+    onToggleLanguage: handleToggleLanguage,
   });
 }
 

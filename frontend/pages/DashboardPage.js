@@ -7,6 +7,7 @@ import { Modal } from "../components/ui/Modal.js";
 import { ProgressBar } from "../components/ui/ProgressBar.js";
 import { LeafletMap } from "../components/map/LeafletMap.js";
 import { formatCoordinate, formatDate, formatLocationLabel } from "../lib/format.js";
+import { translate } from "../lib/language.js";
 import { fetchLocationLabel } from "../features/rigMoves/api.js";
 
 const { useRef, useState } = React;
@@ -56,7 +57,10 @@ export function DashboardPage({
   onSaveRigInventory,
   onOpenMove,
   onLogout,
+  language = "en",
+  onToggleLanguage,
 }) {
+  const t = (key, fallback) => translate(language, key, fallback);
   const [endPoint, setEndPoint] = useState(null);
   const [endLabel, setEndLabel] = useState("");
   const [fieldError, setFieldError] = useState("");
@@ -169,6 +173,8 @@ export function DashboardPage({
       subtitle: formatDate(currentDate),
       currentUser,
       onLogout,
+      language,
+      onToggleLanguage,
       fullBleed: true,
     },
     h(

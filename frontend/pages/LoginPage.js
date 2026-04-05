@@ -3,10 +3,11 @@ import { Button } from "../components/ui/Button.js";
 import { Card } from "../components/ui/Card.js";
 import { Field, TextInput } from "../components/ui/Field.js";
 import { TEST_USERS, TEST_USER } from "../features/auth/auth.js";
+import { translate } from "../lib/language.js";
 
 const { useState } = React;
 
-export function LoginPage({ isAuthenticated, onLogin, onBackHome }) {
+export function LoginPage({ isAuthenticated, onLogin, onBackHome, language = "en", onToggleLanguage }) {
   const [email, setEmail] = useState(TEST_USER.email);
   const [password, setPassword] = useState(TEST_USER.password);
   const [error, setError] = useState("");
@@ -20,7 +21,7 @@ export function LoginPage({ isAuthenticated, onLogin, onBackHome }) {
     try {
       await onLogin({ email, password });
     } catch (nextError) {
-      setError(nextError.message || "Login failed.");
+      setError(nextError.message || translate(language, "loginFailed", "Login failed."));
     } finally {
       setIsSubmitting(false);
     }
@@ -34,9 +35,20 @@ export function LoginPage({ isAuthenticated, onLogin, onBackHome }) {
       {
         type: "button",
         variant: "ghost",
+        size: "sm",
+        className: "marketing-cta auth-language-button",
+        onClick: onToggleLanguage,
+        children: translate(language, "langToggle", "AR"),
+      },
+    ),
+    h(
+      Button,
+      {
+        type: "button",
+        variant: "ghost",
         className: "scene-back-button auth-back-button",
         onClick: onBackHome,
-        "aria-label": "Back to Home",
+        "aria-label": translate(language, "backHome", "Back to Home"),
         children: h(
           "svg",
           {
@@ -58,12 +70,12 @@ export function LoginPage({ isAuthenticated, onLogin, onBackHome }) {
     h(
       Card,
       { className: "auth-card" },
-      h("p", { className: "eyebrow" }, "Welcome"),
-      h("h1", { className: "auth-title" }, isAuthenticated ? "Session already active" : "Login"),
+      h("p", { className: "eyebrow" }, translate(language, "welcome", "Welcome")),
+      h("h1", { className: "auth-title" }, isAuthenticated ? translate(language, "sessionActive", "Session already active") : translate(language, "login", "Login")),
         h(
           "p",
           { className: "muted-copy" },
-          "Sign in to access the dashboard and operational workspace.",
+          translate(language, "loginSubtitle", "Sign in to access the dashboard and operational workspace."),
         ),
         h(
           "div",
@@ -90,7 +102,7 @@ export function LoginPage({ isAuthenticated, onLogin, onBackHome }) {
           { className: "auth-form", onSubmit: handleSubmit },
         h(
           Field,
-          { label: "Email" },
+          { label: translate(language, "email", "Email") },
           h(TextInput, {
             type: "email",
             value: email,
@@ -100,11 +112,11 @@ export function LoginPage({ isAuthenticated, onLogin, onBackHome }) {
         ),
         h(
           Field,
-          { label: "Password" },
+          { label: translate(language, "password", "Password") },
           h(TextInput, {
             type: "password",
             value: password,
-            placeholder: "Enter your password",
+            placeholder: translate(language, "password", "Password"),
             onChange: (event) => setPassword(event.target.value),
           }),
         ),
@@ -117,7 +129,7 @@ export function LoginPage({ isAuthenticated, onLogin, onBackHome }) {
               type: "button",
               className: "auth-text-link",
             },
-            "Forgot your password?",
+            translate(language, "forgotPassword", "Forgot your password?"),
           ),
         ),
         error ? h("p", { className: "field-error auth-error" }, error) : null,
@@ -128,20 +140,20 @@ export function LoginPage({ isAuthenticated, onLogin, onBackHome }) {
             type: "submit",
             className: "login-primary",
             isBusy: isSubmitting,
-            children: "Login",
+            children: translate(language, "login", "Login"),
           }),
         ),
         h(
           "div",
           { className: "auth-footer-row" },
-          h("span", { className: "muted-copy" }, "Don't have an account?"),
+          h("span", { className: "muted-copy" }, translate(language, "noAccount", "Don't have an account?")),
           h(
             "button",
             {
               type: "button",
               className: "auth-text-link auth-signup-link",
             },
-            "Sign up",
+            translate(language, "signUp", "Sign up"),
           ),
         ),
       ),

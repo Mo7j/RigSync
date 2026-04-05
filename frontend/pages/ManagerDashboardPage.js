@@ -3,8 +3,10 @@ import { AppLayout } from "../layouts/AppLayout.js";
 import { Button } from "../components/ui/Button.js";
 import { Card, StatCard } from "../components/ui/Card.js";
 import { ProgressBar } from "../components/ui/ProgressBar.js";
+import { ManagerRigsMap } from "../components/map/ManagerRigsMap.js";
 import { formatDate, formatLocationLabel } from "../lib/format.js";
 import { buildFleetAvailability } from "../features/resources/storage.js";
+import { translate } from "../lib/language.js";
 
 const { useMemo, useState } = React;
 
@@ -121,6 +123,22 @@ function getExecutionTaskSummary(moves) {
   return totals;
 }
 
+function formatSceneStatus(move) {
+  if (!move) {
+    return "Idle";
+  }
+  if (move?.operatingState === "drilling") {
+    return "Drilling";
+  }
+  if (move?.executionState === "completed") {
+    return "Completed";
+  }
+  if (move?.executionState === "active") {
+    return "Transferring";
+  }
+  return "Planning";
+}
+
 function CollapsibleSection({ title, pill, children, defaultOpen = true }) {
   return h(
     Card,
@@ -206,8 +224,13 @@ export function ManagerDashboardPage({
   onCreateDriver,
   onSaveResources,
   onLogout,
+  language = "en",
+  onToggleLanguage,
 }) {
+  const t = (key, fallback) => translate(language, key, fallback);
   const [showDriverForm, setShowDriverForm] = useState(false);
+  const [isMapOpen, setIsMapOpen] = useState(false);
+  const [selectedRigId, setSelectedRigId] = useState(null);
   const [driverDraft, setDriverDraft] = useState({
     name: "",
     email: "",
@@ -259,6 +282,39 @@ export function ManagerDashboardPage({
     { label: "Tasks Waiting", value: String((taskSummary.rigDown + taskSummary.move + taskSummary.rigUp) - taskSummary.completed), meta: "Driver app sync target" },
   ];
   const truckTypeOptions = [...new Set([...(managerFleet || []).map((truck) => truck.type), ...DRIVER_TRUCK_TYPE_OPTIONS])];
+  const rigMapItems = useMemo(
+    () =>
+      (moves || []).map((move) => ({
+        id: move.id,
+        name: move.name,
+        startPoint: move.startPoint || null,
+        endPoint: move.endPoint || null,
+        startLabel: formatLocationLabel(move.startLabel, "Source"),
+        endLabel: formatLocationLabel(move.endLabel, "Destination"),
+        routeGeometry: move.simulation?.routeGeometry || [],
+        executionState: move.executionState,
+        operatingState: move.operatingState,
+        completionPercentage: Number(move.completionPercentage) || 0,
+        loadCount: move.loadCount || 0,
+        eta: move.eta || "--",
+        routeTime: move.routeTime || "--",
+        phase: formatSceneStatus(move),
+      })),
+    [moves],
+  );
+  const selectedRig = useMemo(() => {
+    if (!rigMapItems.length) {
+      return null;
+    }
+    return rigMapItems.find((item) => item.id === selectedRigId)
+      || rigMapItems.find((item) => item.executionState === "active")
+      || rigMapItems[0];
+  }, [rigMapItems, selectedRigId]);
+  const liveRigs = rigMapItems.filter((item) => item.executionState === "active").length;
+  const completedRigs = rigMapItems.filter((item) => item.operatingState === "drilling" || item.executionState === "completed").length;
+  const averageProgress = rigMapItems.length
+    ? Math.round(rigMapItems.reduce((sum, item) => sum + (Number(item.completionPercentage) || 0), 0) / rigMapItems.length)
+    : 0;
 
   async function saveResources(nextPartial) {
     const nextResources = {
@@ -300,13 +356,128 @@ export function ManagerDashboardPage({
     });
   }
 
+  if (isMapOpen) {
+    return h(
+      AppLayout,
+      {
+        title: `${t("managerView", "Manager view")}, ${currentUser?.name || t("supervisor", "Supervisor")}`,
+        subtitle: formatDate(currentDate),
+        currentUser,
+        onLogout,
+        language,
+        onToggleLanguage,
+        fullBleed: true,
+      },
+      h(
+        "section",
+        { className: "scene-only-shell manager-scene-shell" },
+        h(ManagerRigsMap, {
+          rigs: rigMapItems,
+          selectedRigId: selectedRig?.id || null,
+          onSelectRig: setSelectedRigId,
+          heightClass: "manager-map-fullscreen",
+        }),
+        h(
+          "div",
+          { className: "scene-top-bar manager-scene-top-bar" },
+          h(
+            "div",
+            { className: "scene-top-left-actions" },
+            h(
+              "button",
+              {
+                type: "button",
+                className: "scene-back-button",
+                onClick: () => setIsMapOpen(false),
+                "aria-label": t("back", "Back"),
+              },
+              h("span", { "aria-hidden": "true" }, "←"),
+            ),
+            h(
+              "button",
+              {
+                type: "button",
+                className: "scene-back-button",
+                onClick: () => setIsMapOpen(false),
+                "aria-label": t("close", "Close"),
+              },
+              h("span", { "aria-hidden": "true" }, "×"),
+            ),
+            h("div", { className: "scene-compact-pill" }, t("viewAll", "View All")),
+          ),
+          h(
+            "div",
+            { className: "scene-top-title" },
+            h("span", { className: "scene-panel-kicker" }, t("managerNetwork", "Manager Network")),
+            h("strong", { className: "scene-top-title-text" }, t("allRigs", "All Rigs")),
+            h("div", { className: "scene-stage-progress manager-scene-stage-progress" },
+              h("div", { className: "scene-stage-item is-completed" }, h("span", { className: "scene-stage-label" }, t("planning", "Planning"))),
+              h("div", { className: `scene-stage-item${liveRigs ? " is-active" : ""}` }, h("span", { className: "scene-stage-label" }, t("execution", "Execution"))),
+              h("div", { className: `scene-stage-item${completedRigs ? " is-completed" : ""}` }, h("span", { className: "scene-stage-label" }, t("drilling", "Drilling"))),
+            ),
+          ),
+        ),
+        h(
+          "aside",
+          { className: "manager-scene-panel manager-scene-panel-left" },
+          h("span", { className: "scene-panel-kicker" }, t("selectedRig", "Selected Rig")),
+          h("strong", { className: "manager-scene-title" }, selectedRig?.name || t("noRigSelected", "No rig selected")),
+          h("p", { className: "manager-scene-copy" }, selectedRig ? `${selectedRig.startLabel} to ${selectedRig.endLabel}` : t("noRigSelectedCopy", "Pick a rig on the map to inspect its transfer state.")),
+          h(
+            "div",
+            { className: "manager-scene-stat-list" },
+            h("div", { className: "manager-scene-stat-row" }, h("span", null, t("status", "Status")), h("strong", null, selectedRig ? t(selectedRig.phase.toLowerCase(), selectedRig.phase) : "--")),
+            h("div", { className: "manager-scene-stat-row" }, h("span", null, t("completion", "Completion")), h("strong", null, `${Math.round(selectedRig?.completionPercentage || 0)}%`)),
+            h("div", { className: "manager-scene-stat-row" }, h("span", null, t("loads", "Loads")), h("strong", null, String(selectedRig?.loadCount || 0))),
+            h("div", { className: "manager-scene-stat-row" }, h("span", null, t("route", "Route")), h("strong", null, selectedRig?.routeTime || "--")),
+            h("div", { className: "manager-scene-stat-row" }, h("span", null, t("eta", "ETA")), h("strong", null, selectedRig?.eta || "--")),
+          ),
+          h(
+            "div",
+            { className: "manager-scene-callout" },
+            h("span", { className: "scene-panel-kicker" }, t("liveTracking", "Live Tracking")),
+            h("strong", null, selectedRig?.executionState === "active" ? t("transferInMotion", "Transfer in motion") : t("routeReady", "Route ready")),
+            h("p", { className: "manager-scene-copy" }, selectedRig?.executionState === "active"
+              ? t("transferInMotionCopy", "Showing old site, destination, route line, and live completion on the path.")
+              : t("routeReadyCopy", "This rig is not actively transferring right now.")),
+          ),
+        ),
+        h(
+          "div",
+          { className: "scene-top-info-strip manager-scene-top-info-strip" },
+          h(
+            "div",
+            { className: "scene-plan-kpis manager-scene-kpis" },
+            h("div", { className: "scene-dashboard-stack-item" }, h("span", { className: "scene-dashboard-label" }, t("rigsLive", "Rigs Live")), h("strong", null, String(liveRigs))),
+            h("div", { className: "scene-dashboard-stack-item" }, h("span", { className: "scene-dashboard-label" }, t("averageCompletion", "Average Completion")), h("strong", null, `${averageProgress}%`)),
+            h("div", { className: "scene-dashboard-stack-item" }, h("span", { className: "scene-dashboard-label" }, t("driversReady", "Drivers Ready")), h("strong", null, String(Math.max(0, drivers.length - driversAssigned)))),
+          ),
+          h(
+            "div",
+            { className: "scene-plan-dashboard manager-scene-dashboard" },
+            h("span", { className: "scene-panel-kicker" }, t("networkSummary", "Network Summary")),
+            h("strong", { className: "scene-plan-summary-title" }, t("managerPlanOverview", "Rig Operations Overview")),
+            h("div", { className: "scene-dashboard-pair" },
+              h("div", { className: "scene-dashboard-pair-item" }, h("span", { className: "scene-dashboard-label" }, t("totalRigs", "Total Rigs")), h("strong", null, String(rigMapItems.length))),
+              h("div", { className: "scene-dashboard-pair-item" }, h("span", { className: "scene-dashboard-label" }, t("inDrilling", "In Drilling")), h("strong", null, String(completedRigs))),
+              h("div", { className: "scene-dashboard-pair-item" }, h("span", { className: "scene-dashboard-label" }, t("routesTracked", "Routes Tracked")), h("strong", null, String(rigMapItems.filter((item) => item.routeGeometry?.length > 1).length))),
+              h("div", { className: "scene-dashboard-pair-item" }, h("span", { className: "scene-dashboard-label" }, t("loadTransfers", "Load Transfers")), h("strong", null, String(rigMapItems.reduce((sum, item) => sum + (item.loadCount || 0), 0)))),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
   return h(
     AppLayout,
     {
-      title: `Manager view, ${currentUser?.name || "Supervisor"}`,
+      title: `${t("managerView", "Manager view")}, ${currentUser?.name || t("supervisor", "Supervisor")}`,
       subtitle: formatDate(currentDate),
       currentUser,
       onLogout,
+      language,
+      onToggleLanguage,
       fullBleed: true,
     },
     h(
@@ -318,17 +489,33 @@ export function ManagerDashboardPage({
         h(
           Card,
           { className: "dashboard-section-card" },
-          h("div", { className: "section-heading" }, h("h2", null, "Manager Overview"), h("span", { className: "section-pill" }, `${stats.totalMoves} rig operations`)),
-          h("p", { className: "muted-copy section-spacing dashboard-existing-copy" }, "Live operations, ready trucks, and driver accounts in one view."),
+          h(
+            "div",
+            { className: "section-heading" },
+            h("h2", null, t("managerOverview", "Manager Overview")),
+            h(
+              "div",
+              { className: "manager-overview-actions" },
+              h(Button, {
+                type: "button",
+                variant: "ghost",
+                size: "sm",
+                onClick: () => setIsMapOpen(true),
+                children: t("viewAll", "View All"),
+              }),
+              h("span", { className: "section-pill" }, `${stats.totalMoves} ${t("rigOperations", "rig operations")}`),
+            ),
+          ),
+          h("p", { className: "muted-copy section-spacing dashboard-existing-copy" }, t("managerOverviewCopy", "Live operations, ready trucks, and driver accounts in one view.")),
           h("div", { className: "manager-summary-grid" }, summaryCards.map((item) => h(StatCard, { key: item.label, ...item }))),
         ),
         h(
           CollapsibleSection,
-          { title: "Resources", pill: `${fleetFree} trucks ready`, defaultOpen: true },
+          { title: t("resources", "Resources"), pill: `${fleetFree} ${t("trucksReady", "trucks ready")}`, defaultOpen: true },
           h(
             "div",
             { className: "manager-resource-toolbar" },
-            h("p", { className: "muted-copy" }, "Create driver accounts only. Each driver carries one truck type, and the planner uses that as the truck assigned to the driver."),
+            h("p", { className: "muted-copy" }, t("resourcesCopy", "Create driver accounts only. Each driver carries one truck type, and the planner uses that as the truck assigned to the driver.")),
             h(
               "div",
               { className: "manager-resource-actions" },
@@ -336,7 +523,7 @@ export function ManagerDashboardPage({
                 type: "button",
                 variant: showDriverForm ? "ghost" : "secondary",
                 onClick: () => setShowDriverForm((value) => !value),
-                children: showDriverForm ? "Close Driver" : "Add Driver",
+                children: showDriverForm ? t("closeDriver", "Close Driver") : t("addDriver", "Add Driver"),
               }),
             ),
           ),
@@ -360,7 +547,7 @@ export function ManagerDashboardPage({
                 h(
                   "label",
                   { className: "manager-rig-stat" },
-                  h("span", null, "Driver name"),
+                  h("span", null, t("driverName", "Driver name")),
                   h("input", {
                     className: "input",
                     type: "text",
@@ -371,7 +558,7 @@ export function ManagerDashboardPage({
                 h(
                   "label",
                   { className: "manager-rig-stat" },
-                  h("span", null, "Email"),
+                  h("span", null, t("email", "Email")),
                   h("input", {
                     className: "input",
                     type: "email",
@@ -382,7 +569,7 @@ export function ManagerDashboardPage({
                 h(
                   "label",
                   { className: "manager-rig-stat" },
-                  h("span", null, "Password"),
+                  h("span", null, t("password", "Password")),
                   h("input", {
                     className: "input",
                     type: "password",
@@ -393,7 +580,7 @@ export function ManagerDashboardPage({
                 h(
                   "label",
                   { className: "manager-rig-stat" },
-                  h("span", null, "Truck type"),
+                  h("span", null, t("truckType", "Truck type")),
                   h(
                     "select",
                     {
@@ -414,14 +601,14 @@ export function ManagerDashboardPage({
                 h(
                   "div",
                   { className: "manager-resource-form-actions" },
-                  h(Button, { type: "submit", children: "Create Driver" }),
+                  h(Button, { type: "submit", children: t("createDriver", "Create Driver") }),
                 ),
               )
             : null,
           h(
             "div",
             { className: "manager-resource-section" },
-            h("div", { className: "section-heading" }, h("h3", null, "Drivers"), h("span", { className: "section-pill" }, `${drivers.length} accounts`)),
+            h("div", { className: "section-heading" }, h("h3", null, t("drivers", "Drivers")), h("span", { className: "section-pill" }, `${drivers.length} ${t("accounts", "accounts")}`)),
             drivers.length
               ? h(
                   "div",
@@ -445,8 +632,8 @@ export function ManagerDashboardPage({
                       h(
                         "div",
                         { className: "manager-resource-metrics" },
-                        h("div", { className: "manager-rig-stat" }, h("span", null, "Driver truck"), h("strong", null, driver.linkedTruck?.type || driver.truckType)),
-                        h("div", { className: "manager-rig-stat" }, h("span", null, "Task object"), h("strong", null, driver.status === "Assigned" ? "Live task" : "Waiting")),
+                        h("div", { className: "manager-rig-stat" }, h("span", null, t("driverTruck", "Driver truck")), h("strong", null, driver.linkedTruck?.type || driver.truckType)),
+                        h("div", { className: "manager-rig-stat" }, h("span", null, t("taskObject", "Task object")), h("strong", null, driver.status === "Assigned" ? t("liveTask", "Live task") : t("waiting", "Waiting"))),
                       ),
                       h(
                         "div",
@@ -456,18 +643,18 @@ export function ManagerDashboardPage({
                           variant: "ghost",
                           size: "sm",
                           onClick: () => handleRemoveDriver(driver.id),
-                          children: "Remove",
+                          children: t("remove", "Remove"),
                         }),
                       ),
                     ),
                   ),
                 )
-              : h("p", { className: "muted-copy" }, "No driver accounts yet."),
+              : h("p", { className: "muted-copy" }, t("noDriverAccountsYet", "No driver accounts yet.")),
           ),
         ),
         h(
           CollapsibleSection,
-          { title: "Moves", pill: `${stats.activeMoves} active`, defaultOpen: true },
+          { title: t("moves", "Moves"), pill: `${stats.activeMoves} ${t("active", "active")}`, defaultOpen: true },
           groupedForemen.length
             ? groupedForemen.map((group) =>
                 h(ForemanMoveList, {

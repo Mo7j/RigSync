@@ -6,6 +6,7 @@ import { ProgressBar } from "../components/ui/ProgressBar.js";
 import { Field, TextInput } from "../components/ui/Field.js";
 import { Modal } from "../components/ui/Modal.js";
 import { formatLocationLabel, formatMinutes } from "../lib/format.js";
+import { translate } from "../lib/language.js";
 import { buildScenarioPlans } from "../features/rigMoves/simulation.js";
 import { buildOperatingSnapshot, buildStartupTransferSchedule } from "../features/rigMoves/operations.js";
 import { persistMoveSession } from "../features/rigMoves/storage.js";
@@ -101,7 +102,11 @@ function normalizeTruckSetup(move, availableFleet = []) {
 
   source.forEach((item, index) => {
     const type = normalizeTruckTypeLabel(item.type);
-    configuredByType.set(normalizeTruckTypeKey(type), {
+    const typeKey = normalizeTruckTypeKey(type);
+    if (!typeKey || type === "Truck") {
+      return;
+    }
+    configuredByType.set(typeKey, {
       id: item.id || `truck-${index + 1}`,
       type,
       count: String(Math.max(0, Number.parseInt(item.count, 10) || 0)),
@@ -2991,7 +2996,10 @@ export function RigMovePage({
   executionAssignments = [],
   teamMoves = [],
   startupRequirements = [],
+  language = "en",
+  onToggleLanguage,
 }) {
+  const t = (key, fallback) => translate(language, key, fallback);
   const previousMoveIdRef = useRef(move?.id || null);
   const speedDropdownRef = useRef(null);
   const [hasSceneInitialized, setHasSceneInitialized] = useState(Boolean(sceneAssetsReady));
@@ -3001,9 +3009,9 @@ export function RigMovePage({
   const [activeScenarioName, setActiveScenarioName] = useState(move?.simulation?.preferredScenarioName || "");
   const [activePlanKey, setActivePlanKey] = useState(move?.simulation?.preferredScenarioName || "");
   const [activeView, setActiveView] = useState(move?.activeView || "map");
-  const [sceneMode, setSceneMode] = useState(move?.sceneMode || "2d");
+  const [sceneMode, setSceneMode] = useState(move?.sceneMode || "3d");
   const [previousSceneMode, setPreviousSceneMode] = useState(
-    move?.previousSceneMode || (move?.sceneMode === "2d" || move?.sceneMode === "3d" ? move.sceneMode : "2d"),
+    move?.previousSceneMode || (move?.sceneMode === "2d" || move?.sceneMode === "3d" ? move.sceneMode : "3d"),
   );
   const [activeStageKey, setActiveStageKey] = useState(
     executionState === "completed" ? "operations" : executionState === "active" ? "execution" : "planning",
@@ -3108,9 +3116,9 @@ export function RigMovePage({
     });
     if (isNewMove) {
       setActiveView(move?.activeView || "map");
-      setSceneMode(move?.sceneMode || "2d");
+      setSceneMode(move?.sceneMode || "3d");
       setPreviousSceneMode(
-        move?.previousSceneMode || (move?.sceneMode === "2d" || move?.sceneMode === "3d" ? move.sceneMode : "2d"),
+        move?.previousSceneMode || (move?.sceneMode === "2d" || move?.sceneMode === "3d" ? move.sceneMode : "3d"),
       );
       setTimelineZoom(move?.timelineZoom || 0.5);
       setTimelineRowType(move?.timelineRowType || "cpm");
@@ -3398,6 +3406,8 @@ export function RigMovePage({
         subtitle: `${formatLocationLabel(move.startLabel, "Source")} -> ${formatLocationLabel(move.endLabel, "Destination")}`,
         currentUser,
         onLogout,
+        language,
+        onToggleLanguage,
         fullBleed: true,
       },
       h(
@@ -3662,6 +3672,8 @@ export function RigMovePage({
         currentUser,
         onLogout,
         onBack,
+        language,
+        onToggleLanguage,
       },
       h(Card, { className: "empty-state" }, h("h2", null, "Loading move"), h("p", { className: "muted-copy" }, "Rebuilding the scene after refresh.")),
     );
@@ -3676,6 +3688,8 @@ export function RigMovePage({
         currentUser,
         onLogout,
         onBack,
+        language,
+        onToggleLanguage,
       },
       h(Card, { className: "empty-state" }, h("h2", null, "Move unavailable"), h("p", { className: "muted-copy" }, "Return to the dashboard and choose another rig move.")),
     );
@@ -3690,6 +3704,8 @@ export function RigMovePage({
         currentUser,
         onLogout,
         onBack,
+        language,
+        onToggleLanguage,
         fullBleed: true,
       },
       h(
@@ -4325,7 +4341,7 @@ export function RigMovePage({
                 ),
               ),
             )
-          : !isTimelineMode && (isPlaybackRunning || isPlaybackPaused)
+          : !isTimelineMode && (isPlaybackRunning || isPlaybackPaused) && !isPlanningStage
           ? h(
               "div",
               { className: "scene-top-info-strip" },
@@ -4343,8 +4359,8 @@ export function RigMovePage({
                 h(
                   "div",
                   { className: "scene-plan-summary-card scene-plan-summary-card-title" },
-                  h("span", { className: "scene-panel-kicker" }, "Execution Tracking"),
-                  h("strong", { className: "scene-plan-summary-title" }, isPlaybackPaused ? "Paused vs Plan" : "Actual vs Planned"),
+                  h("span", { className: "scene-panel-kicker" }, t("executionTracking", "Execution Tracking")),
+                  h("strong", { className: "scene-plan-summary-title" }, isPlaybackPaused ? t("pausedVsPlan", "Paused vs Plan") : t("actualVsPlanned", "Actual vs Planned")),
                 ),
                 h(
                   "div",
@@ -4371,7 +4387,7 @@ export function RigMovePage({
                 h(
                   "div",
                   { className: "scene-dashboard-pair" },
-                  h("div", { className: "scene-dashboard-inline scene-dashboard-pair-item" }, h("span", { className: "scene-dashboard-label" }, "Drivers Assigned"), h("strong", null, String(executionAssignmentMetrics.driverCount))),
+                  h("div", { className: "scene-dashboard-inline scene-dashboard-pair-item" }, h("span", { className: "scene-dashboard-label" }, t("driversAssigned", "Drivers Assigned")), h("strong", null, String(executionAssignmentMetrics.driverCount))),
                   h("div", { className: "scene-dashboard-inline scene-dashboard-pair-item" }, h("span", { className: "scene-dashboard-label" }, "Stage Tasks Done"), h("strong", null, `${actualTasksDone}/${executionAssignmentMetrics.totalStageTasks}`)),
                 ),
                 h(
@@ -4396,7 +4412,7 @@ export function RigMovePage({
               h(
                 "div",
                 { className: "scene-plan-kpis" },
-                h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Time Passed"), h("strong", null, renderElapsedTimeValue(executionVisibleMinute))),
+                h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, t("timePassed", "Time Passed")), h("strong", null, renderElapsedTimeValue(executionVisibleMinute))),
                 h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Completion"), h("strong", null, `${actualCompletionPercent}%`)),
                 h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Plan By Now"), h("strong", null, `${plannedCompletionPercent}%`)),
                 h("div", { className: "scene-dashboard-stack-item" }, h("span", { className: "scene-dashboard-label" }, "Next Task"), h("strong", null, nextExecutionTaskLabel), h("p", { className: "scene-dashboard-copy" }, `${executionPaceLabel} • variance ${completionVarianceLabel}`)),
@@ -4407,32 +4423,32 @@ export function RigMovePage({
                 h(
                   "div",
                   { className: "scene-plan-summary-card scene-plan-summary-card-title" },
-                  h("span", { className: "scene-panel-kicker" }, "Execution Tracking"),
-                  h("strong", { className: "scene-plan-summary-title" }, "Actual vs Planned"),
+                  h("span", { className: "scene-panel-kicker" }, t("executionTracking", "Execution Tracking")),
+                  h("strong", { className: "scene-plan-summary-title" }, t("actualVsPlanned", "Actual vs Planned")),
                 ),
                 h(
                   "div",
                   { className: "scene-dashboard-pair" },
-                  h("div", { className: "scene-dashboard-inline scene-dashboard-pair-item" }, h("span", { className: "scene-dashboard-label" }, "Ahead / Behind"), h("strong", null, completionVarianceLabel)),
-                  h("div", { className: "scene-dashboard-inline scene-dashboard-pair-item" }, h("span", { className: "scene-dashboard-label" }, "Time Left"), h("strong", null, timeLeftLabel)),
+                  h("div", { className: "scene-dashboard-inline scene-dashboard-pair-item" }, h("span", { className: "scene-dashboard-label" }, t("aheadBehind", "Ahead / Behind")), h("strong", null, completionVarianceLabel)),
+                  h("div", { className: "scene-dashboard-inline scene-dashboard-pair-item" }, h("span", { className: "scene-dashboard-label" }, t("timeLeft", "Time Left")), h("strong", null, timeLeftLabel)),
                 ),
                 h(
                   "div",
                   { className: "scene-dashboard-pair" },
-                  h("div", { className: "scene-dashboard-inline scene-dashboard-pair-item" }, h("span", { className: "scene-dashboard-label" }, "Drivers Assigned"), h("strong", null, String(executionAssignmentMetrics.driverCount))),
-                  h("div", { className: "scene-dashboard-inline scene-dashboard-pair-item" }, h("span", { className: "scene-dashboard-label" }, "Tasks Done"), h("strong", null, `${actualTasksDone}/${executionAssignmentMetrics.totalStageTasks}`)),
+                  h("div", { className: "scene-dashboard-inline scene-dashboard-pair-item" }, h("span", { className: "scene-dashboard-label" }, t("driversAssigned", "Drivers Assigned")), h("strong", null, String(executionAssignmentMetrics.driverCount))),
+                  h("div", { className: "scene-dashboard-inline scene-dashboard-pair-item" }, h("span", { className: "scene-dashboard-label" }, t("tasksDone", "Tasks Done")), h("strong", null, `${actualTasksDone}/${executionAssignmentMetrics.totalStageTasks}`)),
                 ),
                 h(
                   "div",
                   { className: "scene-dashboard-pair" },
-                  h("div", { className: "scene-dashboard-inline scene-dashboard-pair-item" }, h("span", { className: "scene-dashboard-label" }, "Rig Down"), h("strong", null, `${executionAssignmentMetrics.stagePercents.down}% / ${Math.round(phases.down)}%`)),
-                  h("div", { className: "scene-dashboard-inline scene-dashboard-pair-item" }, h("span", { className: "scene-dashboard-label" }, "Move"), h("strong", null, `${executionAssignmentMetrics.stagePercents.move}% / ${Math.round(phases.move)}%`)),
+                  h("div", { className: "scene-dashboard-inline scene-dashboard-pair-item" }, h("span", { className: "scene-dashboard-label" }, t("rigDown", "Rig Down")), h("strong", null, `${executionAssignmentMetrics.stagePercents.down}% / ${Math.round(phases.down)}%`)),
+                  h("div", { className: "scene-dashboard-inline scene-dashboard-pair-item" }, h("span", { className: "scene-dashboard-label" }, t("move", "Move")), h("strong", null, `${executionAssignmentMetrics.stagePercents.move}% / ${Math.round(phases.move)}%`)),
                 ),
                 h(
                   "div",
                   { className: "scene-dashboard-pair" },
-                  h("div", { className: "scene-dashboard-inline scene-dashboard-pair-item" }, h("span", { className: "scene-dashboard-label" }, "Rig Up"), h("strong", null, `${executionAssignmentMetrics.stagePercents.up}% / ${Math.round(phases.up)}%`)),
-                  h("div", { className: "scene-dashboard-inline scene-dashboard-pair-item" }, h("span", { className: "scene-dashboard-label" }, "Planned Tasks"), h("strong", null, String(plannedTasksByNow))),
+                  h("div", { className: "scene-dashboard-inline scene-dashboard-pair-item" }, h("span", { className: "scene-dashboard-label" }, t("rigUp", "Rig Up")), h("strong", null, `${executionAssignmentMetrics.stagePercents.up}% / ${Math.round(phases.up)}%`)),
+                  h("div", { className: "scene-dashboard-inline scene-dashboard-pair-item" }, h("span", { className: "scene-dashboard-label" }, t("plannedTasks", "Planned Tasks")), h("strong", null, String(plannedTasksByNow))),
                 ),
               ),
             )
@@ -4442,6 +4458,9 @@ export function RigMovePage({
               h(
                 "div",
                 { className: "scene-plan-kpis" },
+                h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, t("rigDown", "Rig Down")), h("strong", null, `${Math.round(phases.down)}%`)),
+                h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, t("move", "Move")), h("strong", null, `${Math.round(phases.move)}%`)),
+                h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, t("rigUp", "Rig Up")), h("strong", null, `${Math.round(phases.up)}%`)),
                 h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "ETA"), h("strong", null, planEtaLabel)),
               ),
               h(
@@ -4450,26 +4469,32 @@ export function RigMovePage({
                 h(
                   "div",
                   { className: "scene-plan-summary-card scene-plan-summary-card-title" },
-                  h("span", { className: "scene-panel-kicker" }, "Execution Plan"),
-                  h("strong", { className: "scene-plan-summary-title" }, isCustomizeActive ? "Custom Execution Plan" : "Plan Overview"),
+                  h("span", { className: "scene-panel-kicker" }, t("executionPlan", "Execution Plan")),
+                  h("strong", { className: "scene-plan-summary-title" }, isCustomizeActive ? t("customExecutionPlan", "Custom Execution Plan") : t("planOverview", "Plan Overview")),
                 ),
                 h(
                   "div",
                   { className: "scene-dashboard-pair" },
-                  h("div", { className: "scene-dashboard-inline scene-dashboard-pair-item" }, h("span", { className: "scene-dashboard-label" }, "Total Time"), h("strong", null, formatDaysHours(activePlanSummary.totalMinutes))),
-                  h("div", { className: "scene-dashboard-inline scene-dashboard-pair-item" }, h("span", { className: "scene-dashboard-label" }, "Round Trips"), h("strong", null, String(activePlanSummary.roundTrips))),
+                  h("div", { className: "scene-dashboard-inline scene-dashboard-pair-item" }, h("span", { className: "scene-dashboard-label" }, t("totalTime", "Total Time")), h("strong", null, formatDaysHours(activePlanSummary.totalMinutes))),
+                  h("div", { className: "scene-dashboard-inline scene-dashboard-pair-item" }, h("span", { className: "scene-dashboard-label" }, t("roundTrips", "Round Trips")), h("strong", null, String(activePlanSummary.roundTrips))),
                 ),
                 h(
                   "div",
                   { className: "scene-dashboard-pair" },
-                  h("div", { className: "scene-dashboard-inline scene-dashboard-pair-item" }, h("span", { className: "scene-dashboard-label" }, "Plan Cost"), h("strong", null, activePlanDashboard.costEstimate)),
-                  h("div", { className: "scene-dashboard-inline scene-dashboard-pair-item" }, h("span", { className: "scene-dashboard-label" }, "Critical Path"), h("strong", null, `${activePlanDashboard.criticalPathHours}h`)),
+                  h("div", { className: "scene-dashboard-inline scene-dashboard-pair-item" }, h("span", { className: "scene-dashboard-label" }, t("planCost", "Plan Cost")), h("strong", null, activePlanDashboard.costEstimate)),
+                  h("div", { className: "scene-dashboard-inline scene-dashboard-pair-item" }, h("span", { className: "scene-dashboard-label" }, t("criticalPath", "Critical Path")), h("strong", null, `${activePlanDashboard.criticalPathHours}h`)),
                 ),
                 h(
                   "div",
                   { className: "scene-dashboard-pair" },
-                  h("div", { className: "scene-dashboard-inline scene-dashboard-pair-item" }, h("span", { className: "scene-dashboard-label" }, "Utilization"), h("strong", null, activePlanDashboard.utilization)),
-                  h("div", { className: "scene-dashboard-inline scene-dashboard-pair-item" }, h("span", { className: "scene-dashboard-label" }, "Truck Utilization"), h("strong", null, activePlanDashboard.truckUtilization)),
+                  h("div", { className: "scene-dashboard-inline scene-dashboard-pair-item" }, h("span", { className: "scene-dashboard-label" }, t("rigDown", "Rig Down")), h("strong", null, `${Math.round(phases.down)}%`)),
+                  h("div", { className: "scene-dashboard-inline scene-dashboard-pair-item" }, h("span", { className: "scene-dashboard-label" }, t("move", "Move")), h("strong", null, `${Math.round(phases.move)}%`)),
+                ),
+                h(
+                  "div",
+                  { className: "scene-dashboard-pair" },
+                  h("div", { className: "scene-dashboard-inline scene-dashboard-pair-item" }, h("span", { className: "scene-dashboard-label" }, t("rigUp", "Rig Up")), h("strong", null, `${Math.round(phases.up)}%`)),
+                  h("div", { className: "scene-dashboard-inline scene-dashboard-pair-item" }, h("span", { className: "scene-dashboard-label" }, "Preview"), h("strong", null, isPlaybackRunning || isPlaybackPaused ? "Running" : "Ready")),
                 ),
                 null,
               ),
@@ -4520,6 +4545,8 @@ export function RigMovePage({
           currentUser,
           onLogout,
           onBack,
+          language,
+          onToggleLanguage,
           fullBleed: true,
         },
         h(
