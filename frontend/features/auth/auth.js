@@ -2,6 +2,7 @@ import { AUTH_STORAGE_KEY } from "../../lib/constants.js";
 import {
   FIREBASE_USER_ROLES,
   createFirebaseUserAccount,
+  ensureSeedUsers,
   getUserProfileById,
   signInFirebaseUser,
   upsertUserProfile,
@@ -99,16 +100,7 @@ export async function authenticateUser(email, password) {
   );
 
   if (staticUser) {
-    await upsertUserProfile({
-      id: staticUser.id,
-      role: staticUser.role,
-      name: staticUser.name,
-      email: staticUser.email,
-      managerId: staticUser.managerId || null,
-      teamForemanIds: staticUser.teamForemanIds || [],
-      assignedRig: staticUser.assignedRig || null,
-      active: true,
-    });
+    await ensureSeedUsers(TEST_USERS);
 
     return buildSessionFromUser(staticUser);
   }
@@ -149,6 +141,29 @@ export async function createDriverAccount({ name, email, password, managerId, tr
     managerId,
     truckId: truckId || null,
     truckType: truckType || null,
+  };
+}
+
+export async function createForemanAccount({ name, email, password, managerId, assignedRig = null }) {
+  const result = await createFirebaseUserAccount({
+    email,
+    password,
+    profile: {
+      name,
+      role: FIREBASE_USER_ROLES.foreman,
+      managerId,
+      assignedRig,
+      active: true,
+    },
+  });
+
+  return {
+    id: result.uid,
+    name,
+    email: String(email || "").trim().toLowerCase(),
+    role: FIREBASE_USER_ROLES.foreman,
+    managerId,
+    assignedRig,
   };
 }
 

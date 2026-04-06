@@ -1,0 +1,10 @@
+end date
+trucks speed factor
+trucks cost factor
+calculate the maximum number of required hauling equipment 
+User input to provide planned date of completion
+ETC vs Planned date of completion
+Estimated start date vs planned start date
+define the avarege ??
+weight and dimension factor to caclculate the most optimum
+idle time or lost time in transportation vs dismanteling

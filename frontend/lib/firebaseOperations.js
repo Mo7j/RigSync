@@ -169,6 +169,22 @@ export async function getUserProfileByEmail(email) {
   return snapshot.docs.length ? normalizeDocSnapshot(snapshot.docs[0]) : null;
 }
 
+export function subscribeManagedForemen(managerId, callback) {
+  if (!managerId) {
+    callback([]);
+    return () => {};
+  }
+
+  const ref = query(collection(firebaseDb, FIRESTORE_COLLECTIONS.users), where("managerId", "==", managerId));
+  return onSnapshot(ref, (snapshot) => {
+    callback(
+      snapshot.docs
+        .map(normalizeDocSnapshot)
+        .filter((user) => user && user.role === FIREBASE_USER_ROLES.foreman),
+    );
+  });
+}
+
 export async function upsertUserProfile(user) {
   const payload = {
     ...user,

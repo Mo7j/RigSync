@@ -26,6 +26,7 @@ export function AppLayout({
   language = "en",
   onToggleLanguage,
   fullBleed = false,
+  hideHeader = false,
   background = null,
   className = "",
   children,
@@ -38,73 +39,75 @@ export function AppLayout({
     h(
       "section",
       { className: `app-frame${fullBleed ? " app-frame-bleed" : ""}${background ? " app-frame-has-background" : ""}` },
-      h(
-        "header",
-        { className: "app-header" },
-        h(
-          "div",
-          { className: "app-brand-cluster" },
-          onBack
-            ? h(
-                Button,
-                {
-                  type: "button",
-                  variant: "ghost",
-                  size: "sm",
-                  className: "back-button",
-                  onClick: onBack,
-                  children: translate(language, "back", "Back"),
-                },
-              )
-            : null,
-          h(
-            "div",
-            null,
-            h("p", { className: "eyebrow" }, translate(language, "workspace", "RigSync Workspace")),
-            h("h1", { className: "app-title" }, title),
-            subtitle ? h("p", { className: "muted-copy" }, subtitle) : null,
-          ),
-        ),
-        h(
-          "div",
-          { className: "app-header-actions" },
-          h(
-            "div",
-            { className: "user-badge" },
-            h("span", { className: "user-badge-dot" }),
+      hideHeader
+        ? null
+        : h(
+            "header",
+            { className: "app-header" },
             h(
               "div",
-              null,
-              h("span", null, currentUser?.role || "Control room"),
+              { className: "app-brand-cluster" },
+              onBack
+                ? h(
+                    Button,
+                    {
+                      type: "button",
+                      variant: "ghost",
+                      size: "sm",
+                      className: "back-button",
+                      onClick: onBack,
+                      children: translate(language, "back", "Back"),
+                    },
+                  )
+                : null,
+              h(
+                "div",
+                null,
+                h("p", { className: "eyebrow" }, translate(language, "workspace", "RigSync Workspace")),
+                h("h1", { className: "app-title" }, title),
+                subtitle ? h("p", { className: "muted-copy" }, subtitle) : null,
+              ),
+            ),
+            h(
+              "div",
+              { className: "app-header-actions" },
+              h(
+                "div",
+                { className: "user-badge" },
+                h("span", { className: "user-badge-dot" }),
+                h(
+                  "div",
+                  null,
+                  h("span", null, currentUser?.role || "Control room"),
+                ),
+              ),
+              h(Button, {
+                type: "button",
+                variant: "ghost",
+                size: "sm",
+                className: "header-ghost-button",
+                onClick: onToggleLanguage,
+                children: translate(language, "langToggle", "AR"),
+              }),
+              h(
+                "button",
+                {
+                  type: "button",
+                  className: "icon-button settings-button",
+                  "aria-label": translate(language, "settings", "Settings"),
+                },
+                h(SettingsGlyph),
+              ),
+              h(Button, {
+                type: "button",
+                variant: "ghost",
+                size: "sm",
+                className: "header-ghost-button",
+                onClick: onLogout,
+                children: translate(language, "logout", "Logout"),
+              }),
             ),
           ),
-          h(Button, {
-            type: "button",
-            variant: "ghost",
-            size: "sm",
-            className: "header-ghost-button",
-            onClick: onToggleLanguage,
-            children: translate(language, "langToggle", "AR"),
-          }),
-          h(
-            "button",
-            {
-              type: "button",
-              className: "icon-button settings-button",
-              "aria-label": translate(language, "settings", "Settings"),
-            },
-            h(SettingsGlyph),
-          ),
-          h(Button, {
-            type: "button",
-            variant: "ghost",
-            size: "sm",
-            className: "header-ghost-button",
-            onClick: onLogout,
-            children: translate(language, "logout", "Logout"),
-          }),
-        ),
-      ),
       children,
     ),
   );

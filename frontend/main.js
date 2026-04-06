@@ -10,11 +10,11 @@ import { applyRigInventoryAdjustments, hydrateRigInventoryAdjustments, readRigIn
 import {
   authenticateUser,
   createDriverAccount,
+  createForemanAccount,
   createSession,
   getSession,
   refreshSession,
   clearSession,
-  getManagedForemen,
 } from "./features/auth/auth.js";
 import {
   readMoves,
@@ -35,7 +35,7 @@ import {
   getAvailabilityValidationError,
   sumTruckCounts,
 } from "./features/resources/storage.js";
-import { subscribeManagerMoves, subscribeManagerResources, subscribeRigInventoryDoc } from "./lib/firebaseOperations.js";
+import { subscribeManagedForemen, subscribeManagerMoves, subscribeManagerResources, subscribeRigInventoryDoc } from "./lib/firebaseOperations.js";
 import { HomePage } from "./pages/HomePage.js";
 import { LoginPage } from "./pages/LoginPage.js";
 import { DashboardPage } from "./pages/DashboardPage.js";
@@ -464,6 +464,7 @@ function App() {
     drivers: [],
     taskAssignments: [],
   });
+  const [managedForemen, setManagedForemen] = useState([]);
   const [managerFleet, setManagerFleet] = useState([]);
   const [isSimulatingMove, setIsSimulatingMove] = useState(false);
   const [simulationProgress, setSimulationProgress] = useState(
@@ -678,7 +679,7 @@ function App() {
   const visibleMoves = session?.role === "Foreman"
     ? moves.filter((move) => move?.createdBy?.id === session.id)
     : session?.role === "Manager"
-      ? moves.filter((move) => move && session.teamForemanIds?.includes(move.createdBy?.id))
+      ? managerScopedMoves
       : moves.filter(Boolean);
   const activeMove =
     route.page === "move"
@@ -732,6 +733,7 @@ function App() {
     if (!managerId) {
       setMoves([]);
       setManagerResources({ fleet: [], trucks: [], drivers: [], taskAssignments: [] });
+      setManagedForemen([]);
       setManagerFleet([]);
       setAreMovesHydrated(true);
       return undefined;
@@ -757,6 +759,17 @@ function App() {
       unsubscribeResources?.();
     };
   }, [managerId, session?.role]);
+
+  useEffect(() => {
+    if (!managerId) {
+      setManagedForemen([]);
+      return undefined;
+    }
+
+    return subscribeManagedForemen(managerId, (nextForemen) => {
+      setManagedForemen(nextForemen || []);
+    });
+  }, [managerId]);
 
   useEffect(() => {
     if (!managerId || !activeMove || activeMove.executionState !== "active") {
@@ -1849,6 +1862,26 @@ function App() {
     return createdDriver;
   }
 
+  async function handleCreateManagerForemanAccount(foremanPayload) {
+    if (!managerId) {
+      return null;
+    }
+
+    const createdForeman = await createForemanAccount({
+      ...foremanPayload,
+      managerId,
+    });
+
+    setManagedForemen((current) => {
+      if (current.some((foreman) => foreman.id === createdForeman.id)) {
+        return current;
+      }
+      return [...current, createdForeman];
+    });
+
+    return createdForeman;
+  }
+
   async function handleSaveRigInventory(rigId, adjustments) {
     if (!rigId) {
       return;
@@ -1997,13 +2030,14 @@ function App() {
     if (session.role === "Manager") {
       return h(ManagerDashboardPage, {
         moves: visibleMoves,
-        foremen: getManagedForemen(session.id),
+        foremen: managedForemen,
         managerResources,
         managerFleet,
         currentUser: session,
         currentDate: new Date(),
         onOpenMove: handleOpenMove,
         onCreateDriver: handleCreateManagerDriverAccount,
+        onCreateForeman: handleCreateManagerForemanAccount,
         onSaveResources: handleSaveManagerResources,
         onSaveFleet: handleSaveManagerFleet,
         onLogout: handleLogout,
@@ -2050,13 +2084,14 @@ function App() {
     if (session.role === "Manager") {
       return h(ManagerDashboardPage, {
         moves: visibleMoves,
-        foremen: getManagedForemen(session.id),
+        foremen: managedForemen,
         managerResources,
         managerFleet,
         currentUser: session,
         currentDate: new Date(),
         onOpenMove: handleOpenMove,
         onCreateDriver: handleCreateManagerDriverAccount,
+        onCreateForeman: handleCreateManagerForemanAccount,
         onSaveResources: handleSaveManagerResources,
         onSaveFleet: handleSaveManagerFleet,
         onLogout: handleLogout,

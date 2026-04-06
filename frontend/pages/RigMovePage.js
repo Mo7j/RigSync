@@ -4448,7 +4448,13 @@ export function RigMovePage({
                   "div",
                   { className: "scene-dashboard-pair" },
                   h("div", { className: "scene-dashboard-inline scene-dashboard-pair-item" }, h("span", { className: "scene-dashboard-label" }, t("rigUp", "Rig Up")), h("strong", null, `${executionAssignmentMetrics.stagePercents.up}% / ${Math.round(phases.up)}%`)),
+                  h("div", { className: "scene-dashboard-inline scene-dashboard-pair-item" }, h("span", { className: "scene-dashboard-label" }, "Support Readiness"), h("strong", null, `${drillingReadinessPercent}%`)),
+                ),
+                h(
+                  "div",
+                  { className: "scene-dashboard-pair" },
                   h("div", { className: "scene-dashboard-inline scene-dashboard-pair-item" }, h("span", { className: "scene-dashboard-label" }, t("plannedTasks", "Planned Tasks")), h("strong", null, String(plannedTasksByNow))),
+                  h("div", { className: "scene-dashboard-inline scene-dashboard-pair-item" }, h("span", { className: "scene-dashboard-label" }, "Missing Resources"), h("strong", null, String(operatingSnapshot.startupSummary.missingUnits))),
                 ),
               ),
             )
@@ -4494,7 +4500,13 @@ export function RigMovePage({
                   "div",
                   { className: "scene-dashboard-pair" },
                   h("div", { className: "scene-dashboard-inline scene-dashboard-pair-item" }, h("span", { className: "scene-dashboard-label" }, t("rigUp", "Rig Up")), h("strong", null, `${Math.round(phases.up)}%`)),
-                  h("div", { className: "scene-dashboard-inline scene-dashboard-pair-item" }, h("span", { className: "scene-dashboard-label" }, "Preview"), h("strong", null, isPlaybackRunning || isPlaybackPaused ? "Running" : "Ready")),
+                  h("div", { className: "scene-dashboard-inline scene-dashboard-pair-item" }, h("span", { className: "scene-dashboard-label" }, "Support Readiness"), h("strong", null, `${drillingReadinessPercent}%`)),
+                ),
+                h(
+                  "div",
+                  { className: "scene-dashboard-pair" },
+                  h("div", { className: "scene-dashboard-inline scene-dashboard-pair-item" }, h("span", { className: "scene-dashboard-label" }, "Missing Resources"), h("strong", null, String(operatingSnapshot.startupSummary.missingUnits))),
+                  h("div", { className: "scene-dashboard-inline scene-dashboard-pair-item" }, h("span", { className: "scene-dashboard-label" }, "Sourced Support"), h("strong", null, `${operatingSnapshot.startupSummary.coveredUnits}/${operatingSnapshot.startupSummary.totalUnits}`)),
                 ),
                 null,
               ),

@@ -13,7 +13,7 @@ function roundCoordinate(value) {
   return Math.round(value * 100000) / 100000;
 }
 
-function compactGeometry(geometry, maxPoints = 240) {
+function compactGeometry(geometry, maxPoints = 120) {
   if (!Array.isArray(geometry) || geometry.length <= maxPoints) {
     return geometry;
   }
@@ -70,9 +70,9 @@ function compactPlayback(playback) {
       destinationLabel: trip.destinationLabel || null,
       dispatchStart: trip.dispatchStart ?? trip.loadStart,
       pickupRouteMinutes: trip.pickupRouteMinutes || null,
-      pickupRouteGeometry: compactGeometry(trip.pickupRouteGeometry || []),
+      pickupRouteGeometry: [],
       routeMinutes: trip.routeMinutes || null,
-      routeGeometry: compactGeometry(trip.routeGeometry || []),
+      routeGeometry: compactGeometry(trip.routeGeometry || [], 48),
       moveStart: trip.moveStart ?? null,
       loadStart: trip.loadStart,
       rigDownStart: trip.rigDownStart ?? trip.loadStart,
@@ -198,10 +198,10 @@ function compactSimulation(simulation) {
       destinationLabel: route.destinationLabel,
       truckLabel: route.truckLabel,
       routeSource: route.routeSource || "",
-      geometry: compactGeometry(route.geometry || []),
+      geometry: compactGeometry(route.geometry || [], 32),
       routeMinutes: route.routeMinutes || null,
       routeDistanceKm: route.routeDistanceKm || null,
-      pickupGeometry: compactGeometry(route.pickupGeometry || []),
+      pickupGeometry: compactGeometry(route.pickupGeometry || [], 24),
       pickupRouteSource: route.pickupRouteSource || "",
       pickupRouteMinutes: route.pickupRouteMinutes || null,
       pickupRouteDistanceKm: route.pickupRouteDistanceKm || null,

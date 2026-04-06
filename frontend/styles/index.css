@@ -1203,6 +1203,10 @@ p {
   padding: 0;
 }
 
+.app-shell.manager-viewall-layout {
+  padding: 0;
+}
+
 .app-layout-scene-mode .app-frame-has-background {
   pointer-events: none;
 }

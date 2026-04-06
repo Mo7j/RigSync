@@ -2,13 +2,16 @@ import { React, h } from "../lib/react.js";
 import { AppLayout } from "../layouts/AppLayout.js";
 import { Button } from "../components/ui/Button.js";
 import { Card, StatCard } from "../components/ui/Card.js";
+import { Modal } from "../components/ui/Modal.js";
 import { ProgressBar } from "../components/ui/ProgressBar.js";
+import { LeafletMap } from "../components/map/LeafletMap.js";
 import { ManagerRigsMap } from "../components/map/ManagerRigsMap.js";
-import { formatDate, formatLocationLabel } from "../lib/format.js";
+import { formatCoordinate, formatDate, formatLocationLabel } from "../lib/format.js";
 import { buildFleetAvailability } from "../features/resources/storage.js";
+import { fetchLocationLabel } from "../features/rigMoves/api.js";
 import { translate } from "../lib/language.js";
 
-const { useMemo, useState } = React;
+const { useMemo, useRef, useState } = React;
 
 function getMoveStatus(move) {
   if (move?.operatingState === "drilling") {
@@ -139,6 +142,12 @@ function formatSceneStatus(move) {
   return "Planning";
 }
 
+function getLatestForemanMove(moves, foremanId) {
+  return [...(moves || [])]
+    .filter((move) => move?.createdBy?.id === foremanId)
+    .sort((left, right) => new Date(right.updatedAt || right.createdAt || 0) - new Date(left.updatedAt || left.createdAt || 0))[0] || null;
+}
+
 function CollapsibleSection({ title, pill, children, defaultOpen = true }) {
   return h(
     Card,
@@ -222,6 +231,7 @@ export function ManagerDashboardPage({
   managerFleet,
   onOpenMove,
   onCreateDriver,
+  onCreateForeman,
   onSaveResources,
   onLogout,
   language = "en",
@@ -229,6 +239,8 @@ export function ManagerDashboardPage({
 }) {
   const t = (key, fallback) => translate(language, key, fallback);
   const [showDriverForm, setShowDriverForm] = useState(false);
+  const [showForemanForm, setShowForemanForm] = useState(false);
+  const [isForemanLocationPickerOpen, setIsForemanLocationPickerOpen] = useState(false);
   const [isMapOpen, setIsMapOpen] = useState(false);
   const [selectedRigId, setSelectedRigId] = useState(null);
   const [driverDraft, setDriverDraft] = useState({
@@ -237,6 +249,16 @@ export function ManagerDashboardPage({
     password: "",
     truckType: "Heavy Hauler",
   });
+  const [foremanDraft, setForemanDraft] = useState({
+    name: "",
+    email: "",
+    password: "",
+    rigName: "",
+    startLabel: "",
+    latitude: "",
+    longitude: "",
+  });
+  const foremanLocationLookupRequestRef = useRef(0);
 
   const stats = getManagerStats(moves);
   const groupedForemen = foremen
@@ -284,23 +306,34 @@ export function ManagerDashboardPage({
   const truckTypeOptions = [...new Set([...(managerFleet || []).map((truck) => truck.type), ...DRIVER_TRUCK_TYPE_OPTIONS])];
   const rigMapItems = useMemo(
     () =>
-      (moves || []).map((move) => ({
-        id: move.id,
-        name: move.name,
-        startPoint: move.startPoint || null,
-        endPoint: move.endPoint || null,
-        startLabel: formatLocationLabel(move.startLabel, "Source"),
-        endLabel: formatLocationLabel(move.endLabel, "Destination"),
-        routeGeometry: move.simulation?.routeGeometry || [],
-        executionState: move.executionState,
-        operatingState: move.operatingState,
-        completionPercentage: Number(move.completionPercentage) || 0,
-        loadCount: move.loadCount || 0,
-        eta: move.eta || "--",
-        routeTime: move.routeTime || "--",
-        phase: formatSceneStatus(move),
-      })),
-    [moves],
+      (foremen || [])
+        .map((foreman) => {
+          const latestMove = getLatestForemanMove(moves, foreman.id);
+          const assignedRig = foreman.assignedRig || null;
+          const fallbackPoint = assignedRig?.startPoint || null;
+          const fallbackLabel = formatLocationLabel(assignedRig?.startLabel, "Current site");
+
+          return {
+            id: assignedRig?.id || latestMove?.id || foreman.id,
+            foremanId: foreman.id,
+            moveId: latestMove?.id || null,
+            name: assignedRig?.name || latestMove?.name || `${foreman.name} Rig`,
+            startPoint: latestMove?.startPoint || fallbackPoint,
+            endPoint: latestMove?.endPoint || null,
+            startLabel: formatLocationLabel(latestMove?.startLabel, fallbackLabel || "Current site"),
+            endLabel: formatLocationLabel(latestMove?.endLabel, latestMove ? "Destination" : "No planned destination"),
+            routeGeometry: latestMove?.simulation?.routeGeometry || [],
+            executionState: latestMove?.executionState || "idle",
+            operatingState: latestMove?.operatingState || "standby",
+            completionPercentage: Number(latestMove?.completionPercentage) || 0,
+            loadCount: latestMove?.loadCount || 0,
+            eta: latestMove?.eta || "--",
+            routeTime: latestMove?.routeTime || "--",
+            phase: latestMove ? formatSceneStatus(latestMove) : "Idle",
+          };
+        })
+        .filter((item) => item.startPoint || item.endPoint),
+    [foremen, moves],
   );
   const selectedRig = useMemo(() => {
     if (!rigMapItems.length) {
@@ -350,6 +383,84 @@ export function ManagerDashboardPage({
     setShowDriverForm(false);
   }
 
+  async function handleAddForeman(event) {
+    event.preventDefault();
+    const name = foremanDraft.name.trim();
+    const email = foremanDraft.email.trim().toLowerCase();
+    const password = foremanDraft.password.trim();
+    const rigName = foremanDraft.rigName.trim();
+    const startLabel = foremanDraft.startLabel.trim();
+    const latitude = Number.parseFloat(foremanDraft.latitude);
+    const longitude = Number.parseFloat(foremanDraft.longitude);
+    if (!name || !email || !password) {
+      return;
+    }
+
+    const hasExplicitLocation = Number.isFinite(latitude) && Number.isFinite(longitude);
+    const assignedRig = hasExplicitLocation || rigName || startLabel
+      ? {
+          id: `rig-${email.replace(/[^a-z0-9]+/gi, "-").replace(/^-+|-+$/g, "") || "foreman"}`,
+          name: rigName || `${name} Rig`,
+          startLabel: startLabel || (hasExplicitLocation ? `${latitude.toFixed(5)}, ${longitude.toFixed(5)}` : ""),
+          startPoint: hasExplicitLocation ? { lat: latitude, lng: longitude } : null,
+        }
+      : null;
+
+    await onCreateForeman?.({
+      name,
+      email,
+      password,
+      assignedRig,
+    });
+
+    setForemanDraft({
+      name: "",
+      email: "",
+      password: "",
+      rigName: "",
+      startLabel: "",
+      latitude: "",
+      longitude: "",
+    });
+    setShowForemanForm(false);
+  }
+
+  async function resolveForemanLocationLabelWithRetry(point) {
+    const requestId = foremanLocationLookupRequestRef.current + 1;
+    foremanLocationLookupRequestRef.current = requestId;
+    const maxAttempts = 4;
+
+    for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+      try {
+        const resolvedLabel = await fetchLocationLabel(point);
+        if (foremanLocationLookupRequestRef.current !== requestId) {
+          return;
+        }
+        if (resolvedLabel) {
+          setForemanDraft((current) => ({ ...current, startLabel: resolvedLabel }));
+          return;
+        }
+      } catch {
+        // Keep coordinate fallback if lookup fails.
+      }
+
+      if (attempt < maxAttempts - 1) {
+        await new Promise((resolve) => window.setTimeout(resolve, 1200 * (attempt + 1)));
+      }
+    }
+  }
+
+  async function handleForemanMapPick({ point }) {
+    setForemanDraft((current) => ({
+      ...current,
+      latitude: String(point?.lat ?? ""),
+      longitude: String(point?.lng ?? ""),
+      startLabel: formatCoordinate(point),
+    }));
+    setIsForemanLocationPickerOpen(false);
+    void resolveForemanLocationLabelWithRetry(point);
+  }
+
   async function handleRemoveDriver(driverId) {
     await saveResources({
       drivers: (managerResources?.drivers || []).filter((driver) => driver.id !== driverId),
@@ -367,6 +478,8 @@ export function ManagerDashboardPage({
         language,
         onToggleLanguage,
         fullBleed: true,
+        hideHeader: true,
+        className: "app-layout-scene-mode manager-viewall-layout",
       },
       h(
         "section",
@@ -422,7 +535,11 @@ export function ManagerDashboardPage({
           { className: "manager-scene-panel manager-scene-panel-left" },
           h("span", { className: "scene-panel-kicker" }, t("selectedRig", "Selected Rig")),
           h("strong", { className: "manager-scene-title" }, selectedRig?.name || t("noRigSelected", "No rig selected")),
-          h("p", { className: "manager-scene-copy" }, selectedRig ? `${selectedRig.startLabel} to ${selectedRig.endLabel}` : t("noRigSelectedCopy", "Pick a rig on the map to inspect its transfer state.")),
+          h("p", { className: "manager-scene-copy" }, selectedRig
+            ? selectedRig.endPoint
+              ? `${selectedRig.startLabel} to ${selectedRig.endLabel}`
+              : selectedRig.startLabel
+            : t("noRigSelectedCopy", "Pick a rig on the map to inspect its transfer state.")),
           h(
             "div",
             { className: "manager-scene-stat-list" },
@@ -436,10 +553,16 @@ export function ManagerDashboardPage({
             "div",
             { className: "manager-scene-callout" },
             h("span", { className: "scene-panel-kicker" }, t("liveTracking", "Live Tracking")),
-            h("strong", null, selectedRig?.executionState === "active" ? t("transferInMotion", "Transfer in motion") : t("routeReady", "Route ready")),
+            h("strong", null, selectedRig?.executionState === "active"
+              ? t("transferInMotion", "Transfer in motion")
+              : selectedRig?.endPoint
+                ? t("routeReady", "Route ready")
+                : t("rigOnSite", "Rig on site")),
             h("p", { className: "manager-scene-copy" }, selectedRig?.executionState === "active"
               ? t("transferInMotionCopy", "Showing old site, destination, route line, and live completion on the path.")
-              : t("routeReadyCopy", "This rig is not actively transferring right now.")),
+              : selectedRig?.endPoint
+                ? t("routeReadyCopy", "This rig is not actively transferring right now.")
+                : t("rigOnSiteCopy", "This rig is currently parked at its assigned location and has no active move.")),
           ),
         ),
         h(
@@ -515,10 +638,16 @@ export function ManagerDashboardPage({
           h(
             "div",
             { className: "manager-resource-toolbar" },
-            h("p", { className: "muted-copy" }, t("resourcesCopy", "Create driver accounts only. Each driver carries one truck type, and the planner uses that as the truck assigned to the driver.")),
+            h("p", { className: "muted-copy" }, t("resourcesCopy", "Create foreman and driver accounts. Drivers carry one truck type, and the planner uses that as the truck assigned to the driver.")),
             h(
               "div",
               { className: "manager-resource-actions" },
+              h(Button, {
+                type: "button",
+                variant: showForemanForm ? "ghost" : "secondary",
+                onClick: () => setShowForemanForm((value) => !value),
+                children: showForemanForm ? t("closeForeman", "Close Foreman") : t("addForeman", "Add Foreman"),
+              }),
               h(Button, {
                 type: "button",
                 variant: showDriverForm ? "ghost" : "secondary",
@@ -605,6 +734,142 @@ export function ManagerDashboardPage({
                 ),
               )
             : null,
+          showForemanForm
+            ? h(
+                "form",
+                { className: "manager-resource-form", onSubmit: handleAddForeman },
+                h(
+                  "label",
+                  { className: "manager-rig-stat" },
+                  h("span", null, t("foremanName", "Foreman name")),
+                  h("input", {
+                    className: "input",
+                    type: "text",
+                    value: foremanDraft.name,
+                    onInput: (event) => setForemanDraft((current) => ({ ...current, name: event.target.value })),
+                  }),
+                ),
+                h(
+                  "label",
+                  { className: "manager-rig-stat" },
+                  h("span", null, t("email", "Email")),
+                  h("input", {
+                    className: "input",
+                    type: "email",
+                    value: foremanDraft.email,
+                    onInput: (event) => setForemanDraft((current) => ({ ...current, email: event.target.value })),
+                  }),
+                ),
+                h(
+                  "label",
+                  { className: "manager-rig-stat" },
+                  h("span", null, t("password", "Password")),
+                  h("input", {
+                    className: "input",
+                    type: "password",
+                    value: foremanDraft.password,
+                    onInput: (event) => setForemanDraft((current) => ({ ...current, password: event.target.value })),
+                  }),
+                ),
+                h(
+                  "label",
+                  { className: "manager-rig-stat" },
+                  h("span", null, t("assignedRig", "Assigned Rig")),
+                  h("input", {
+                    className: "input",
+                    type: "text",
+                    value: foremanDraft.rigName,
+                    onInput: (event) => setForemanDraft((current) => ({ ...current, rigName: event.target.value })),
+                  }),
+                ),
+                h(
+                  "label",
+                  { className: "manager-rig-stat" },
+                  h("span", null, t("currentRigLocation", "Current Rig Location")),
+                  h(
+                    "div",
+                    { className: "manager-resource-actions" },
+                    h("input", {
+                      className: "input",
+                      type: "text",
+                      value: foremanDraft.startLabel,
+                      placeholder: "Click Select to open map",
+                      readOnly: true,
+                    }),
+                    h(Button, {
+                      type: "button",
+                      variant: "ghost",
+                      onClick: () => setIsForemanLocationPickerOpen(true),
+                      children: foremanDraft.latitude && foremanDraft.longitude ? t("change", "Change") : t("select", "Select"),
+                    }),
+                  ),
+                ),
+                h(
+                  "label",
+                  { className: "manager-rig-stat" },
+                  h("span", null, t("latitude", "Latitude")),
+                  h("input", {
+                    className: "input",
+                    type: "number",
+                    step: "any",
+                    value: foremanDraft.latitude,
+                    onInput: (event) => setForemanDraft((current) => ({ ...current, latitude: event.target.value })),
+                  }),
+                ),
+                h(
+                  "label",
+                  { className: "manager-rig-stat" },
+                  h("span", null, t("longitude", "Longitude")),
+                  h("input", {
+                    className: "input",
+                    type: "number",
+                    step: "any",
+                    value: foremanDraft.longitude,
+                    onInput: (event) => setForemanDraft((current) => ({ ...current, longitude: event.target.value })),
+                  }),
+                ),
+                h(
+                  "div",
+                  { className: "manager-resource-form-actions" },
+                  h(Button, { type: "submit", children: t("createForeman", "Create Foreman") }),
+                ),
+              )
+            : null,
+          h(
+            "div",
+            { className: "manager-resource-section" },
+            h("div", { className: "section-heading" }, h("h3", null, t("foremen", "Foremen")), h("span", { className: "section-pill" }, `${foremen.length} ${t("accounts", "accounts")}`)),
+            foremen.length
+              ? h(
+                  "div",
+                  { className: "manager-resource-grid" },
+                  foremen.map((foreman) =>
+                    h(
+                      "article",
+                      { key: foreman.id, className: "manager-resource-card" },
+                      h(
+                        "div",
+                        { className: "manager-resource-card-head" },
+                        h("div", null, h("strong", null, foreman.name), h("p", { className: "muted-copy" }, foreman.email || "--")),
+                        h("span", { className: "manager-resource-status manager-resource-status-available" }, t("active", "Active")),
+                      ),
+                      h(
+                        "div",
+                        { className: "manager-resource-tags" },
+                        h("span", { className: "manager-resource-tag" }, foreman.assignedRig?.name || t("unassigned", "Unassigned")),
+                        h("span", { className: "manager-resource-tag manager-resource-tag-muted" }, t("foreman", "Foreman")),
+                      ),
+                      h(
+                        "div",
+                        { className: "manager-resource-metrics" },
+                        h("div", { className: "manager-rig-stat" }, h("span", null, t("moves", "Moves")), h("strong", null, String(moves.filter((move) => move.createdBy?.id === foreman.id).length))),
+                        h("div", { className: "manager-rig-stat" }, h("span", null, t("assignedRig", "Assigned rig")), h("strong", null, foreman.assignedRig?.name || t("notSet", "Not set"))),
+                      ),
+                    ),
+                  ),
+                )
+              : h("p", { className: "muted-copy" }, t("noForemanAccountsYet", "No foreman accounts yet.")),
+          ),
           h(
             "div",
             { className: "manager-resource-section" },
@@ -673,5 +938,29 @@ export function ManagerDashboardPage({
         ),
       ),
     ),
+    isForemanLocationPickerOpen
+      ? h(
+          Modal,
+          {
+            title: t("selectCurrentRigLocation", "Select current rig location"),
+            description: t("selectCurrentRigLocationCopy", "Click the map to place the foreman's current rig location."),
+            onClose: () => setIsForemanLocationPickerOpen(false),
+            flushBody: true,
+          },
+          h(LeafletMap, {
+            startPoint: null,
+            endPoint:
+              foremanDraft.latitude && foremanDraft.longitude
+                ? {
+                    lat: Number.parseFloat(foremanDraft.latitude),
+                    lng: Number.parseFloat(foremanDraft.longitude),
+                  }
+                : null,
+            pickerTarget: "end",
+            onPickPoint: handleForemanMapPick,
+            heightClass: "map-frame map-frame-modal",
+          }),
+        )
+      : null,
   );
 }
