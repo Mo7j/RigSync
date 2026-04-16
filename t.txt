@@ -8,3 +8,5 @@ Estimated start date vs planned start date
 define the avarege ??
 weight and dimension factor to caclculate the most optimum
 idle time or lost time in transportation vs dismanteling
+
+spider chart for the cost speed and utliaztion, pie chart, bar charts for the trucks. 

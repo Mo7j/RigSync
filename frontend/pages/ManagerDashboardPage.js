@@ -6,6 +6,7 @@ import { Modal } from "../components/ui/Modal.js";
 import { ProgressBar } from "../components/ui/ProgressBar.js";
 import { LeafletMap } from "../components/map/LeafletMap.js";
 import { ManagerRigsMap } from "../components/map/ManagerRigsMap.js";
+import { ManagerRigsScene3D } from "../components/map/ManagerRigsScene3D.js";
 import { formatCoordinate, formatDate, formatLocationLabel } from "../lib/format.js";
 import { buildFleetAvailability } from "../features/resources/storage.js";
 import { fetchLocationLabel } from "../features/rigMoves/api.js";
@@ -242,6 +243,7 @@ export function ManagerDashboardPage({
   const [showForemanForm, setShowForemanForm] = useState(false);
   const [isForemanLocationPickerOpen, setIsForemanLocationPickerOpen] = useState(false);
   const [isMapOpen, setIsMapOpen] = useState(false);
+  const [viewAllMode, setViewAllMode] = useState("3d");
   const [selectedRigId, setSelectedRigId] = useState(null);
   const [driverDraft, setDriverDraft] = useState({
     name: "",
@@ -484,12 +486,19 @@ export function ManagerDashboardPage({
       h(
         "section",
         { className: "scene-only-shell manager-scene-shell" },
-        h(ManagerRigsMap, {
-          rigs: rigMapItems,
-          selectedRigId: selectedRig?.id || null,
-          onSelectRig: setSelectedRigId,
-          heightClass: "manager-map-fullscreen",
-        }),
+        viewAllMode === "3d"
+          ? h(ManagerRigsScene3D, {
+              rigs: rigMapItems,
+              selectedRigId: selectedRig?.id || null,
+              onSelectRig: setSelectedRigId,
+              heightClass: "manager-map-fullscreen",
+            })
+          : h(ManagerRigsMap, {
+              rigs: rigMapItems,
+              selectedRigId: selectedRig?.id || null,
+              onSelectRig: setSelectedRigId,
+              heightClass: "manager-map-fullscreen",
+            }),
         h(
           "div",
           { className: "scene-top-bar manager-scene-top-bar" },
@@ -517,6 +526,28 @@ export function ManagerDashboardPage({
               h("span", { "aria-hidden": "true" }, "×"),
             ),
             h("div", { className: "scene-compact-pill" }, t("viewAll", "View All")),
+            h(
+              "div",
+              { className: "manager-view-mode-switch", role: "tablist", "aria-label": "View mode" },
+              h(
+                "button",
+                {
+                  type: "button",
+                  className: `manager-view-mode-button${viewAllMode === "3d" ? " is-active" : ""}`,
+                  onClick: () => setViewAllMode("3d"),
+                },
+                "3D Kingdom",
+              ),
+              h(
+                "button",
+                {
+                  type: "button",
+                  className: `manager-view-mode-button${viewAllMode === "map" ? " is-active" : ""}`,
+                  onClick: () => setViewAllMode("map"),
+                },
+                "2D Map",
+              ),
+            ),
           ),
           h(
             "div",
@@ -539,7 +570,9 @@ export function ManagerDashboardPage({
             ? selectedRig.endPoint
               ? `${selectedRig.startLabel} to ${selectedRig.endLabel}`
               : selectedRig.startLabel
-            : t("noRigSelectedCopy", "Pick a rig on the map to inspect its transfer state.")),
+            : viewAllMode === "3d"
+              ? t("noRigSelectedCopy3d", "Pick a rig on the Saudi terrain to inspect its transfer state.")
+              : t("noRigSelectedCopy", "Pick a rig on the map to inspect its transfer state.")),
           h(
             "div",
             { className: "manager-scene-stat-list" },

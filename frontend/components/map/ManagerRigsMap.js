@@ -1,4 +1,5 @@
 import { React, h } from "../../lib/react.js";
+import { SAUDI_BORDER_POINTS } from "./saudiShape.js";
 
 const { useEffect, useMemo, useRef } = React;
 
@@ -167,6 +168,29 @@ export function ManagerRigsMap({
     layersRef.current = [];
 
     const bounds = [];
+
+    const saudiHighlight = window.L.polygon(SAUDI_BORDER_POINTS, {
+      color: "#ffd84a",
+      weight: 2,
+      opacity: 0.92,
+      fillColor: "#ffd84a",
+      fillOpacity: 0.12,
+      lineJoin: "round",
+      smoothFactor: 1.4,
+      interactive: false,
+    }).addTo(map);
+    layersRef.current.push(saudiHighlight);
+
+    const saudiGlow = window.L.polygon(SAUDI_BORDER_POINTS, {
+      color: "#ffe48f",
+      weight: 10,
+      opacity: 0.12,
+      fillOpacity: 0,
+      lineJoin: "round",
+      smoothFactor: 1.4,
+      interactive: false,
+    }).addTo(map);
+    layersRef.current.push(saudiGlow);
 
     mapItems.forEach((rig) => {
       const indexLabel = String(rig.index);
