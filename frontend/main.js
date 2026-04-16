@@ -1674,10 +1674,17 @@ function App() {
       executionState: nextState,
       operatingState: executionProgress.rigUpCompleted ? "drilling" : targetMove.operatingState || "standby",
       executionProgress,
-      completionPercentage: executionProgress.rigUpCompleted ? 100 : targetMove.completionPercentage,
+      completionPercentage:
+        executionProgress.rigUpCompleted
+          ? 100
+          : Number.isFinite(Number(patch?.completionPercentage))
+            ? Math.max(0, Math.min(100, Number(patch.completionPercentage)))
+            : targetMove.completionPercentage,
       progressMinute: executionProgress.rigUpCompleted
         ? targetMove?.simulation?.bestPlan?.totalMinutes || targetMove.progressMinute
-        : targetMove.progressMinute,
+        : Number.isFinite(Number(patch?.progressMinute))
+          ? Math.max(0, Number(patch.progressMinute))
+          : targetMove.progressMinute,
     };
 
     setMoves((current) =>
@@ -1943,11 +1950,16 @@ function App() {
     setSceneFocusResetKey((value) => value + 1);
   }
 
-  async function handleStartExecution(moveId) {
+  async function handleStartExecution(moveId, options = {}) {
     const moveToAssign = readMoves().find((move) => move.id === moveId);
     if (!moveToAssign) {
       return;
     }
+
+    const trackingMode = options?.trackingMode === "demoUltrasonic" ? "demoUltrasonic" : "driverApp";
+    const ultrasonicStartCm = Math.max(0, Number(options?.ultrasonicStartCm) || 45);
+    const ultrasonicArrivalCm = Math.max(0, Number(options?.ultrasonicArrivalCm) || 8);
+    const ultrasonicLatestCm = trackingMode === "demoUltrasonic" ? ultrasonicStartCm : null;
 
     const nextAssignments = buildDriverAssignmentsForMove({
       move: moveToAssign,
@@ -1969,10 +1981,15 @@ function App() {
       executionProgress: {
         managerNotified: true,
         trucksReserved: true,
-        liveDataRequested: true,
+        liveDataRequested: trackingMode === "driverApp",
         rigDownCompleted: false,
         rigMoveCompleted: false,
         rigUpCompleted: false,
+        trackingMode,
+        ultrasonicStartCm,
+        ultrasonicArrivalCm,
+        ultrasonicLatestCm,
+        ultrasonicLastUpdatedAt: trackingMode === "demoUltrasonic" ? new Date().toISOString() : null,
       },
     });
 
@@ -2166,6 +2183,7 @@ function App() {
       onPausePlayback: handlePauseTogglePlayback,
       onEndPlayback: handleEndPlayback,
       onStartExecution: handleStartExecution,
+      onUpdateExecutionProgress: updateMoveExecutionProgress,
       onDeleteMove: handleDeleteMove,
       onBack: () => navigateTo("/dashboard"),
       onLogout: handleLogout,

@@ -96,6 +96,52 @@ function formatProgressDuration(ms = 0) {
   return seconds ? `${minutes}m ${seconds}s` : `${minutes}m`;
 }
 
+function parseDistanceCm(value) {
+  const matched = String(value || "").match(/-?\d+(?:\.\d+)?/);
+  if (!matched) {
+    return null;
+  }
+
+  const parsed = Number(matched[0]);
+  if (!Number.isFinite(parsed)) {
+    return null;
+  }
+
+  return Math.max(0, parsed);
+}
+
+function formatDistanceCm(value) {
+  if (value == null || !Number.isFinite(Number(value))) {
+    return "--";
+  }
+
+  const safeValue = Math.max(0, Number(value));
+  return `${Number.isInteger(safeValue) ? safeValue : safeValue.toFixed(1)} cm`;
+}
+
+function getUltrasonicDemoSummary(executionProgress = {}) {
+  const startCm = Math.max(0, Number(executionProgress?.ultrasonicStartCm) || 45);
+  const arrivalCm = Math.max(0, Number(executionProgress?.ultrasonicArrivalCm) || 8);
+  const latestCm = executionProgress?.ultrasonicLatestCm == null
+    ? null
+    : Math.max(0, Number(executionProgress.ultrasonicLatestCm) || 0);
+  const totalWindow = Math.max(startCm - arrivalCm, 0.001);
+  const hasReading = latestCm != null;
+  const progressPercent = hasReading
+    ? Math.max(0, Math.min(100, Math.round(((startCm - latestCm) / totalWindow) * 100)))
+    : 0;
+  const arrived = hasReading && latestCm <= arrivalCm;
+
+  return {
+    startCm,
+    arrivalCm,
+    latestCm,
+    hasReading,
+    progressPercent: arrived ? 100 : progressPercent,
+    arrived,
+  };
+}
+
 function normalizeTruckSetup(move, availableFleet = []) {
   const source = move?.truckSetup?.length ? move.truckSetup : move?.simulation?.truckSetup || [];
   const configuredByType = new Map();
@@ -216,9 +262,8 @@ function PlanSwitcher({ scenarios, activePlanKey, onSelect, includeCustomize = t
       ...scenarios.map((scenario) => ({
         key: scenario.name,
         label: scenario.name,
-        meta: formatTruckMixSummary(scenario.allocatedTruckSetup || scenario.truckSetup || []),
       })),
-      ...(includeCustomize ? [{ key: "customize", label: "Customize", meta: "Manual" }] : []),
+      ...(includeCustomize ? [{ key: "customize", label: "Customize" }] : []),
     ].map((item) =>
       h(
         "button",
@@ -230,7 +275,6 @@ function PlanSwitcher({ scenarios, activePlanKey, onSelect, includeCustomize = t
           onClick: () => onSelect(item.key),
         },
         h("span", { className: "plan-switcher-label" }, item.label),
-        h("span", { className: "plan-switcher-meta" }, item.meta),
       ),
     ),
   );
@@ -701,6 +745,179 @@ function getPlanComparisonStats(scenarios, selectedScenario, move, currentMinute
     routeDistance: `${Math.round(routeKm * Math.max(totalLoads, 1))} km`,
     criticalPathTasks: criticalTaskCount,
   };
+}
+
+function getPlanRadarComparisonModel(scenarios, selectedScenario, move) {
+  const selectedName = selectedScenario?.name;
+  const selectedPlan = {
+    key: selectedName || "selected-preview",
+    name: selectedName || "Balanced Plan",
+    totalMinutes: 23 * 24 * 60,
+    totalCost: 172000,
+    utilization: 84,
+    reliability: 88,
+    flexibility: 80,
+    isSelected: true,
+  };
+  const previewCandidates = [
+    selectedPlan,
+    {
+      key: "preview-fast",
+      name: "Fast Track",
+      totalMinutes: 19 * 24 * 60,
+      totalCost: 204000,
+      utilization: 90,
+      reliability: 78,
+      flexibility: 72,
+      isSelected: false,
+    },
+    {
+      key: "preview-lean",
+      name: "Lean Cost",
+      totalMinutes: 27 * 24 * 60,
+      totalCost: 138000,
+      utilization: 76,
+      reliability: 83,
+      flexibility: 91,
+      isSelected: false,
+    },
+  ];
+  const completedPlans = previewCandidates;
+
+  const metrics = [
+    { key: "totalMinutes", label: "Time", invert: true },
+    { key: "totalCost", label: "Cost", invert: true },
+    { key: "utilization", label: "Utilization", invert: false },
+    { key: "reliability", label: "Reliability", invert: false },
+    { key: "flexibility", label: "Flexibility", invert: false },
+  ];
+  const colors = ["#f5b63a", "#58c4dd", "#7ddc84"];
+  const bounds = metrics.reduce((result, metric) => {
+    const values = completedPlans.map((plan) => plan[metric.key]);
+    const min = values.length ? Math.min(...values) : 0;
+    const max = values.length ? Math.max(...values) : 0;
+    result[metric.key] = { min, max };
+    return result;
+  }, {});
+
+  return {
+    metrics,
+    plans: completedPlans.map((plan, index) => ({
+      ...plan,
+      color: plan.isSelected ? "#f5b63a" : "rgba(178, 186, 199, 0.55)",
+      displayScores: metrics.map((metric) => {
+        if (metric.key === "totalMinutes" || metric.key === "totalCost") {
+          const { min, max } = bounds[metric.key];
+          if (max === min) {
+            return 90;
+          }
+          const normalized = (plan[metric.key] - min) / Math.max(max - min, 1);
+          return Math.round(55 + ((1 - normalized) * 42));
+        }
+        return Math.round(plan[metric.key]);
+      }),
+      values: metrics.map((metric) => {
+        const { min, max } = bounds[metric.key];
+        if (max === min) {
+          return 0.82;
+        }
+        const normalized = (plan[metric.key] - min) / Math.max(max - min, 1);
+        const score = metric.invert ? 1 - normalized : normalized;
+        return 0.28 + (score * 0.64);
+      }),
+    })),
+  };
+}
+
+function getRadarPoint(cx, cy, radius, index, total, value = 1) {
+  const angle = (-Math.PI / 2) + ((Math.PI * 2 * index) / Math.max(total, 1));
+  return {
+    x: cx + Math.cos(angle) * radius * value,
+    y: cy + Math.sin(angle) * radius * value,
+  };
+}
+
+function PlanComparisonRadar({ model }) {
+  const metrics = model?.metrics || [];
+  const plans = model?.plans || [];
+  const orderedPlans = [...plans].sort((left, right) => Number(left.isSelected) - Number(right.isSelected));
+  const size = 300;
+  const center = size / 2;
+  const radius = 88;
+  const rings = [0.2, 0.4, 0.6, 0.8, 1];
+
+  if (!metrics.length || !plans.length) {
+    return h("p", { className: "scene-radar-empty" }, "Plan comparison will appear after simulation results are available.");
+  }
+
+  return h(
+    "div",
+    { className: "scene-radar-card" },
+    h(
+      "div",
+      { className: "scene-radar-frame" },
+      metrics.map((metric, index) => {
+        const point = getRadarPoint(center, center, radius + 42, index, metrics.length);
+        return h(
+          "div",
+          {
+            key: `stat-${metric.key}`,
+            className: "scene-radar-stat",
+            style: {
+              left: `${(point.x / size) * 100}%`,
+              top: `${(point.y / size) * 100}%`,
+            },
+          },
+          h("span", { className: "scene-radar-stat-label" }, metric.label),
+        );
+      }),
+      h(
+        "svg",
+        {
+          className: "scene-radar-svg",
+          viewBox: `0 0 ${size} ${size}`,
+          role: "img",
+          "aria-label": "Plan comparison radar chart",
+        },
+        rings.map((ring) =>
+          h("polygon", {
+            key: `ring-${ring}`,
+            className: "scene-radar-ring",
+            points: metrics.map((metric, index) => {
+              const point = getRadarPoint(center, center, radius, index, metrics.length, ring);
+              return `${point.x},${point.y}`;
+            }).join(" "),
+          }),
+        ),
+        metrics.map((metric, index) => {
+          const point = getRadarPoint(center, center, radius, index, metrics.length);
+          return h("line", {
+            key: `axis-${metric.key}`,
+            className: "scene-radar-axis",
+            x1: center,
+            y1: center,
+            x2: point.x,
+            y2: point.y,
+          });
+        }),
+        orderedPlans.map((plan) =>
+          h("polygon", {
+            key: plan.key,
+            className: "scene-radar-shape",
+            points: plan.values.map((value, index) => {
+              const point = getRadarPoint(center, center, radius, index, metrics.length, value);
+              return `${point.x},${point.y}`;
+            }).join(" "),
+            style: {
+              fill: plan.isSelected ? "rgba(245, 182, 58, 0.20)" : "rgba(154, 163, 176, 0.08)",
+              stroke: plan.color,
+              opacity: plan.isSelected ? 1 : 0.42,
+            },
+          }),
+        ),
+      ),
+    ),
+  );
 }
 
 function getTruckFocusStats({ truckId, playback, currentMinute, totalMinutes, move }) {
@@ -2983,6 +3200,7 @@ export function RigMovePage({
   onPausePlayback,
   onEndPlayback,
   onStartExecution,
+  onUpdateExecutionProgress,
   onDeleteMove,
   onBack,
   onLogout,
@@ -3025,6 +3243,15 @@ export function RigMovePage({
   const [isSpeedDropdownOpen, setIsSpeedDropdownOpen] = useState(false);
   const [isDeleteConfirmOpen, setIsDeleteConfirmOpen] = useState(false);
   const [executionNow, setExecutionNow] = useState(() => Date.now());
+  const [trackingMode, setTrackingMode] = useState(executionProgress?.trackingMode === "demoUltrasonic" ? "demoUltrasonic" : "driverApp");
+  const [ultrasonicStartInput, setUltrasonicStartInput] = useState(String(Math.max(0, Number(executionProgress?.ultrasonicStartCm) || 45)));
+  const [ultrasonicArrivalInput, setUltrasonicArrivalInput] = useState(String(Math.max(0, Number(executionProgress?.ultrasonicArrivalCm) || 8)));
+  const [ultrasonicReadingInput, setUltrasonicReadingInput] = useState(
+    executionProgress?.ultrasonicLatestCm == null
+      ? String(Math.max(0, Number(executionProgress?.ultrasonicStartCm) || 45))
+      : String(Math.max(0, Number(executionProgress.ultrasonicLatestCm) || 0)),
+  );
+  const [liveDemoMinute, setLiveDemoMinute] = useState(0);
 
   function handleSceneModeChange(nextMode) {
     if (nextMode === "timeline") {
@@ -3132,12 +3359,36 @@ export function RigMovePage({
     }
     if (isNewMove) {
       setFocusTarget(null);
+      setTrackingMode(move?.executionProgress?.trackingMode === "demoUltrasonic" ? "demoUltrasonic" : "driverApp");
+      setUltrasonicStartInput(String(Math.max(0, Number(move?.executionProgress?.ultrasonicStartCm) || 45)));
+      setUltrasonicArrivalInput(String(Math.max(0, Number(move?.executionProgress?.ultrasonicArrivalCm) || 8)));
+      setUltrasonicReadingInput(
+        move?.executionProgress?.ultrasonicLatestCm == null
+          ? String(Math.max(0, Number(move?.executionProgress?.ultrasonicStartCm) || 45))
+          : String(Math.max(0, Number(move?.executionProgress?.ultrasonicLatestCm) || 0)),
+      );
     }
   }, [move?.id, move?.updatedAt, availableFleet, activeScenarioName, move?.simulation]);
 
   useEffect(() => {
     setFocusTarget(null);
   }, [sceneFocusResetKey]);
+
+  useEffect(() => {
+    setTrackingMode(executionProgress?.trackingMode === "demoUltrasonic" ? "demoUltrasonic" : "driverApp");
+    setUltrasonicStartInput(String(Math.max(0, Number(executionProgress?.ultrasonicStartCm) || 45)));
+    setUltrasonicArrivalInput(String(Math.max(0, Number(executionProgress?.ultrasonicArrivalCm) || 8)));
+    setUltrasonicReadingInput(
+      executionProgress?.ultrasonicLatestCm == null
+        ? String(Math.max(0, Number(executionProgress?.ultrasonicStartCm) || 45))
+        : String(Math.max(0, Number(executionProgress?.ultrasonicLatestCm) || 0)),
+    );
+  }, [
+    executionProgress?.trackingMode,
+    executionProgress?.ultrasonicStartCm,
+    executionProgress?.ultrasonicArrivalCm,
+    executionProgress?.ultrasonicLatestCm,
+  ]);
 
   useEffect(() => {
     setActiveStageKey(
@@ -3284,8 +3535,59 @@ export function RigMovePage({
     [safeMove.simulation, selectedScenario, effectiveTruckSetup],
   );
 
+  const activeTrackingMode = executionProgress?.trackingMode === "demoUltrasonic" ? "demoUltrasonic" : "driverApp";
+  const ultrasonicDemo = getUltrasonicDemoSummary(executionProgress);
   const totalMinutes = displaySimulation.bestPlan.totalMinutes;
-  const visibleMinute = sceneAssetsReady ? Math.min(currentMinute, totalMinutes) : 0;
+  const baseVisibleMinute = sceneAssetsReady ? Math.min(currentMinute, totalMinutes) : 0;
+  const demoCompletionPercent = Math.max(
+    0,
+    Math.min(
+      100,
+      Number(
+        activeTrackingMode === "demoUltrasonic"
+          ? (move?.completionPercentage ?? executionProgress?.completionPercentage ?? ultrasonicDemo.progressPercent)
+          : 0,
+      ) || ultrasonicDemo.progressPercent,
+    ),
+  );
+  const isLiveDemoTracking = activeTrackingMode === "demoUltrasonic" && (executionState === "active" || executionState === "completed");
+  const demoTargetMinute = Math.min(totalMinutes, Math.max(0, (demoCompletionPercent / 100) * Math.max(totalMinutes, 0)));
+
+  useEffect(() => {
+    if (!isLiveDemoTracking) {
+      setLiveDemoMinute(baseVisibleMinute);
+      return undefined;
+    }
+
+    setLiveDemoMinute((current) => {
+      if (!Number.isFinite(current) || Math.abs(current - demoTargetMinute) > Math.max(totalMinutes * 0.35, 120)) {
+        return demoTargetMinute;
+      }
+      return current;
+    });
+
+    const intervalId = window.setInterval(() => {
+      setLiveDemoMinute((current) => {
+        const delta = demoTargetMinute - current;
+        if (Math.abs(delta) < 0.35) {
+          return demoTargetMinute;
+        }
+
+        const step = Math.sign(delta) * Math.max(0.45, Math.abs(delta) * 0.22);
+        const nextValue = current + step;
+        if (delta > 0) {
+          return Math.min(nextValue, demoTargetMinute);
+        }
+        return Math.max(nextValue, demoTargetMinute);
+      });
+    }, 50);
+
+    return () => {
+      window.clearInterval(intervalId);
+    };
+  }, [isLiveDemoTracking, demoTargetMinute, totalMinutes, baseVisibleMinute]);
+
+  const visibleMinute = isLiveDemoTracking ? Math.min(liveDemoMinute, totalMinutes) : baseVisibleMinute;
   const canResumePlayback = visibleMinute > 0 && visibleMinute < totalMinutes;
   const completion = Math.min(100, Math.round((visibleMinute / Math.max(totalMinutes, 1)) * 100));
   const phases = useMemo(
@@ -3338,6 +3640,14 @@ export function RigMovePage({
     () => getPlanComparisonStats(scenarioPlans, selectedScenario, safeMove, visibleMinute),
     [scenarioPlans, selectedScenario, safeMove, visibleMinute],
   );
+  const planRadarModel = useMemo(
+    () => getPlanRadarComparisonModel(scenarioPlans, selectedScenario, safeMove),
+    [scenarioPlans, selectedScenario, safeMove],
+  );
+  const previewPlanCard = planRadarModel.plans[0] || null;
+  const previewRoundTrips = 24;
+  const previewTruckUsageLabel = "6/8";
+  const previewCostPerLoad = previewPlanCard ? formatCurrency((previewPlanCard.totalCost || 0) / Math.max(previewRoundTrips, 1)) : formatCurrency(0);
   const criticalPathChain = useMemo(
     () => buildCriticalPathChain(displaySimulation.bestPlan.playback),
     [displaySimulation.bestPlan.playback],
@@ -3489,6 +3799,7 @@ export function RigMovePage({
   );
   const planningStartDateLabel = formatPlanningDateLabel(planningStartDate);
   const planEtaLabel = getPlanEtaLabel(planningStartDate, planningStartTime, activePlanSummary.totalMinutes);
+  const previewPlanEtaLabel = getPlanEtaLabel(planningStartDate, planningStartTime, previewPlanCard?.totalMinutes || 0);
   const executionAssignmentMetrics = useMemo(
     () => getAssignmentExecutionMetrics(executionAssignments, executionProgress),
     [executionAssignments, executionProgress],
@@ -3520,14 +3831,52 @@ export function RigMovePage({
   const isPlanningStage = executionState === "planning";
   const isOperationsStage = executionState === "completed";
   const rigDownCompleted = Boolean(executionProgress?.rigDownCompleted);
+  const rigMoveCompleted = Boolean(executionProgress?.rigMoveCompleted);
   const rigUpCompleted = Boolean(executionProgress?.rigUpCompleted);
+  const trackingStatusLabel = activeTrackingMode === "demoUltrasonic"
+    ? ultrasonicDemo.arrived
+      ? "Arrived at destination"
+      : ultrasonicDemo.hasReading
+        ? `${formatDistanceCm(ultrasonicDemo.latestCm)} remaining`
+        : "Waiting for demo reading"
+    : executionProgress?.liveDataRequested
+      ? "Waiting on driver app"
+      : "Driver app not requested";
+  function handleApplyUltrasonicReading(nextReadingInput = ultrasonicReadingInput) {
+    const parsedReadingCm = parseDistanceCm(nextReadingInput);
+    if (parsedReadingCm == null || !move?.id || typeof onUpdateExecutionProgress !== "function") {
+      return;
+    }
+
+    const parsedStartCm = Math.max(0, parseDistanceCm(ultrasonicStartInput) ?? ultrasonicDemo.startCm);
+    const parsedArrivalCm = Math.max(0, parseDistanceCm(ultrasonicArrivalInput) ?? ultrasonicDemo.arrivalCm);
+    const safeArrivalCm = Math.min(parsedStartCm, parsedArrivalCm);
+    const totalWindow = Math.max(parsedStartCm - safeArrivalCm, 0.001);
+    const progressRatio = Math.max(0, Math.min(1, (parsedStartCm - parsedReadingCm) / totalWindow));
+    const progressMinute = Math.round(totalMinutes * progressRatio);
+    const hasArrived = parsedReadingCm <= safeArrivalCm;
+
+    onUpdateExecutionProgress(move.id, {
+      trackingMode: "demoUltrasonic",
+      liveDataRequested: false,
+      ultrasonicStartCm: parsedStartCm,
+      ultrasonicArrivalCm: safeArrivalCm,
+      ultrasonicLatestCm: parsedReadingCm,
+      ultrasonicLastUpdatedAt: new Date().toISOString(),
+      rigMoveCompleted: rigMoveCompleted || hasArrived,
+      completionPercentage: Math.round(progressRatio * 100),
+      progressMinute,
+    });
+  }
+
   const executionDetailRows = isPlanningStage
     ? []
     : [
         { key: "reserved", label: "Trucks Reserved", value: executionProgress?.trucksReserved ? "Yes" : "Pending" },
         { key: "manager", label: "Manager Notified", value: executionProgress?.managerNotified ? "Sent" : "Pending" },
-        { key: "live", label: "Driver Live Data", value: executionProgress?.liveDataRequested ? "Waiting on backend" : "Not requested" },
+        { key: "tracking-status", label: "Tracking Status", value: trackingStatusLabel },
         { key: "rigdown", label: "Rig Down", value: rigDownCompleted ? "Completed" : "Pending" },
+        { key: "rigmove", label: "Rig Move", value: rigMoveCompleted ? "Completed" : "Pending" },
         { key: "rigup", label: "Rig Up", value: rigUpCompleted ? "Completed" : "Pending" },
       ];
   const readOnlyBanner = readOnly
@@ -3614,16 +3963,83 @@ export function RigMovePage({
         ),
       )
     : null;
+  const startExecutionSetup = null;
   const executionActions = !readOnly && isExecutionActive
-    ? h(
-        "div",
-        { className: "scene-panel-actions scene-panel-actions-inline" },
-        h(
-          "span",
-          { className: "muted-copy" },
-          "Execution completion is controlled by assigned drivers in the driver app.",
-        ),
-      )
+    ? activeTrackingMode === "demoUltrasonic"
+      ? h(
+          "div",
+          { className: "scene-panel-actions" },
+          h(
+            "section",
+            { className: "scene-panel-section scene-panel-section-plain" },
+            h(
+              "div",
+              { className: "scene-panel-head" },
+              h("span", { className: "scene-panel-kicker" }, "Demo Tracking"),
+              h("strong", null, ultrasonicDemo.arrived ? "Arrived" : `${ultrasonicDemo.progressPercent}%`),
+            ),
+            h("p", { className: "muted-copy section-spacing" }, "Demo-only mode. Enter the toy truck ultrasonic reading. 45 cm is the start reference and 8 cm marks arrival."),
+            h(
+              "div",
+              { className: "scene-stat-grid" },
+              h("div", { className: "scene-stat-card" }, h("span", null, "Latest"), h("strong", null, ultrasonicDemo.hasReading ? formatDistanceCm(ultrasonicDemo.latestCm) : "--")),
+              h("div", { className: "scene-stat-card" }, h("span", null, "Start"), h("strong", null, formatDistanceCm(ultrasonicDemo.startCm))),
+              h("div", { className: "scene-stat-card" }, h("span", null, "Arrival"), h("strong", null, formatDistanceCm(ultrasonicDemo.arrivalCm))),
+              h("div", { className: "scene-stat-card" }, h("span", null, "Move Progress"), h("strong", null, `${ultrasonicDemo.progressPercent}%`)),
+            ),
+            h(
+              Field,
+              {
+                label: "Sensor Reading",
+                hint: "Accepts values like 45 or 45cm.",
+              },
+              h(TextInput, {
+                type: "text",
+                value: ultrasonicReadingInput,
+                placeholder: "45cm",
+                onChange: (event) => setUltrasonicReadingInput(event.target.value),
+              }),
+            ),
+            h(
+              "div",
+              { className: "scene-panel-actions scene-panel-actions-inline" },
+              [45, 40, 34, 28, 20, 12, 8].map((reading) =>
+                h(Button, {
+                  key: `demo-reading-${reading}`,
+                  type: "button",
+                  variant: "ghost",
+                  className: "scene-top-action-button",
+                  onClick: () => {
+                    const nextValue = `${reading}cm`;
+                    setUltrasonicReadingInput(nextValue);
+                    handleApplyUltrasonicReading(nextValue);
+                  },
+                  children: `${reading}cm`,
+                }),
+              ),
+            ),
+            h(
+              "div",
+              { className: "scene-panel-actions scene-panel-actions-inline" },
+              h(Button, {
+                type: "button",
+                variant: "ghost",
+                className: "scene-top-action-button",
+                onClick: () => handleApplyUltrasonicReading(),
+                children: ultrasonicDemo.arrived ? "Update Demo Reading" : "Apply Reading",
+              }),
+            ),
+          ),
+        )
+      : h(
+          "div",
+          { className: "scene-panel-actions scene-panel-actions-inline" },
+          h(
+            "span",
+            { className: "muted-copy" },
+            "Execution completion is controlled by assigned drivers in the driver app.",
+          ),
+        )
     : null;
   const startupKpiSection = h(
     "section",
@@ -4172,6 +4588,7 @@ export function RigMovePage({
                 ),
                 executionStatusRow,
                 executionSummary,
+                startExecutionSetup,
                 simulationError ? h("p", { className: "field-error section-spacing" }, simulationError) : null,
                 readOnlyBanner,
                 !readOnly && isPlanningStage
@@ -4191,7 +4608,15 @@ export function RigMovePage({
                         type: "button",
                         variant: "ghost",
                         className: "scene-top-action-button",
-                        onClick: () => onStartExecution?.(move.id),
+                        onClick: () => {
+                          const startDistanceCm = Math.max(0, parseDistanceCm(ultrasonicStartInput) ?? 45);
+                          const arrivalDistanceCm = Math.min(startDistanceCm, Math.max(0, parseDistanceCm(ultrasonicArrivalInput) ?? 8));
+                          onStartExecution?.(move.id, {
+                            trackingMode,
+                            ultrasonicStartCm: startDistanceCm,
+                            ultrasonicArrivalCm: arrivalDistanceCm,
+                          });
+                        },
                         children: "Start Execution",
                       }),
                     )
@@ -4240,6 +4665,7 @@ export function RigMovePage({
                 ),
                 executionStatusOverlayRow,
                 executionSummary,
+                startExecutionSetup,
                 readOnlyBanner,
                 !readOnly && isPlanningStage
                   ? h(
@@ -4257,7 +4683,15 @@ export function RigMovePage({
                         type: "button",
                         variant: "ghost",
                         className: "scene-top-action-button",
-                        onClick: () => onStartExecution?.(move.id),
+                        onClick: () => {
+                          const startDistanceCm = Math.max(0, parseDistanceCm(ultrasonicStartInput) ?? 45);
+                          const arrivalDistanceCm = Math.min(startDistanceCm, Math.max(0, parseDistanceCm(ultrasonicArrivalInput) ?? 8));
+                          onStartExecution?.(move.id, {
+                            trackingMode,
+                            ultrasonicStartCm: startDistanceCm,
+                            ultrasonicArrivalCm: arrivalDistanceCm,
+                          });
+                        },
                         children: "Start Execution",
                       }),
                     )
@@ -4464,10 +4898,27 @@ export function RigMovePage({
               h(
                 "div",
                 { className: "scene-plan-kpis" },
-                h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, t("rigDown", "Rig Down")), h("strong", null, `${Math.round(phases.down)}%`)),
-                h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, t("move", "Move")), h("strong", null, `${Math.round(phases.move)}%`)),
-                h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, t("rigUp", "Rig Up")), h("strong", null, `${Math.round(phases.up)}%`)),
-                h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "ETA"), h("strong", null, planEtaLabel)),
+                h(
+                  "div",
+                  { className: "scene-plan-kpi-card" },
+                  h("span", { className: "scene-dashboard-label" }, t("totalTime", "Total Time")),
+                  h("strong", { className: "scene-plan-kpi-value" }, formatDaysHours(previewPlanCard?.totalMinutes || 0)),
+                  h("span", { className: "scene-plan-kpi-meta" }, `${previewRoundTrips} round trips - ETA ${previewPlanEtaLabel}`),
+                ),
+                h(
+                  "div",
+                  { className: "scene-plan-kpi-card" },
+                  h("span", { className: "scene-dashboard-label" }, "Total Cost"),
+                  h("strong", { className: "scene-plan-kpi-value" }, formatCurrency(previewPlanCard?.totalCost || 0)),
+                  h("span", { className: "scene-plan-kpi-meta" }, `${previewCostPerLoad} per load`),
+                ),
+                h(
+                  "div",
+                  { className: "scene-plan-kpi-card" },
+                  h("span", { className: "scene-dashboard-label" }, "Utilization"),
+                  h("strong", { className: "scene-plan-kpi-value" }, `${previewPlanCard?.utilization || 0}%`),
+                  h("span", { className: "scene-plan-kpi-meta" }, `${previewTruckUsageLabel} trucks used`),
+                ),
               ),
               h(
                 "div",
@@ -4476,38 +4927,10 @@ export function RigMovePage({
                   "div",
                   { className: "scene-plan-summary-card scene-plan-summary-card-title" },
                   h("span", { className: "scene-panel-kicker" }, t("executionPlan", "Execution Plan")),
-                  h("strong", { className: "scene-plan-summary-title" }, isCustomizeActive ? t("customExecutionPlan", "Custom Execution Plan") : t("planOverview", "Plan Overview")),
+                  h("strong", { className: "scene-plan-summary-title" }, "Plan Comparison"),
+                  h("p", { className: "scene-radar-subtitle" }, isCustomizeActive ? t("customExecutionPlan", "Custom Execution Plan") : t("planOverview", "Plan Overview")),
                 ),
-                h(
-                  "div",
-                  { className: "scene-dashboard-pair" },
-                  h("div", { className: "scene-dashboard-inline scene-dashboard-pair-item" }, h("span", { className: "scene-dashboard-label" }, t("totalTime", "Total Time")), h("strong", null, formatDaysHours(activePlanSummary.totalMinutes))),
-                  h("div", { className: "scene-dashboard-inline scene-dashboard-pair-item" }, h("span", { className: "scene-dashboard-label" }, t("roundTrips", "Round Trips")), h("strong", null, String(activePlanSummary.roundTrips))),
-                ),
-                h(
-                  "div",
-                  { className: "scene-dashboard-pair" },
-                  h("div", { className: "scene-dashboard-inline scene-dashboard-pair-item" }, h("span", { className: "scene-dashboard-label" }, t("planCost", "Plan Cost")), h("strong", null, activePlanDashboard.costEstimate)),
-                  h("div", { className: "scene-dashboard-inline scene-dashboard-pair-item" }, h("span", { className: "scene-dashboard-label" }, t("criticalPath", "Critical Path")), h("strong", null, `${activePlanDashboard.criticalPathHours}h`)),
-                ),
-                h(
-                  "div",
-                  { className: "scene-dashboard-pair" },
-                  h("div", { className: "scene-dashboard-inline scene-dashboard-pair-item" }, h("span", { className: "scene-dashboard-label" }, t("rigDown", "Rig Down")), h("strong", null, `${Math.round(phases.down)}%`)),
-                  h("div", { className: "scene-dashboard-inline scene-dashboard-pair-item" }, h("span", { className: "scene-dashboard-label" }, t("move", "Move")), h("strong", null, `${Math.round(phases.move)}%`)),
-                ),
-                h(
-                  "div",
-                  { className: "scene-dashboard-pair" },
-                  h("div", { className: "scene-dashboard-inline scene-dashboard-pair-item" }, h("span", { className: "scene-dashboard-label" }, t("rigUp", "Rig Up")), h("strong", null, `${Math.round(phases.up)}%`)),
-                  h("div", { className: "scene-dashboard-inline scene-dashboard-pair-item" }, h("span", { className: "scene-dashboard-label" }, "Support Readiness"), h("strong", null, `${drillingReadinessPercent}%`)),
-                ),
-                h(
-                  "div",
-                  { className: "scene-dashboard-pair" },
-                  h("div", { className: "scene-dashboard-inline scene-dashboard-pair-item" }, h("span", { className: "scene-dashboard-label" }, "Missing Resources"), h("strong", null, String(operatingSnapshot.startupSummary.missingUnits))),
-                  h("div", { className: "scene-dashboard-inline scene-dashboard-pair-item" }, h("span", { className: "scene-dashboard-label" }, "Sourced Support"), h("strong", null, `${operatingSnapshot.startupSummary.coveredUnits}/${operatingSnapshot.startupSummary.totalUnits}`)),
-                ),
+                h(PlanComparisonRadar, { model: planRadarModel }),
                 null,
               ),
             ) : null,
@@ -4611,25 +5034,36 @@ export function RigMovePage({
               simulationError ? h("p", { className: "field-error section-spacing" }, simulationError) : null,
               readOnlyBanner,
               !readOnly && isPlanningStage
-                ? h(
-                    "div",
-                    { className: "move-setup-actions" },
-                    h(PlaybackActionButton, {
-                      isRunning: isPlaybackRunning,
-                      isBusy: isSimulating,
-                      isPaused: isPlaybackPaused,
-                      onRun: () => onRunCustomPlan({ moveId: move.id, truckSetup }),
-                      onEnd: onEndPlayback,
-                      onPauseToggle: onPausePlayback,
-                      label: canResumePlayback ? "Resume Simulation" : "Run Simulation",
-                    }),
-                    h(Button, {
-                      type: "button",
-                      variant: "ghost",
-                      onClick: () => onStartExecution?.(move.id),
-                      children: "Start Execution",
-                    }),
-                  )
+                ? [
+                    startExecutionSetup,
+                    h(
+                      "div",
+                      { className: "move-setup-actions" },
+                      h(PlaybackActionButton, {
+                        isRunning: isPlaybackRunning,
+                        isBusy: isSimulating,
+                        isPaused: isPlaybackPaused,
+                        onRun: () => onRunCustomPlan({ moveId: move.id, truckSetup }),
+                        onEnd: onEndPlayback,
+                        onPauseToggle: onPausePlayback,
+                        label: canResumePlayback ? "Resume Simulation" : "Run Simulation",
+                      }),
+                      h(Button, {
+                        type: "button",
+                        variant: "ghost",
+                        onClick: () => {
+                          const startDistanceCm = Math.max(0, parseDistanceCm(ultrasonicStartInput) ?? 45);
+                          const arrivalDistanceCm = Math.min(startDistanceCm, Math.max(0, parseDistanceCm(ultrasonicArrivalInput) ?? 8));
+                          onStartExecution?.(move.id, {
+                            trackingMode,
+                            ultrasonicStartCm: startDistanceCm,
+                            ultrasonicArrivalCm: arrivalDistanceCm,
+                          });
+                        },
+                        children: "Start Execution",
+                      }),
+                    ),
+                  ]
                 : executionActions,
             ),
           ),

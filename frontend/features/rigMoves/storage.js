@@ -273,6 +273,14 @@ function normalizeStoredMove(move) {
       rigDownCompleted: Boolean(move.executionProgress?.rigDownCompleted),
       rigMoveCompleted: Boolean(move.executionProgress?.rigMoveCompleted),
       rigUpCompleted: Boolean(move.executionProgress?.rigUpCompleted),
+      trackingMode: move.executionProgress?.trackingMode === "demoUltrasonic" ? "demoUltrasonic" : "driverApp",
+      ultrasonicStartCm: Math.max(0, Number(move.executionProgress?.ultrasonicStartCm) || 45),
+      ultrasonicArrivalCm: Math.max(0, Number(move.executionProgress?.ultrasonicArrivalCm) || 8),
+      ultrasonicLatestCm:
+        move.executionProgress?.ultrasonicLatestCm == null
+          ? null
+          : Math.max(0, Number(move.executionProgress.ultrasonicLatestCm) || 0),
+      ultrasonicLastUpdatedAt: move.executionProgress?.ultrasonicLastUpdatedAt || null,
     },
     simulation: normalizeStoredSimulation(move.simulation),
   };
@@ -404,6 +412,11 @@ export function createMoveRecord({ name, startPoint, endPoint, startLabel, endLa
       rigDownCompleted: false,
       rigMoveCompleted: false,
       rigUpCompleted: false,
+      trackingMode: "driverApp",
+      ultrasonicStartCm: 45,
+      ultrasonicArrivalCm: 8,
+      ultrasonicLatestCm: null,
+      ultrasonicLastUpdatedAt: null,
     },
     truckSetup: simulation.truckSetup || [],
     simulation,
