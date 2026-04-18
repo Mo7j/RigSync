@@ -4674,6 +4674,7 @@ export function RigMovePage({
   const [isCalculatingCustomPlan, setIsCalculatingCustomPlan] = useState(false);
   const [customPlanError, setCustomPlanError] = useState("");
   const stableDemoTargetMinuteRef = useRef(null);
+  const liveDemoTripKeyRef = useRef("");
 
   function handleSceneModeChange(nextMode) {
     if (nextMode === "timeline") {
@@ -5055,6 +5056,9 @@ export function RigMovePage({
     () => getActiveSensorTripWindow(activePlayback, executionAssignments),
     [activePlayback, executionAssignments],
   );
+  const sensorTripKey = sensorTripWindow
+    ? `${sensorTripWindow.direction}:${Number(sensorTripWindow.startMinute)}:${Number(sensorTripWindow.endMinute)}`
+    : "";
   const demoCompletionPercent = Math.max(
     0,
     Math.min(
@@ -5107,12 +5111,21 @@ export function RigMovePage({
   useEffect(() => {
     if (!isLiveDemoTracking) {
       setLiveDemoMinute(baseVisibleMinute);
+      liveDemoTripKeyRef.current = "";
       return undefined;
+    }
+
+    const targetMinute = demoTargetMinute ?? baseVisibleMinute;
+    const didTripWindowChange = liveDemoTripKeyRef.current !== sensorTripKey;
+    liveDemoTripKeyRef.current = sensorTripKey;
+
+    if (didTripWindowChange) {
+      setLiveDemoMinute(targetMinute);
     }
 
     setLiveDemoMinute((current) => {
       const targetMinute = demoTargetMinute ?? current ?? baseVisibleMinute;
-      if (!Number.isFinite(current) || Math.abs(current - targetMinute) > Math.max(totalMinutes * 0.35, 120)) {
+      if (!Number.isFinite(current) || Math.abs(current - targetMinute) > Math.max(totalMinutes * 0.2, 1.5)) {
         return targetMinute;
       }
       return current;
@@ -5138,7 +5151,7 @@ export function RigMovePage({
     return () => {
       window.clearInterval(intervalId);
     };
-  }, [isLiveDemoTracking, demoTargetMinute, totalMinutes, baseVisibleMinute]);
+  }, [isLiveDemoTracking, demoTargetMinute, totalMinutes, baseVisibleMinute, sensorTripKey]);
 
   const visibleMinute = isLiveDemoTracking ? Math.min(liveDemoMinute, totalMinutes) : baseVisibleMinute;
   const canResumePlayback = visibleMinute > 0 && visibleMinute < totalMinutes;

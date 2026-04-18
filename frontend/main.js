@@ -2696,14 +2696,14 @@ function App() {
 
     if (action === "startMove" || action === "startReturn") {
       updateMoveExecutionProgress(targetAssignment.moveId, {
-        ultrasonicLatestCm: startDistanceCm,
+        ultrasonicLatestCm: action === "startReturn" ? arrivalDistanceCm : startDistanceCm,
         ultrasonicLastUpdatedAt: timestamp,
       });
     }
 
     if (action === "arrived") {
       updateMoveExecutionProgress(targetAssignment.moveId, {
-        ultrasonicLatestCm: arrivalDistanceCm,
+        ultrasonicLatestCm: isReturnTask ? startDistanceCm : arrivalDistanceCm,
         ultrasonicLastUpdatedAt: timestamp,
       });
     }
