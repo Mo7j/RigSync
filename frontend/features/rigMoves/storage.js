@@ -1,12 +1,92 @@
 import { clampPercentage, formatCoordinate, formatMinutes, formatShortDate } from "../../lib/format.js";
 import { haversineKilometers } from "./simulation.js";
 import { deleteMoveDoc, fetchMoveDoc, saveMoveDoc } from "../../lib/firebaseOperations.js";
+import { deleteMoveRecord, fetchMoveRecord, fetchMoveRecords, saveMoveRecord } from "./api.js";
 
 let movesCache = [];
+const MOVE_BACKUP_STORAGE_KEY = "rigsync.moveBackups";
 
 export function setMovesCache(nextMoves = []) {
   movesCache = sortMoves((nextMoves || []).map(normalizeStoredMove).filter(Boolean));
   return movesCache;
+}
+
+function readMoveBackups() {
+  try {
+    const stored = window.localStorage.getItem(MOVE_BACKUP_STORAGE_KEY);
+    const parsed = stored ? JSON.parse(stored) : {};
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function writeMoveBackups(backups) {
+  try {
+    window.localStorage.setItem(MOVE_BACKUP_STORAGE_KEY, JSON.stringify(backups));
+  } catch {
+    // Ignore local persistence failures.
+  }
+}
+
+function persistMoveBackup(move) {
+  if (!move?.id) {
+    return;
+  }
+
+  const backups = readMoveBackups();
+  backups[move.id] = compactMoveForStorage(normalizeStoredMove(move));
+  writeMoveBackups(backups);
+}
+
+function removeMoveBackup(moveId) {
+  const backups = readMoveBackups();
+  if (!backups[moveId]) {
+    return;
+  }
+
+  delete backups[moveId];
+  writeMoveBackups(backups);
+}
+
+function readMoveBackup(moveId) {
+  const backups = readMoveBackups();
+  return backups[moveId] ? normalizeStoredMove(backups[moveId]) : null;
+}
+
+function isMoveMoreComplete(candidate, current) {
+  if (!current) {
+    return true;
+  }
+
+  const candidateHasDetail = Boolean(candidate?.simulation?.bestPlan?.playback?.trips?.length || candidate?.simulation?.scenarioPlans?.length);
+  const currentHasDetail = Boolean(current?.simulation?.bestPlan?.playback?.trips?.length || current?.simulation?.scenarioPlans?.length);
+  if (candidateHasDetail !== currentHasDetail) {
+    return candidateHasDetail;
+  }
+
+  return new Date(candidate?.updatedAt || 0).getTime() >= new Date(current?.updatedAt || 0).getTime();
+}
+
+function mergeMoveCollections(...collections) {
+  const merged = new Map();
+
+  collections
+    .flat()
+    .map((move) => normalizeStoredMove(move))
+    .filter(Boolean)
+    .forEach((move) => {
+      const current = merged.get(move.id);
+      if (isMoveMoreComplete(move, current)) {
+        merged.set(move.id, move);
+      }
+    });
+
+  return sortMoves([...merged.values()]);
+}
+
+export function mergeMovesCache(nextMoves = []) {
+  return setMovesCache(mergeMoveCollections(readMoves(), nextMoves));
 }
 
 function roundCoordinate(value) {
@@ -38,27 +118,34 @@ function compactGeometry(geometry, maxPoints = 120) {
   return sampled;
 }
 
-function compactPlayback(playback) {
+function compactPlayback(playback, options = {}) {
   if (!playback) {
     return null;
   }
 
+  const includeGeometry = options.includeGeometry !== false;
+  const includeJourneys = options.includeJourneys === true;
+
   return {
     totalMinutes: playback.totalMinutes,
-    journeys: (playback.journeys || []).map((journey) => ({
-      id: journey.id,
-      truckId: journey.truckId,
-      truckType: journey.truckType,
-      loadIds: [...(journey.loadIds || [])],
-      loadCodes: [...(journey.loadCodes || [])],
-      description: journey.description || null,
-      dispatchStart: journey.dispatchStart ?? 0,
-      moveStart: journey.moveStart ?? 0,
-      arrivalAtDestination: journey.arrivalAtDestination ?? 0,
-      returnStart: journey.returnStart ?? 0,
-      returnToSource: journey.returnToSource ?? 0,
-      routeMinutes: journey.routeMinutes || null,
-    })),
+    journeys: includeJourneys
+      ? (playback.journeys || []).map((journey) => ({
+          id: journey.id,
+          truckId: journey.truckId,
+          truckType: journey.truckType,
+          loadIds: [...(journey.loadIds || [])],
+          loadCodes: [...(journey.loadCodes || [])],
+          description: journey.description || null,
+          dispatchStart: journey.dispatchStart ?? 0,
+          moveStart: journey.moveStart ?? 0,
+          arrivalAtDestination: journey.arrivalAtDestination ?? 0,
+          returnStart: journey.returnStart ?? 0,
+          returnToSource: journey.returnToSource ?? 0,
+          routeMinutes: journey.routeMinutes || null,
+          routeDistanceKm: journey.routeDistanceKm || null,
+          routeGeometry: includeGeometry ? compactGeometry(journey.routeGeometry || [], 24) : [],
+        }))
+      : [],
     trips: (playback.trips || []).map((trip) => ({
       truckId: trip.truckId,
       truckType: trip.truckType,
@@ -70,9 +157,9 @@ function compactPlayback(playback) {
       destinationLabel: trip.destinationLabel || null,
       dispatchStart: trip.dispatchStart ?? trip.loadStart,
       pickupRouteMinutes: trip.pickupRouteMinutes || null,
-      pickupRouteGeometry: [],
+      pickupRouteGeometry: includeGeometry ? compactGeometry(trip.pickupRouteGeometry || [], 16) : [],
       routeMinutes: trip.routeMinutes || null,
-      routeGeometry: compactGeometry(trip.routeGeometry || [], 48),
+      routeGeometry: includeGeometry ? compactGeometry(trip.routeGeometry || [], 24) : [],
       moveStart: trip.moveStart ?? null,
       loadStart: trip.loadStart,
       rigDownStart: trip.rigDownStart ?? trip.loadStart,
@@ -126,6 +213,7 @@ function compactScenarioPlan(plan) {
     return null;
   }
 
+  const compactedPlayback = compactPlayback(plan.bestVariant?.playback || plan.playback, { includeGeometry: false });
   return {
     name: plan.name,
     truckCount: plan.truckCount,
@@ -149,6 +237,7 @@ function compactScenarioPlan(plan) {
           routeMinutes: plan.bestVariant.routeMinutes,
           processingMinutes: plan.bestVariant.processingMinutes,
           totalMinutes: plan.bestVariant.totalMinutes,
+          playback: compactedPlayback,
         }
       : null,
   };
@@ -164,7 +253,7 @@ function compactBestPlan(plan) {
     routeMinutes: plan.routeMinutes,
     processingMinutes: plan.processingMinutes,
     totalMinutes: plan.totalMinutes,
-    playback: compactPlayback(plan.playback),
+    playback: compactPlayback(plan.playback, { includeGeometry: false, includeJourneys: false }),
   };
 }
 
@@ -213,6 +302,17 @@ function compactSimulation(simulation) {
   };
 }
 
+function compactMoveForStorage(move) {
+  if (!move) {
+    return move;
+  }
+
+  return {
+    ...move,
+    simulation: compactSimulation(move.simulation),
+  };
+}
+
 function normalizeStoredSimulation(simulation) {
   if (!simulation) {
     return null;
@@ -220,6 +320,54 @@ function normalizeStoredSimulation(simulation) {
 
   const compacted = compactSimulation(simulation);
   if (!compacted?.scenarioPlans?.length) {
+    const fallbackScenarioName =
+      compacted?.preferredScenarioName ||
+      compacted?.bestScenario?.name ||
+      compacted?.bestPlan?.name ||
+      "Saved plan";
+    const fallbackScenario =
+      compacted?.bestPlan
+        ? {
+            name: fallbackScenarioName,
+            truckCount: compacted?.bestScenario?.truckCount || compacted?.truckCount || 0,
+            capacity: compacted?.bestScenario?.capacity || 0,
+            routeDistanceKm: compacted?.bestScenario?.routeDistanceKm || compacted?.routeDistanceKm || 0,
+            routeMinutes: compacted?.bestScenario?.routeMinutes || compacted?.bestPlan?.routeMinutes || compacted?.routeMinutes || 0,
+            routeSource: compacted?.bestScenario?.routeSource || compacted?.routeSource || "",
+            routeGeometry: compacted?.bestScenario?.routeGeometry || compacted?.routeGeometry || [],
+            totalMinutes: compacted?.bestScenario?.totalMinutes || compacted?.bestPlan?.totalMinutes || 0,
+            truckSetup: compacted?.bestScenario?.truckSetup || compacted?.truckSetup || [],
+            allocatedTruckSetup:
+              compacted?.bestScenario?.allocatedTruckSetup ||
+              compacted?.bestScenario?.truckSetup ||
+              compacted?.truckSetup ||
+              [],
+            usedTruckSetup: compacted?.bestScenario?.usedTruckSetup || [],
+            allocatedTruckCount:
+              compacted?.bestScenario?.allocatedTruckCount ||
+              compacted?.bestScenario?.truckCount ||
+              compacted?.truckCount ||
+              0,
+            utilization: compacted?.bestScenario?.utilization || 0,
+            truckUtilization: compacted?.bestScenario?.truckUtilization || 0,
+            idleMinutes: compacted?.bestScenario?.idleMinutes || 0,
+            costEstimate: compacted?.bestScenario?.costEstimate || 0,
+            bestVariant: {
+              ...compacted.bestPlan,
+              name: compacted.bestPlan.name || fallbackScenarioName,
+            },
+          }
+        : null;
+
+    if (fallbackScenario) {
+      return {
+        ...compacted,
+        scenarioPlans: [fallbackScenario],
+        bestScenario: fallbackScenario,
+        preferredScenarioName: fallbackScenario.name,
+      };
+    }
+
     return compacted;
   }
 
@@ -227,19 +375,22 @@ function normalizeStoredSimulation(simulation) {
     compacted.scenarioPlans.find((plan) => plan.name === compacted.preferredScenarioName) ||
     compacted.scenarioPlans[0];
 
-  const hydratedScenarioPlans = compacted.scenarioPlans.map((plan) => (
-    plan.name === preferredScenario?.name
-      ? {
-          ...plan,
-          bestVariant: compacted.bestPlan
-            ? {
-                ...plan.bestVariant,
-                ...compacted.bestPlan,
-              }
-            : plan.bestVariant,
-        }
-      : plan
-  ));
+  const hydratedScenarioPlans = compacted.scenarioPlans.map((plan) => {
+    if (plan.name === preferredScenario?.name) {
+      return {
+        ...plan,
+        bestVariant: compacted.bestPlan
+          ? {
+              ...plan.bestVariant,
+              ...compacted.bestPlan,
+              playback: compacted.bestPlan.playback || plan.bestVariant?.playback || null,
+            }
+          : plan.bestVariant,
+      };
+    }
+
+    return plan;
+  });
 
   return {
     ...compacted,
@@ -256,13 +407,19 @@ function normalizeStoredMove(move) {
     return move;
   }
 
+  const resolvedManagerId =
+    move.managerId ||
+    (move.createdBy?.role === "Manager" ? move.createdBy?.id : move.createdBy?.managerId) ||
+    null;
+
   return {
     ...move,
+    managerId: resolvedManagerId,
     createdBy: move.createdBy || {
       id: "foreman-fahad",
       name: "Fahad Al-Qahtani",
       role: "Foreman",
-      managerId: "manager-nasser",
+      managerId: resolvedManagerId || "manager-nasser",
     },
     executionState: move.executionState || "planning",
     operatingState: move.operatingState || (move.executionState === "completed" ? "drilling" : "standby"),
@@ -291,22 +448,45 @@ function sortMoves(moves) {
 }
 
 export async function hydrateMoves(managerId, { summary = false } = {}) {
-  void summary;
   if (!managerId) {
     return setMovesCache([]);
   }
 
-  return readMoves().filter((move) => {
-    const moveManagerId = move.createdBy?.role === "Manager" ? move.createdBy?.id : move.createdBy?.managerId;
+  const remoteMoves = await fetchMoveRecords(managerId, { summary });
+  const backupMoves = Object.values(readMoveBackups()).filter((move) => {
+    const moveManagerId = move?.createdBy?.role === "Manager" ? move.createdBy?.id : move?.createdBy?.managerId;
     return moveManagerId === managerId;
   });
+
+  return setMovesCache(mergeMoveCollections(remoteMoves, backupMoves));
 }
 
 export async function fetchMove(moveId) {
-  const payload = normalizeStoredMove(await fetchMoveDoc(moveId));
+  let payload = null;
+
+  try {
+    payload = normalizeStoredMove(await fetchMoveRecord(moveId));
+  } catch {
+    payload = null;
+  }
+
+  if (!payload) {
+    try {
+      payload = normalizeStoredMove(await fetchMoveDoc(moveId));
+    } catch {
+      payload = null;
+    }
+  }
+
+  if (!payload) {
+    payload = readMoveBackup(moveId);
+  }
+
   if (!payload) {
     return null;
   }
+
+  persistMoveBackup(payload);
   const current = readMoves().filter((item) => item.id !== payload.id);
   setMovesCache([payload, ...current]);
   return payload;
@@ -317,13 +497,18 @@ export function readMoves() {
 }
 
 export async function upsertMove(move) {
-  const savedMove = normalizeStoredMove(await saveMoveDoc(normalizeStoredMove(move)));
+  const compactedMove = compactMoveForStorage(normalizeStoredMove(move));
+  const savedMove = normalizeStoredMove(await saveMoveRecord(compactedMove));
+  persistMoveBackup(savedMove);
+  void saveMoveDoc(compactedMove).catch(() => {});
   const current = readMoves().filter((item) => item.id !== savedMove.id);
   return setMovesCache([savedMove, ...current]);
 }
 
 export async function removeMove(moveId) {
-  await deleteMoveDoc(moveId);
+  await deleteMoveRecord(moveId);
+  removeMoveBackup(moveId);
+  void deleteMoveDoc(moveId).catch(() => {});
   return setMovesCache(readMoves().filter((move) => move.id !== moveId));
 }
 
@@ -364,15 +549,25 @@ export async function persistMoveSession(moveId, sessionState) {
     },
   });
 
-  await saveMoveDoc({
-    id: moveId,
-    ...sessionState,
-    executionProgress: updatedMove.executionProgress,
+  const persistedMove = compactMoveForStorage({
+    ...updatedMove,
     updatedAt: new Date().toISOString(),
   });
-  const current = readMoves().filter((item) => item.id !== updatedMove.id);
-  setMovesCache([updatedMove, ...current]);
-  return updatedMove;
+  const syncedMove = normalizeStoredMove(persistedMove);
+
+  await saveMoveRecord(persistedMove);
+  persistMoveBackup(persistedMove);
+  void saveMoveDoc({
+    id: moveId,
+    managerId: updatedMove.managerId,
+    createdBy: updatedMove.createdBy,
+    ...sessionState,
+    executionProgress: updatedMove.executionProgress,
+    updatedAt: persistedMove.updatedAt,
+  }).catch(() => {});
+  const current = readMoves().filter((item) => item.id !== syncedMove.id);
+  setMovesCache([syncedMove, ...current]);
+  return syncedMove;
 }
 
 export function createMoveRecord({ name, startPoint, endPoint, startLabel, endLabel, simulation, routeMode, loadCount, createdBy = null }) {

@@ -108,6 +108,7 @@ class LoadDependency(Base):
             "load_template_id",
             "depends_on_load_template_id",
             "dependency_phase",
+            "predecessor_activity_code",
             name="uq_load_dependency_phase",
         ),
     )
@@ -120,6 +121,7 @@ class LoadDependency(Base):
         index=True,
     )
     dependency_phase: Mapped[str] = mapped_column(String, nullable=False, default="general")
+    predecessor_activity_code: Mapped[str | None] = mapped_column(String, nullable=True)
 
     load_template: Mapped[LoadTemplate] = relationship(
         "LoadTemplate",

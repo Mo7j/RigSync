@@ -4,8 +4,9 @@ import {
   DEFAULT_TRUCK_SETUP,
 } from "./lib/constants.js";
 import { fetchLoads, fetchLocationLabel } from "./features/rigMoves/api.js";
-import { buildLogicalLoads, buildScenarioPlans, fetchRouteData, fallbackRouteData } from "./features/rigMoves/simulation.js";
-import { buildOperatingSnapshot, buildStartupTransferLoads, buildStartupTransferSchedule } from "./features/rigMoves/operations.js";
+import { buildLogicalLoads, fetchRouteData, fallbackRouteData } from "./features/rigMoves/simulation.js";
+import { buildScenarioPlans } from "./features/rigMoves/isePlanner.js";
+import { buildOperatingSnapshot, buildStartupTransferSchedule } from "./features/rigMoves/operations.js";
 import { applyRigInventoryAdjustments, hydrateRigInventoryAdjustments, readRigInventoryAdjustments, setRigInventoryCache, writeRigInventoryAdjustments } from "./features/rigInventory/storage.js";
 import {
   authenticateUser,
@@ -17,8 +18,9 @@ import {
   clearSession,
 } from "./features/auth/auth.js";
 import {
+  hydrateMoves,
+  mergeMovesCache,
   readMoves,
-  setMovesCache,
   fetchMove,
   createMoveRecord,
   upsertMove,
@@ -168,8 +170,7 @@ function hasMultiTruckPlans(move) {
 function isMoveDetailLoaded(move) {
   return Boolean(
     move?.simulation?.scenarioPlans?.length ||
-    move?.simulation?.bestPlan?.playback?.trips?.length ||
-    move?.simulation?.routeGeometry?.length,
+    move?.simulation?.bestPlan?.playback?.trips?.length,
   );
 }
 
@@ -433,13 +434,14 @@ function buildPlanningLoadsForMove({ baseLogicalLoads, move, teamMoves, startupR
     logicalLoads: baseLogicalLoads,
     startupRequirements,
   });
-  const supportRouteMap = Object.fromEntries(
-    ((move?.simulation?.supportRoutes || []).map((route) => [route.key, route])),
-  );
+  void operatingSnapshot;
 
   return [
     ...(baseLogicalLoads || []),
-    ...buildStartupTransferLoads(operatingSnapshot.startupLoads, supportRouteMap),
+    ...buildLogicalLoads(startupRequirements || []).map((load) => ({
+      ...load,
+      source_kind: "startup",
+    })),
   ];
 }
 
@@ -483,6 +485,7 @@ function App() {
   const lastPersistedMinuteRef = useRef(0);
   const lastPlaybackUiUpdateRef = useRef(0);
   const lastSavedMoveSessionRef = useRef("");
+  const [routeMoveFallback, setRouteMoveFallback] = useState(null);
 
   useEffect(() => {
     const normalizedLanguage = language === "ar" ? "ar" : "en";
@@ -683,7 +686,13 @@ function App() {
       : moves.filter(Boolean);
   const activeMove =
     route.page === "move"
-      ? visibleMoves.find((move) => move && String(move.id) === String(route.moveId)) || null
+      ? (
+          visibleMoves.find((move) => move && String(move.id) === String(route.moveId)) ||
+          managerScopedMoves.find((move) => move && String(move.id) === String(route.moveId)) ||
+          (routeMoveFallback && String(routeMoveFallback.id) === String(route.moveId) ? routeMoveFallback : null) ||
+          moves.find((move) => move && String(move.id) === String(route.moveId)) ||
+          null
+        )
       : null;
   const activeScenario = getActiveScenario(activeMove);
   const activeTotalMinutes = activeScenario?.bestVariant?.totalMinutes || 0;
@@ -741,8 +750,15 @@ function App() {
 
     setAreMovesHydrated(false);
 
+    void hydrateMoves(managerId, { summary: true })
+      .then((hydratedMoves) => {
+        setMoves(hydratedMoves);
+        setAreMovesHydrated(true);
+      })
+      .catch(() => {});
+
     const unsubscribeMoves = subscribeManagerMoves(managerId, (remoteMoves) => {
-      const normalizedMoves = setMovesCache(remoteMoves);
+      const normalizedMoves = mergeMovesCache(remoteMoves);
       setMoves(normalizedMoves);
       setAreMovesHydrated(true);
     });
@@ -820,11 +836,13 @@ function App() {
 
     async function hydrateActiveMove() {
       if (route.page !== "move" || !route.moveId) {
+        setRouteMoveFallback(null);
         setIsActiveMoveHydrated(false);
         return;
       }
 
       if (activeMove && isMoveDetailLoaded(activeMove)) {
+        setRouteMoveFallback(activeMove);
         setIsActiveMoveHydrated(true);
         return;
       }
@@ -833,11 +851,15 @@ function App() {
 
       try {
         const hydratedMove = await fetchMove(route.moveId);
-        if (!cancelled) {
+        if (!cancelled && hydratedMove) {
+          setRouteMoveFallback(hydratedMove);
           setMoves((current) => {
             const remaining = current.filter((move) => move.id !== hydratedMove.id);
             return [hydratedMove, ...remaining];
           });
+          setIsActiveMoveHydrated(true);
+        } else if (!cancelled) {
+          setRouteMoveFallback(null);
           setIsActiveMoveHydrated(true);
         }
       } catch {
@@ -853,6 +875,16 @@ function App() {
       cancelled = true;
     };
   }, [route.page, route.moveId, activeMove?.id, activeMove?.updatedAt]);
+
+  useEffect(() => {
+    if (route.page !== "move" || !route.moveId || !activeMove) {
+      return;
+    }
+
+    if (String(activeMove.id) === String(route.moveId)) {
+      setRouteMoveFallback(activeMove);
+    }
+  }, [route.page, route.moveId, activeMove]);
 
   useEffect(() => {
     if (!foremanRigContext?.rig?.id) {
@@ -1352,10 +1384,12 @@ function App() {
       completedStages: 6,
       totalStages: 8,
     });
-    const supportRouteMap = Object.fromEntries(supportRoutesWithPickup.map((route) => [route.key, route]));
     const planningLoads = [
       ...(logicalLoads || []),
-      ...buildStartupTransferLoads(operatingSnapshot.startupLoads, supportRouteMap),
+      ...buildLogicalLoads(startupRequirements || []).map((load) => ({
+        ...load,
+        source_kind: "startup",
+      })),
     ];
     const normalizedScenarioTruckSetup = (scenarioTruckSetup || sanitizedTruckSetup)
       .map((item) => ({
@@ -1592,6 +1626,8 @@ function App() {
       simulation: {
         ...targetMove.simulation,
         preferredScenarioName: scenarioName,
+        bestScenario: selectedScenario,
+        bestPlan: selectedScenario.bestVariant || targetMove.simulation.bestPlan,
       },
     };
 

@@ -59,6 +59,10 @@ function isSerializedArray(value) {
 }
 
 function serializeMoveValue(value, { nestedInArray = false } = {}) {
+  if (value === undefined) {
+    return nestedInArray ? null : undefined;
+  }
+
   if (isCoordinatePair(value)) {
     return {
       __rigsyncType: "point",
@@ -79,7 +83,9 @@ function serializeMoveValue(value, { nestedInArray = false } = {}) {
 
   if (value && typeof value === "object") {
     return Object.fromEntries(
-      Object.entries(value).map(([key, entryValue]) => [key, serializeMoveValue(entryValue)]),
+      Object.entries(value)
+        .map(([key, entryValue]) => [key, serializeMoveValue(entryValue)])
+        .filter(([, entryValue]) => entryValue !== undefined),
     );
   }
 
@@ -245,6 +251,11 @@ export async function ensureSeedUsers(users = []) {
 }
 
 export function subscribeManagerMoves(managerId, callback) {
+  if (!managerId) {
+    callback([]);
+    return () => {};
+  }
+
   const ref = query(collection(firebaseDb, FIRESTORE_COLLECTIONS.moves), where("managerId", "==", managerId));
   return onSnapshot(ref, (snapshot) => {
     callback(snapshot.docs.map(normalizeDocSnapshot).filter(Boolean).map(deserializeMovePayload));
@@ -256,13 +267,37 @@ export async function fetchMoveDoc(moveId) {
   return deserializeMovePayload(normalizeDocSnapshot(snapshot));
 }
 
+function deriveMoveManagerId(move = {}) {
+  return (
+    move.managerId ||
+    (move.createdBy?.role === "Manager" ? move.createdBy?.id : move.createdBy?.managerId) ||
+    null
+  );
+}
+
 export async function saveMoveDoc(move) {
   const payload = serializeMovePayload({
     ...move,
+    managerId: deriveMoveManagerId(move),
+    createdBy: move.createdBy
+      ? {
+          ...move.createdBy,
+          managerId: move.createdBy.managerId || deriveMoveManagerId(move),
+        }
+      : move.createdBy,
     updatedAt: new Date().toISOString(),
   });
   await setDoc(doc(firebaseDb, FIRESTORE_COLLECTIONS.moves, move.id), payload, { merge: true });
-  return move;
+  return {
+    ...move,
+    managerId: deriveMoveManagerId(move),
+    createdBy: move.createdBy
+      ? {
+          ...move.createdBy,
+          managerId: move.createdBy.managerId || deriveMoveManagerId(move),
+        }
+      : move.createdBy,
+  };
 }
 
 export async function deleteMoveDoc(moveId) {

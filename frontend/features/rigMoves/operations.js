@@ -105,8 +105,19 @@ export function buildStartupTransferLoads(startupLoads = [], supportRouteMap = {
           rig_up_duration: load.avg_rig_up_minutes || 45,
           optimal_rig_down_duration: 20,
           optimal_rig_up_duration: Math.max(15, Math.round((load.avg_rig_up_minutes || 45) * 0.85)),
-          min_worker_count: 2,
-          optimal_worker_count: 4,
+          min_worker_count: Math.max(1, Number.parseInt(load.minimum_crew_up_count, 10) || 2),
+          optimal_worker_count: Math.max(
+            Math.max(1, Number.parseInt(load.minimum_crew_up_count, 10) || 2),
+            Number.parseInt(load.optimal_crew_up_count, 10) || 4,
+          ),
+          minimum_crew_roles: {
+            rig_down: {},
+            rig_up: load.minimum_crew_up_roles || {},
+          },
+          optimal_crew_roles: {
+            rig_down: {},
+            rig_up: load.optimal_crew_up_roles || {},
+          },
           sourceLabel: source.rigLabel,
           sourcePoint: source.rigPoint || null,
           destinationLabel: supportRoute?.destinationLabel || "Destination",
@@ -116,6 +127,7 @@ export function buildStartupTransferLoads(startupLoads = [], supportRouteMap = {
           routeDistanceKm: supportRoute?.routeDistanceKm || null,
           routeGeometry: supportRoute?.geometry || null,
           rig_down_dependency_codes: load.rig_down_dependency_codes || [],
+          rig_move_dependency_codes: load.rig_move_dependency_codes || [],
           rig_up_dependency_codes: load.rig_up_dependency_codes || [],
           source_kind: "startup",
           dependency_ids: [],
@@ -143,18 +155,43 @@ export function buildStartupTransferSchedule(startupLoads = [], destinationLabel
 
 function normalizeStartupRequirements(startupRequirements = []) {
   const source = startupRequirements?.length ? startupRequirements : DEFAULT_STARTUP_REQUIREMENTS;
-  return source.map((load) => ({
+  const grouped = new Map();
+
+  source.forEach((load) => {
+    const id = String(load.id || load.code || "").trim() || crypto.randomUUID();
+    const baseId = id.replace(/-L\d+$/i, "");
+    if (!grouped.has(baseId)) {
+      grouped.set(baseId, {
+        ...load,
+        id: baseId,
+        description: load.description || "Startup load",
+        count: 0,
+        priority: Number.parseInt(load.priority, 10) || 0,
+        truckTypes: normalizeTruckTypes(load.truckTypes || load.truck_types || load.truck_type),
+        dependencyLabel: load.dependencyLabel || "Standalone startup load",
+        isReusable: Boolean(load.isReusable),
+        avg_rig_up_minutes: Number.parseInt(load.avg_rig_up_minutes, 10) || null,
+        rig_down_dependency_codes: [],
+        rig_move_dependency_codes: [],
+        rig_up_dependency_codes: [],
+      });
+    }
+
+    const entry = grouped.get(baseId);
+    entry.count += Math.max(1, Number.parseInt(load.count ?? load.load_count, 10) || 1);
+    entry.priority = Math.min(entry.priority, Number.parseInt(load.priority, 10) || entry.priority || 0);
+    entry.avg_rig_up_minutes = entry.avg_rig_up_minutes || Number.parseInt(load.avg_rig_up_minutes, 10) || null;
+    entry.truckTypes = [...new Set([...entry.truckTypes, ...normalizeTruckTypes(load.truckTypes || load.truck_types || load.truck_type)])];
+    entry.rig_move_dependency_codes.push(...parseDependencyCodes(load.rig_move_dependency_codes || load.dependencyLabel));
+    entry.rig_up_dependency_codes.push(...parseDependencyCodes(load.rig_up_dependency_codes || load.dependencyLabel));
+    entry.isReusable = entry.isReusable || Boolean(load.isReusable);
+  });
+
+  return [...grouped.values()].map((load) => ({
     ...load,
-    id: load.id,
-    description: load.description || "Startup load",
-    count: Math.max(1, Number.parseInt(load.count ?? load.load_count, 10) || 1),
-    priority: Number.parseInt(load.priority, 10) || 0,
-    truckTypes: normalizeTruckTypes(load.truckTypes || load.truck_types || load.truck_type),
-    dependencyLabel: load.dependencyLabel || "Standalone startup load",
-    isReusable: Boolean(load.isReusable),
-    avg_rig_up_minutes: Number.parseInt(load.avg_rig_up_minutes, 10) || null,
-    rig_down_dependency_codes: parseDependencyCodes(load.rig_down_dependency_codes || load.dependencyLabel),
-    rig_up_dependency_codes: parseDependencyCodes(load.rig_up_dependency_codes || load.dependencyLabel),
+    rig_down_dependency_codes: [...new Set(load.rig_down_dependency_codes)],
+    rig_move_dependency_codes: [...new Set(load.rig_move_dependency_codes)],
+    rig_up_dependency_codes: [...new Set(load.rig_up_dependency_codes)],
   }));
 }
 

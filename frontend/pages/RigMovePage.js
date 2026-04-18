@@ -7,11 +7,11 @@ import { Field, TextInput } from "../components/ui/Field.js";
 import { Modal } from "../components/ui/Modal.js";
 import { formatLocationLabel, formatMinutes } from "../lib/format.js";
 import { translate } from "../lib/language.js";
-import { buildScenarioPlans } from "../features/rigMoves/simulation.js";
+import { buildScenarioPlans } from "../features/rigMoves/isePlanner.js";
 import { buildOperatingSnapshot, buildStartupTransferSchedule } from "../features/rigMoves/operations.js";
 import { persistMoveSession } from "../features/rigMoves/storage.js";
 
-const { useDeferredValue, useEffect, useMemo, useRef, useState } = React;
+const { useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } = React;
 
 function normalizeTruckTypeKey(type) {
   const normalized = String(type || "")
@@ -383,15 +383,15 @@ function getPlanSummary(scenario) {
     totalMinutes: scenario?.totalMinutes || 0,
     totalLoads: trips.length,
     roundTrips: countRoundTrips(playback),
-    routeOrder: scenario?.bestVariant?.name || "Best route order",
-    waves: scenario?.bestVariant?.waves?.length || scenario?.waves?.length || 0,
+    routeOrder: scenario?.name || scenario?.bestVariant?.name || "Selected plan",
+    waves: 0,
   };
 }
 
 function formatCurrency(value) {
-  return new Intl.NumberFormat("en-US", {
+  return new Intl.NumberFormat("en-SA", {
     style: "currency",
-    currency: "USD",
+    currency: "SAR",
     maximumFractionDigits: 0,
   }).format(Math.max(0, value));
 }
@@ -595,7 +595,13 @@ function getPlanDashboardStats(scenario, move) {
   const criticalLoadIds = new Set(criticalTasks.map((task) => task.loadId));
   const totalMinutes = Math.max(scenario?.totalMinutes || 0, 1);
   const allocatedTruckSetup = scenario?.allocatedTruckSetup || scenario?.truckSetup || [];
-  const usedTruckCount = Math.max(1, Number.parseInt(scenario?.truckCount, 10) || 1);
+  const usedTruckCount = Math.max(
+    1,
+    new Set(trips.map((trip) => trip.truckId).filter(Boolean)).size ||
+      (scenario?.usedTruckSetup || []).reduce((sum, truck) => sum + Math.max(0, Number.parseInt(truck?.count, 10) || 0), 0) ||
+      Number.parseInt(scenario?.truckCount, 10) ||
+      1,
+  );
   const allocatedTruckCount = Math.max(
     usedTruckCount,
     allocatedTruckSetup.reduce((sum, truck) => sum + Math.max(0, Number.parseInt(truck?.count, 10) || 0), 0) ||
@@ -748,50 +754,46 @@ function getPlanComparisonStats(scenarios, selectedScenario, move, currentMinute
 }
 
 function getPlanRadarComparisonModel(scenarios, selectedScenario, move) {
-  const selectedName = selectedScenario?.name;
-  const selectedPlan = {
-    key: selectedName || "selected-preview",
-    name: selectedName || "Balanced Plan",
-    totalMinutes: 23 * 24 * 60,
-    totalCost: 172000,
-    utilization: 84,
-    reliability: 88,
-    flexibility: 80,
-    isSelected: true,
-  };
-  const previewCandidates = [
-    selectedPlan,
-    {
-      key: "preview-fast",
-      name: "Fast Track",
-      totalMinutes: 19 * 24 * 60,
-      totalCost: 204000,
-      utilization: 90,
-      reliability: 78,
-      flexibility: 72,
-      isSelected: false,
-    },
-    {
-      key: "preview-lean",
-      name: "Lean Cost",
-      totalMinutes: 27 * 24 * 60,
-      totalCost: 138000,
-      utilization: 76,
-      reliability: 83,
-      flexibility: 91,
-      isSelected: false,
-    },
-  ];
-  const completedPlans = previewCandidates;
+  const completedPlans = (scenarios || [])
+    .filter((scenario) => (scenario?.totalMinutes || 0) > 0)
+    .map((scenario) => {
+      const truckCount = Math.max(
+        1,
+        Number(scenario?.allocatedTruckCount) ||
+          Number(scenario?.truckCount) ||
+          (scenario?.allocatedTruckSetup || scenario?.truckSetup || []).reduce(
+            (sum, truck) => sum + Math.max(0, Number.parseInt(truck?.count, 10) || 0),
+            0,
+          ) ||
+          1,
+      );
+      const totalLoads = scenario?.bestVariant?.playback?.trips?.length || 0;
+      const baselineCost = Math.max(0, Number(scenario?.manualBaseline?.costEstimate) || 0);
+      const savingsPercent =
+        baselineCost > 0
+          ? Math.max(0, Math.round((((baselineCost - Math.max(0, Number(scenario?.costEstimate) || 0)) / baselineCost) * 100)))
+          : Math.max(0, Number(scenario?.savingsVsBaselinePercent) || 0);
+
+      return {
+        key: scenario.name,
+        name: scenario.name,
+        totalMinutes: Math.max(0, Number(scenario?.totalMinutes) || 0),
+        totalCost: Math.max(0, Number(scenario?.costEstimate) || 0),
+        utilization: Math.max(0, Number(scenario?.truckUtilization) || Number(scenario?.utilization) || 0),
+        savings: savingsPercent,
+        idleMinutes: Math.max(0, Number(scenario?.idleMinutes) || 0),
+        fleetUse: totalLoads > 0 ? Math.round((totalLoads / truckCount) * 10) / 10 : 0,
+        isSelected: scenario?.name === selectedScenario?.name,
+      };
+    });
 
   const metrics = [
     { key: "totalMinutes", label: "Time", invert: true },
     { key: "totalCost", label: "Cost", invert: true },
     { key: "utilization", label: "Utilization", invert: false },
-    { key: "reliability", label: "Reliability", invert: false },
-    { key: "flexibility", label: "Flexibility", invert: false },
+    { key: "savings", label: "Savings", invert: false },
+    { key: "idleMinutes", label: "Idle", invert: true },
   ];
-  const colors = ["#f5b63a", "#58c4dd", "#7ddc84"];
   const bounds = metrics.reduce((result, metric) => {
     const values = completedPlans.map((plan) => plan[metric.key]);
     const min = values.length ? Math.min(...values) : 0;
@@ -804,17 +806,15 @@ function getPlanRadarComparisonModel(scenarios, selectedScenario, move) {
     metrics,
     plans: completedPlans.map((plan, index) => ({
       ...plan,
-      color: plan.isSelected ? "#f5b63a" : "rgba(178, 186, 199, 0.55)",
+      color: plan.isSelected ? "#f5b63a" : ["#58c4dd", "#7ddc84", "#9ab0c0", "#ef8b5d"][index % 4],
       displayScores: metrics.map((metric) => {
-        if (metric.key === "totalMinutes" || metric.key === "totalCost") {
-          const { min, max } = bounds[metric.key];
-          if (max === min) {
-            return 90;
-          }
-          const normalized = (plan[metric.key] - min) / Math.max(max - min, 1);
-          return Math.round(55 + ((1 - normalized) * 42));
+        const { min, max } = bounds[metric.key];
+        if (max === min) {
+          return 90;
         }
-        return Math.round(plan[metric.key]);
+        const normalized = (plan[metric.key] - min) / Math.max(max - min, 1);
+        const score = metric.invert ? 1 - normalized : normalized;
+        return Math.round(55 + (score * 42));
       }),
       values: metrics.map((metric) => {
         const { min, max } = bounds[metric.key];
@@ -1133,29 +1133,16 @@ function buildTruckScheduleRows(playback) {
     return "scene-timeline-segment-truck-heavyhaul";
   }
 
-  const usedTruckIds = [...new Set(journeys.map((trip) => trip.truckId))].sort((left, right) => left - right);
+  const usedTruckIds = [...new Set(journeys.map((trip) => trip.truckId).filter(Boolean))].sort((left, right) => String(left).localeCompare(String(right)));
 
   return usedTruckIds.map((truckId) => {
     let rowToneClass = "scene-timeline-segment-truck-heavyhaul";
-    const truckItems = journeys
-      .filter((trip) => trip.truckId === truckId)
+    const truckTrips = journeys.filter((trip) => trip.truckId === truckId);
+    const truckTypeLabel = truckTrips[0]?.truckType || "Truck";
+    const truckItems = truckTrips
       .flatMap((trip, tripIndex) => {
         const items = [];
         const toneClass = getTruckToneClass(trip.truckType);
-
-        if ((trip.pickupLoadStart ?? 0) > (trip.dispatchStart ?? trip.pickupLoadStart ?? 0)) {
-          items.push({
-            key: `${truckId}-${trip.loadId}-${tripIndex}-pickup`,
-            loadId: trip.loadIds?.[0] ?? trip.loadId,
-            description: `${trip.description} to pickup`,
-            startMinute: trip.dispatchStart ?? trip.pickupLoadStart,
-            endMinute: trip.moveStart ?? trip.pickupLoadStart,
-            left: (((trip.dispatchStart ?? trip.pickupLoadStart) / totalMinutes) * 100),
-            width: ((((trip.moveStart ?? trip.pickupLoadStart) - (trip.dispatchStart ?? trip.pickupLoadStart)) / totalMinutes) * 100),
-            toneClass,
-            label: trip.description || getLoadDisplayLabel(trip),
-          });
-        }
 
         if ((trip.arrivalAtDestination ?? 0) > (trip.moveStart ?? trip.pickupLoadFinish ?? trip.rigDownFinish ?? 0)) {
           items.push({
@@ -1166,20 +1153,6 @@ function buildTruckScheduleRows(playback) {
             endMinute: trip.arrivalAtDestination,
             left: (((trip.moveStart ?? trip.pickupLoadFinish ?? trip.rigDownFinish) / totalMinutes) * 100),
             width: (((trip.arrivalAtDestination - (trip.moveStart ?? trip.pickupLoadFinish ?? trip.rigDownFinish)) / totalMinutes) * 100),
-            toneClass,
-            label: trip.description || getLoadDisplayLabel(trip),
-          });
-        }
-
-        if ((trip.returnToSource ?? 0) > (trip.returnStart ?? trip.unloadDropFinish ?? trip.arrivalAtDestination ?? 0)) {
-          items.push({
-            key: `${truckId}-${trip.loadId}-${tripIndex}-return`,
-            loadId: trip.loadIds?.[0] ?? trip.loadId,
-            description: `${trip.description} return`,
-            startMinute: trip.returnStart ?? trip.unloadDropFinish ?? trip.arrivalAtDestination,
-            endMinute: trip.returnToSource,
-            left: (((trip.returnStart ?? trip.unloadDropFinish ?? trip.arrivalAtDestination) / totalMinutes) * 100),
-            width: (((trip.returnToSource - (trip.returnStart ?? trip.unloadDropFinish ?? trip.arrivalAtDestination)) / totalMinutes) * 100),
             toneClass,
             label: trip.description || getLoadDisplayLabel(trip),
           });
@@ -1196,10 +1169,18 @@ function buildTruckScheduleRows(playback) {
     return {
       key: `truck-${truckId}`,
       truckId,
+      label: String(truckId),
+      subLabel: `${truckTypeLabel} | ${truckItems.length} move${truckItems.length === 1 ? "" : "s"}`,
+      subLabel: `${truckTypeLabel} · ${truckItems.length} move segment${truckItems.length === 1 ? "" : "s"}`,
+      subLabel: `${truckTypeLabel} | ${truckItems.length} move${truckItems.length === 1 ? "" : "s"}`,
       toneClass: rowToneClass,
       items: truckItems,
-      loadCount: journeys.filter((trip) => trip.truckId === truckId).length,
+      loadCount: truckTrips.length,
     };
+  }).sort((left, right) => {
+    const leftStart = left.items[0]?.startMinute ?? Number.MAX_SAFE_INTEGER;
+    const rightStart = right.items[0]?.startMinute ?? Number.MAX_SAFE_INTEGER;
+    return leftStart - rightStart || String(left.truckId).localeCompare(String(right.truckId));
   });
 }
 
@@ -1223,21 +1204,7 @@ function buildLoadScheduleRows(playback) {
           left: (((trip.rigDownStart ?? trip.loadStart ?? 0) / totalMinutes) * 100),
           width: (((trip.rigDownFinish || 0) - (trip.rigDownStart ?? trip.loadStart ?? 0)) / totalMinutes) * 100,
           toneClass: "scene-timeline-segment-down",
-          label: "Down",
-        });
-      }
-
-      if ((trip.pickupLoadFinish ?? 0) > (trip.pickupLoadStart ?? trip.rigDownFinish ?? 0)) {
-        items.push({
-          key: `load-${trip.loadId}-${index}-pickup`,
-          loadId: trip.loadId,
-          description: `${trip.description} pickup`,
-          startMinute: trip.pickupLoadStart ?? trip.rigDownFinish,
-          endMinute: trip.pickupLoadFinish,
-          left: (((trip.pickupLoadStart ?? trip.rigDownFinish ?? 0) / totalMinutes) * 100),
-          width: (((trip.pickupLoadFinish || 0) - (trip.pickupLoadStart ?? trip.rigDownFinish ?? 0)) / totalMinutes) * 100,
-          toneClass: "scene-timeline-segment-truck-lowbed",
-          label: "Pickup",
+          label: "RD",
         });
       }
 
@@ -1251,21 +1218,7 @@ function buildLoadScheduleRows(playback) {
           left: (((trip.moveStart ?? trip.pickupLoadFinish ?? trip.rigDownFinish ?? 0) / totalMinutes) * 100),
           width: (((trip.arrivalAtDestination || 0) - (trip.moveStart ?? trip.pickupLoadFinish ?? trip.rigDownFinish ?? 0)) / totalMinutes) * 100,
           toneClass: "scene-timeline-segment-move",
-          label: "Move",
-        });
-      }
-
-      if ((trip.unloadDropFinish ?? 0) > (trip.unloadDropStart ?? trip.arrivalAtDestination ?? 0)) {
-        items.push({
-          key: `load-${trip.loadId}-${index}-drop`,
-          loadId: trip.loadId,
-          description: `${trip.description} unload`,
-          startMinute: trip.unloadDropStart ?? trip.arrivalAtDestination,
-          endMinute: trip.unloadDropFinish,
-          left: (((trip.unloadDropStart ?? trip.arrivalAtDestination ?? 0) / totalMinutes) * 100),
-          width: (((trip.unloadDropFinish || 0) - (trip.unloadDropStart ?? trip.arrivalAtDestination ?? 0)) / totalMinutes) * 100,
-          toneClass: "scene-timeline-segment-truck-flatbed",
-          label: "Drop",
+          label: "RM",
         });
       }
 
@@ -1279,7 +1232,7 @@ function buildLoadScheduleRows(playback) {
           left: (((trip.rigUpStart ?? trip.arrivalAtDestination ?? 0) / totalMinutes) * 100),
           width: (((trip.rigUpFinish || 0) - (trip.rigUpStart ?? trip.arrivalAtDestination ?? 0)) / totalMinutes) * 100,
           toneClass: "scene-timeline-segment-up",
-          label: "Up",
+          label: "RU",
         });
       }
 
@@ -1288,11 +1241,17 @@ function buildLoadScheduleRows(playback) {
         loadId: trip.loadId,
         label: `${getLoadDisplayLabel(trip)} · ${trip.description || `Load ${getLoadDisplayLabel(trip)}`}`,
         subLabel: `${sourceLabel} load · ${items.length} task segment${items.length === 1 ? "" : "s"}`,
+        label: getLoadDisplayLabel(trip),
+        subLabel: `${trip.description || `${sourceLabel} load`} | ${sourceLabel}`,
         sourceKind,
         items,
       };
     })
-    .sort((left, right) => left.loadId - right.loadId);
+    .sort((left, right) => {
+      const leftStart = left.items[0]?.startMinute ?? Number.MAX_SAFE_INTEGER;
+      const rightStart = right.items[0]?.startMinute ?? Number.MAX_SAFE_INTEGER;
+      return leftStart - rightStart || left.loadId - right.loadId;
+    });
 }
 
 function buildCriticalPathRows(playback) {
@@ -1784,6 +1743,11 @@ function FullScreenTimeline({
   currentMinute,
   zoom = 1,
   gapMinutes = 8 * 60,
+  rowType = "cpm",
+  title = null,
+  windowStartMinute = 0,
+  windowMinutes = null,
+  tickMinutes = null,
   cpOnly = false,
   showRD = true,
   showRM = true,
@@ -1797,43 +1761,65 @@ function FullScreenTimeline({
   const syncingBodyRef = useRef(false);
   const [hoverCard, setHoverCard] = useState(null);
   const totalMinutes = Math.max(playback?.totalMinutes || 1, 1);
-  const rowType = "cpm";
+  const visibleStartMinute = Math.max(0, Math.min(windowStartMinute, Math.max(0, totalMinutes - 1)));
+  const visibleDurationMinutes = Math.max(60, Math.min(windowMinutes || totalMinutes, totalMinutes));
+  const visibleEndMinute = Math.min(totalMinutes, visibleStartMinute + visibleDurationMinutes);
+  const visibleRangeMinutes = Math.max(1, visibleEndMinute - visibleStartMinute);
+  const shouldShowTrip = useCallback((trip) => {
+    if (!trip) {
+      return false;
+    }
+    if ((trip.typeCode === "RD" || trip.label === "RD") && !showRD) {
+      return false;
+    }
+    if ((trip.typeCode === "RM" || trip.label === "RM") && !showRM) {
+      return false;
+    }
+    if ((trip.typeCode === "RU" || trip.typeCode === "RU_SU" || trip.label === "RU") && !showRU) {
+      return false;
+    }
+    return true;
+  }, [showRD, showRM, showRU]);
   const rows = useMemo(() => {
-    const baseRows = buildCpmScheduleRows(playback);
-    return baseRows.filter((row) => {
-      const trip = row.items?.[0];
-      if (!trip) {
-        return false;
-      }
-      if (cpOnly && !row.critical) {
-        return false;
-      }
-      if (trip.typeCode === "RD" && !showRD) {
-        return false;
-      }
-      if (trip.typeCode === "RM" && !showRM) {
-        return false;
-      }
-      if ((trip.typeCode === "RU" || trip.typeCode === "RU_SU") && !showRU) {
-        return false;
-      }
-      return true;
-    });
-  }, [playback, cpOnly, showRD, showRM, showRU]);
-  const tickStepMinutes = 24 * 60;
-  const tickCount = Math.max(1, Math.ceil(totalMinutes / tickStepMinutes));
+    const baseRows =
+      rowType === "load"
+        ? buildLoadScheduleRows(playback)
+        : rowType === "truck"
+          ? buildTruckScheduleRows(playback)
+          : buildCpmScheduleRows(playback);
+    return baseRows
+      .map((row) => ({
+        ...row,
+        items: (row.items || []).filter((trip) =>
+          (trip.endMinute ?? 0) > visibleStartMinute &&
+          (trip.startMinute ?? 0) < visibleEndMinute &&
+          shouldShowTrip(trip),
+        ),
+      }))
+      .filter((row) => {
+        if (!row.items?.length) {
+          return false;
+        }
+        if (rowType === "cpm" && cpOnly && !row.critical) {
+          return false;
+        }
+        return true;
+      });
+  }, [playback, rowType, cpOnly, shouldShowTrip, visibleStartMinute, visibleEndMinute]);
+  const tickStepMinutes = Math.max(60, tickMinutes || (visibleRangeMinutes <= 12 * 60 ? 2 * 60 : 4 * 60));
+  const tickCount = Math.max(1, Math.ceil(visibleRangeMinutes / tickStepMinutes));
   const ticks = useMemo(
     () => Array.from({ length: tickCount + 1 }, (_, index) => {
-      const minute = Math.min(totalMinutes, index * tickStepMinutes);
+      const minute = Math.min(visibleEndMinute, visibleStartMinute + (index * tickStepMinutes));
       return {
         key: `timeline-tick-${index}`,
-        left: `${(minute / totalMinutes) * 100}%`,
-        label: `${(minute / (24 * 60)).toFixed(1)}d`,
+        left: `${((minute - visibleStartMinute) / visibleRangeMinutes) * 100}%`,
+        label: formatTimelineWindowLabel(minute),
       };
     }),
-    [tickCount, tickStepMinutes, totalMinutes],
+    [tickCount, tickStepMinutes, visibleStartMinute, visibleEndMinute, visibleRangeMinutes],
   );
-  const currentX = `${(Math.min(currentMinute, totalMinutes) / totalMinutes) * 100}%`;
+  const currentX = `${((Math.min(Math.max(currentMinute, visibleStartMinute), visibleEndMinute) - visibleStartMinute) / visibleRangeMinutes) * 100}%`;
   const pixelsPerTick = 112;
   const timelineWidth = Math.max(Math.round(tickCount * pixelsPerTick), 1);
 
@@ -1898,11 +1884,11 @@ function FullScreenTimeline({
   useEffect(() => {
     const bodyNode = bodyScrollRef.current;
     const headerNode = headerScrollRef.current;
-    if (!bodyNode || !headerNode || totalMinutes <= 0) {
+    if (!bodyNode || !headerNode || visibleRangeMinutes <= 0) {
       return;
     }
 
-    const markerOffset = (Math.min(currentMinute, totalMinutes) / totalMinutes) * timelineWidth;
+    const markerOffset = ((Math.min(Math.max(currentMinute, visibleStartMinute), visibleEndMinute) - visibleStartMinute) / visibleRangeMinutes) * timelineWidth;
     const viewportWidth = bodyNode.clientWidth;
     const maxScrollLeft = Math.max(0, timelineWidth - viewportWidth);
     const targetScrollLeft = Math.max(0, Math.min(maxScrollLeft, markerOffset - viewportWidth * 0.65));
@@ -1916,7 +1902,7 @@ function FullScreenTimeline({
       syncingHeaderRef.current = true;
       headerNode.scrollLeft = targetScrollLeft;
     }
-  }, [currentMinute, totalMinutes, timelineWidth]);
+  }, [currentMinute, visibleStartMinute, visibleEndMinute, visibleRangeMinutes, timelineWidth]);
 
   return h(
     "section",
@@ -1927,7 +1913,7 @@ function FullScreenTimeline({
       h(
         "div",
         { className: "scene-timeline-header-copy" },
-        h("span", null, rowType === "cpm" ? "CPM" : "Schedule"),
+        h("span", null, title || (rowType === "cpm" ? "CPM" : rowType === "load" ? "Load" : "Truck")),
         h("strong", null, "Chart"),
       ),
       h(
@@ -1937,7 +1923,7 @@ function FullScreenTimeline({
           h(
             "div",
             { key: `timeline-copy-${row.key || row.truckId}`, className: "scene-timeline-row-copy" },
-            h("strong", null, rowType === "phase" ? row.label : rowType === "load" ? row.label : rowType === "cpm" ? row.label : `Truck ${row.truckId}`),
+            h("strong", null, rowType === "phase" ? row.label : rowType === "load" ? row.label : rowType === "cpm" ? row.label : row.label || `Truck ${row.truckId}`),
             h(
               "span",
               null,
@@ -1958,6 +1944,12 @@ function FullScreenTimeline({
     h(
       "div",
       { className: "scene-timeline-main" },
+      h(
+        "div",
+        { className: "scene-timeline-window-banner" },
+        h("strong", null, formatTimelineWindowRange(visibleStartMinute, visibleEndMinute)),
+        h("span", null, visibleDurationMinutes === (12 * 60) ? "12-hour shift window" : "24-hour day window"),
+      ),
       h(
         "div",
         {
@@ -2026,26 +2018,23 @@ function FullScreenTimeline({
                   : trip.endMinute ?? trip.returnToSource ?? trip.rigUpFinish;
               const tripWidthPercent =
                 rowType === "phase" || rowType === "load" || rowType === "cpm"
-                  ? trip.width
-                  : trip.width ?? ((((trip.returnToSource ?? trip.rigUpFinish) - (trip.dispatchStart ?? trip.loadStart)) / totalMinutes) * 100);
+                  ? (((Math.min(tripEndMinute, visibleEndMinute) - Math.max(tripStartMinute, visibleStartMinute)) / visibleRangeMinutes) * 100)
+                  : (((Math.min(tripEndMinute, visibleEndMinute) - Math.max(tripStartMinute, visibleStartMinute)) / visibleRangeMinutes) * 100);
               const tripWidthPx = (tripWidthPercent / 100) * timelineWidth;
               const tripSizeClass = tripWidthPx < 18 ? " is-micro" : tripWidthPx < 44 ? " is-compact" : "";
-              const visibleDuration = Math.max(0, Math.min(currentMinute, tripEndMinute) - tripStartMinute);
+              const visibleDuration = Math.max(0, Math.min(currentMinute, tripEndMinute) - Math.max(tripStartMinute, visibleStartMinute));
               const activeFillPercent = tripEndMinute > tripStartMinute
                 ? Math.max(0, Math.min(100, (visibleDuration / (tripEndMinute - tripStartMinute)) * 100))
                 : 0;
               const toneClass = trip.toneClass || row.toneClass || "scene-timeline-segment-truck-heavyhaul";
-              const leftPercent =
-                rowType === "phase" || rowType === "load" || rowType === "cpm"
-                  ? trip.left
-                  : trip.left ?? (((trip.dispatchStart ?? trip.loadStart) / totalMinutes) * 100);
+              const leftPercent = ((Math.max(tripStartMinute, visibleStartMinute) - visibleStartMinute) / visibleRangeMinutes) * 100;
               const hoverText = rowType === "phase"
-                ? `${row.label} | ${getLoadDisplayLabel(trip)} | ${formatTimelineClock(tripStartMinute)} -> ${formatTimelineClock(tripEndMinute)}`
+                ? `${row.label} | ${getLoadDisplayLabel(trip)} | ${formatTimelineWindowLabel(tripStartMinute)} -> ${formatTimelineWindowLabel(tripEndMinute)}`
                 : rowType === "load"
-                    ? `${row.label} | ${trip.label} | ${formatTimelineClock(tripStartMinute)} -> ${formatTimelineClock(tripEndMinute)}`
+                    ? `${row.label} | ${trip.label} | ${formatTimelineWindowLabel(tripStartMinute)} -> ${formatTimelineWindowLabel(tripEndMinute)}`
                   : rowType === "cpm"
-                    ? `${row.label} | ${trip.description || trip.label} | ${trip.critical ? "Critical path | " : ""}${formatTimelineClock(tripStartMinute)} -> ${formatTimelineClock(tripEndMinute)}`
-                  : `Truck ${row.truckId} | ${getLoadDisplayLabel(trip)} | ${formatTimelineClock(tripStartMinute)} -> ${formatTimelineClock(tripEndMinute)}`;
+                    ? `${row.label} | ${trip.description || trip.label} | ${trip.critical ? "Critical path | " : ""}${formatTimelineWindowLabel(tripStartMinute)} -> ${formatTimelineWindowLabel(tripEndMinute)}`
+                  : `Truck ${row.truckId} | ${getLoadDisplayLabel(trip)} | ${formatTimelineWindowLabel(tripStartMinute)} -> ${formatTimelineWindowLabel(tripEndMinute)}`;
 
               return [
                 showFloatBar && !trip.critical && trip.floatMinutes > 0
@@ -2391,6 +2380,8 @@ function PlannerCanvas({
   timelineGapMinutes = 180,
 }) {
   const [activitySearch, setActivitySearch] = useState("");
+  const [ganttWindowHours, setGanttWindowHours] = useState(24);
+  const [ganttWindowIndex, setGanttWindowIndex] = useState(0);
   const [ganttFilters, setGanttFilters] = useState({
     cpOnly: false,
     showRD: true,
@@ -2430,6 +2421,21 @@ function PlannerCanvas({
   const totalTransportCost = costBreakdownRows.reduce((sum, row) => sum + row.tripCost, 0);
   const totalTransportDistance = costBreakdownRows.reduce((sum, row) => sum + row.distanceKm, 0);
   const criticalPathRows = criticalPathChain.map((task) => `${task.loadCode}`).filter((value, index, values) => values.indexOf(value) === index);
+  const ganttWindowMinutes = ganttWindowHours * 60;
+  const ganttWindowCount = Math.max(1, Math.ceil(Math.max(playback?.totalMinutes || 0, 1) / ganttWindowMinutes));
+  const boundedGanttWindowIndex = Math.max(0, Math.min(ganttWindowIndex, ganttWindowCount - 1));
+  const ganttWindowStartMinute = boundedGanttWindowIndex * ganttWindowMinutes;
+  const ganttTickMinutes = ganttWindowHours === 12 ? 60 : 120;
+
+  useEffect(() => {
+    if (ganttWindowIndex !== boundedGanttWindowIndex) {
+      setGanttWindowIndex(boundedGanttWindowIndex);
+    }
+  }, [ganttWindowIndex, boundedGanttWindowIndex]);
+
+  useEffect(() => {
+    setGanttWindowIndex((value) => Math.min(value, Math.max(0, ganttWindowCount - 1)));
+  }, [ganttWindowHours, ganttWindowCount]);
 
   return h(
     "section",
@@ -2627,15 +2633,44 @@ function PlannerCanvas({
     h(
       Card,
       { className: "scene-planner-canvas-card scene-planner-gantt-card" },
-      h("span", { className: "scene-panel-kicker" }, "Gantt Chart"),
+      h("span", { className: "scene-panel-kicker" }, "Load Gantt"),
       h(
         "div",
         { className: "scene-gantt-toolbar" },
-        h("label", { className: "scene-gantt-check" }, h("input", {
-          type: "checkbox",
-          checked: ganttFilters.cpOnly,
-          onChange: (event) => setGanttFilters((current) => ({ ...current, cpOnly: event.target.checked })),
-        }), h("span", null, "CP only")),
+        h("span", { className: "scene-planner-section-note" }, `${ganttWindowHours === 12 ? "Shift" : "Day"} ${boundedGanttWindowIndex + 1}/${ganttWindowCount}`),
+        h("span", { className: "scene-planner-section-note is-plain" }, formatTimelineWindowRange(ganttWindowStartMinute, Math.min((playback?.totalMinutes || 0), ganttWindowStartMinute + ganttWindowMinutes))),
+        h("button", {
+          type: "button",
+          className: "scene-timeline-back-button",
+          disabled: boundedGanttWindowIndex <= 0,
+          onClick: () => setGanttWindowIndex((value) => Math.max(0, value - 1)),
+          children: "Prev",
+        }),
+        h("button", {
+          type: "button",
+          className: "scene-timeline-back-button",
+          onClick: () => setGanttWindowHours(12),
+          disabled: ganttWindowHours === 12,
+          children: "12h",
+        }),
+        h("button", {
+          type: "button",
+          className: "scene-timeline-back-button",
+          onClick: () => setGanttWindowHours(24),
+          disabled: ganttWindowHours === 24,
+          children: "24h",
+        }),
+        h("button", {
+          type: "button",
+          className: "scene-timeline-back-button",
+          disabled: boundedGanttWindowIndex >= (ganttWindowCount - 1),
+          onClick: () => setGanttWindowIndex((value) => Math.min(ganttWindowCount - 1, value + 1)),
+          children: "Next",
+        }),
+      ),
+      h(
+        "div",
+        { className: "scene-gantt-toolbar" },
         h("label", { className: "scene-gantt-check" }, h("input", {
           type: "checkbox",
           checked: ganttFilters.showRD,
@@ -2656,7 +2691,7 @@ function PlannerCanvas({
           checked: true,
           disabled: true,
           readOnly: true,
-        }), h("span", null, "Days")),
+        }), h("span", null, ganttWindowHours === 12 ? "Shift view" : "Day view")),
         h("label", { className: "scene-gantt-check" }, h("input", {
           type: "checkbox",
           checked: ganttFilters.showFloatBar,
@@ -2668,20 +2703,47 @@ function PlannerCanvas({
         { className: "scene-gantt-legend" },
         h("span", { className: "scene-gantt-legend-item" }, h("i", { className: "scene-gantt-legend-dot is-rd" }), "Rig Down"),
         h("span", { className: "scene-gantt-legend-item" }, h("i", { className: "scene-gantt-legend-dot is-rm" }), "Moving"),
-        h("span", { className: "scene-gantt-legend-item" }, h("i", { className: "scene-gantt-legend-dot is-ru" }), "Rig Up (RL)"),
-        h("span", { className: "scene-gantt-legend-item" }, h("i", { className: "scene-gantt-legend-dot is-su" }), "Rig Up (SU)"),
-        h("span", { className: "scene-gantt-legend-item" }, h("i", { className: "scene-gantt-legend-dot is-critical" }), "Critical"),
+        h("span", { className: "scene-gantt-legend-item" }, h("i", { className: "scene-gantt-legend-dot is-ru" }), "Rig Up"),
       ),
       h(FullScreenTimeline, {
         playback,
         currentMinute,
         zoom,
+        rowType: "load",
+        title: "Load",
+        windowStartMinute: ganttWindowStartMinute,
+        windowMinutes: ganttWindowMinutes,
+        tickMinutes: ganttTickMinutes,
         gapMinutes: timelineGapMinutes,
-        cpOnly: ganttFilters.cpOnly,
         showRD: ganttFilters.showRD,
         showRM: ganttFilters.showRM,
         showRU: ganttFilters.showRU,
-        showFloatBar: ganttFilters.showFloatBar,
+        showFloatBar: false,
+      }),
+    ),
+    h(
+      Card,
+      { className: "scene-planner-canvas-card scene-planner-gantt-card" },
+      h("span", { className: "scene-panel-kicker" }, "Truck Gantt"),
+      h(
+        "div",
+        { className: "scene-gantt-legend" },
+        h("span", { className: "scene-gantt-legend-item" }, h("i", { className: "scene-gantt-legend-dot is-rm" }), "Truck Moving"),
+      ),
+      h(FullScreenTimeline, {
+        playback,
+        currentMinute,
+        zoom,
+        rowType: "truck",
+        title: "Truck",
+        windowStartMinute: ganttWindowStartMinute,
+        windowMinutes: ganttWindowMinutes,
+        tickMinutes: ganttTickMinutes,
+        gapMinutes: timelineGapMinutes,
+        showRD: false,
+        showRM: true,
+        showRU: false,
+        showFloatBar: false,
       }),
     ),
   );
@@ -2693,6 +2755,29 @@ function formatTimelineClock(totalMinutes) {
   const minutes = safeMinutes % 60;
 
   return `${hours}:${String(minutes).padStart(2, "0")}`;
+}
+
+function formatTimelineWindowLabel(minute) {
+  const safeMinutes = Math.max(0, Math.round(minute || 0));
+  const day = Math.floor(safeMinutes / (24 * 60)) + 1;
+  const dayMinute = safeMinutes % (24 * 60);
+  return `D${day} ${formatTimelineClock(dayMinute)}`;
+}
+
+function formatTimelineWindowRange(startMinute, endMinute) {
+  const safeStart = Math.max(0, Math.round(startMinute || 0));
+  const safeEnd = Math.max(safeStart, Math.round(endMinute || 0));
+  const startDay = Math.floor(safeStart / (24 * 60)) + 1;
+  const startDayMinute = safeStart % (24 * 60);
+  const endDay = Math.floor(Math.max(0, safeEnd - 1) / (24 * 60)) + 1;
+  const endDayMinute = safeEnd % (24 * 60);
+  if (safeEnd - safeStart <= 12 * 60) {
+    return `Shift view | D${startDay} ${formatTimelineClock(startDayMinute)} - D${endDay} ${formatTimelineClock(endDayMinute)}`;
+  }
+  if (startDay === endDay && startDayMinute === 0 && endDayMinute === 0) {
+    return `Day ${startDay}`;
+  }
+  return `Day view | D${startDay} ${formatTimelineClock(startDayMinute)} - D${endDay} ${formatTimelineClock(endDayMinute)}`;
 }
 
 function getTimelineWorkingMinutes(playback, rowType) {
@@ -3252,6 +3337,9 @@ export function RigMovePage({
       : String(Math.max(0, Number(executionProgress.ultrasonicLatestCm) || 0)),
   );
   const [liveDemoMinute, setLiveDemoMinute] = useState(0);
+  const [customScenario, setCustomScenario] = useState(null);
+  const [isCalculatingCustomPlan, setIsCalculatingCustomPlan] = useState(false);
+  const [customPlanError, setCustomPlanError] = useState("");
 
   function handleSceneModeChange(nextMode) {
     if (nextMode === "timeline") {
@@ -3434,6 +3522,12 @@ export function RigMovePage({
     };
   }, [move?.id, activeView, sceneMode, previousSceneMode, timelineZoom, timelineRowType, timelineGapMinutes, planningStartDate, planningStartTime]);
 
+  useEffect(() => {
+    setCustomScenario(null);
+    setCustomPlanError("");
+    setIsCalculatingCustomPlan(false);
+  }, [move?.id]);
+
   const fallbackPlayback = {
     totalMinutes: 0,
     journeys: [],
@@ -3493,18 +3587,101 @@ export function RigMovePage({
   const isCustomizeActive = !readOnly && activePlanKey === "customize";
   const deferredTruckSetup = useDeferredValue(truckSetup);
   const deferredTotalTrucks = deferredTruckSetup.reduce((sum, item) => sum + (Number.parseInt(item.count, 10) || 0), 0);
-  const planningRouteData = {
+  const planningRouteData = useMemo(() => ({
     minutes: safeMove.simulation?.routeMinutes || baseActiveScenario?.routeMinutes || 0,
     distanceKm: safeMove.simulation?.routeDistanceKm || baseActiveScenario?.routeDistanceKm || safeMove.routeKm || 0,
     geometry: safeMove.simulation?.routeGeometry || baseActiveScenario?.routeGeometry || [],
     source: safeMove.simulation?.routeSource || baseActiveScenario?.routeSource || "Preview route",
-  };
+  }), [safeMove.simulation, baseActiveScenario, safeMove.routeKm]);
+  useEffect(() => {
+    if (!isCustomizeActive || readOnly || !move?.id) {
+      setIsCalculatingCustomPlan(false);
+      setCustomPlanError("");
+      return undefined;
+    }
+
+    const sanitizedTruckSetup = deferredTruckSetup
+      .map((item) => ({
+        ...item,
+        type: normalizeTruckTypeLabel(item?.type),
+        count: Math.max(0, Number.parseInt(item?.count, 10) || 0),
+        hourlyCost: Math.max(0, Number(item?.hourlyCost) || 0),
+      }))
+      .filter((item) => item.type && item.count > 0);
+
+    if (!sanitizedTruckSetup.length || !logicalLoads.length) {
+      setCustomScenario(null);
+      setIsCalculatingCustomPlan(false);
+      setCustomPlanError(sanitizedTruckSetup.length ? "" : "Add at least one truck type to preview a custom plan.");
+      return undefined;
+    }
+
+    let cancelled = false;
+    const timeoutId = window.setTimeout(() => {
+      setIsCalculatingCustomPlan(true);
+      setCustomPlanError("");
+
+      void buildScenarioPlans(
+        logicalLoads,
+        planningRouteData,
+        4,
+        sanitizedTruckSetup.reduce((sum, item) => sum + item.count, 0),
+        sanitizedTruckSetup,
+        truckSpecs,
+        {
+          dayShift: 4,
+          nightShift: 4,
+          roles: {},
+          averageHourlyCost: 0,
+          startHour: Number.parseInt((planningStartTime || "06:00").split(":")[0], 10) || 6,
+          startMinute: Number.parseInt((planningStartTime || "06:00").split(":")[1], 10) || 0,
+          enforceExactFleet: true,
+        },
+      ).then((plans) => {
+        if (cancelled) {
+          return;
+        }
+
+        const bestCustomScenario = (plans || []).reduce(
+          (best, plan) => (!best || (plan?.totalMinutes || Infinity) < (best?.totalMinutes || Infinity) ? plan : best),
+          null,
+        );
+
+        if (!bestCustomScenario?.bestVariant) {
+          setCustomScenario(null);
+          setCustomPlanError("No feasible custom plan was found for this truck mix.");
+          return;
+        }
+
+        setCustomScenario({
+          ...bestCustomScenario,
+          allocatedTruckSetup: sanitizedTruckSetup,
+          truckSetup: sanitizedTruckSetup,
+          allocatedTruckCount: sanitizedTruckSetup.reduce((sum, item) => sum + item.count, 0),
+        });
+      }).catch((error) => {
+        if (!cancelled) {
+          setCustomScenario(null);
+          setCustomPlanError(error?.message || "Failed to calculate the custom plan.");
+        }
+      }).finally(() => {
+        if (!cancelled) {
+          setIsCalculatingCustomPlan(false);
+        }
+      });
+    }, 450);
+
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timeoutId);
+    };
+  }, [isCustomizeActive, readOnly, move?.id, deferredTruckSetup, logicalLoads, planningRouteData, truckSpecs, planningStartTime]);
   const scenarioPlans = baseScenarioPlans;
   const activeScenario =
     scenarioPlans.find((scenario) => scenario.name === activeScenarioName) ||
     scenarioPlans[0] ||
     baseActiveScenario;
-  const selectedScenario = activeScenario;
+  const selectedScenario = isCustomizeActive ? (customScenario || activeScenario) : activeScenario;
   const selectedAllocatedTruckSetup = selectedScenario?.allocatedTruckSetup || selectedScenario?.truckSetup || truckSetup;
   const effectiveTruckCount = isCustomizeActive
     ? (deferredTotalTrucks || totalTrucks || selectedScenario?.allocatedTruckCount || selectedScenario?.truckCount || 1)
@@ -3525,19 +3702,21 @@ export function RigMovePage({
   const displaySimulation = useMemo(
     () => ({
       ...(safeMove.simulation || {}),
-      truckCount: selectedScenario.truckCount,
-      bestPlan: safeMove.simulation?.bestPlan || selectedScenario.bestVariant,
-      bestScenario: selectedScenario,
-      routeGeometry: selectedScenario.routeGeometry,
-      routeMinutes: selectedScenario.routeMinutes,
+      truckCount: selectedScenario?.truckCount || safeMove.simulation?.truckCount || 0,
+      bestPlan: selectedScenario?.bestVariant || safeMove.simulation?.bestPlan || fallbackScenario.bestVariant,
+      bestScenario: selectedScenario || safeMove.simulation?.bestScenario || fallbackScenario,
+      routeGeometry: selectedScenario?.routeGeometry || safeMove.simulation?.routeGeometry || [],
+      routeMinutes: selectedScenario?.routeMinutes || safeMove.simulation?.routeMinutes || 0,
       truckSetup: effectiveTruckSetup,
     }),
-    [safeMove.simulation, selectedScenario, effectiveTruckSetup],
+    [safeMove.simulation, selectedScenario, effectiveTruckSetup, fallbackScenario],
   );
+  const activeBestPlan = displaySimulation.bestPlan || fallbackScenario.bestVariant;
+  const activePlayback = activeBestPlan?.playback || fallbackPlayback;
 
   const activeTrackingMode = executionProgress?.trackingMode === "demoUltrasonic" ? "demoUltrasonic" : "driverApp";
   const ultrasonicDemo = getUltrasonicDemoSummary(executionProgress);
-  const totalMinutes = displaySimulation.bestPlan.totalMinutes;
+  const totalMinutes = activeBestPlan?.totalMinutes || 0;
   const baseVisibleMinute = sceneAssetsReady ? Math.min(currentMinute, totalMinutes) : 0;
   const demoCompletionPercent = Math.max(
     0,
@@ -3591,16 +3770,16 @@ export function RigMovePage({
   const canResumePlayback = visibleMinute > 0 && visibleMinute < totalMinutes;
   const completion = Math.min(100, Math.round((visibleMinute / Math.max(totalMinutes, 1)) * 100));
   const phases = useMemo(
-    () => getPhasePercentages(displaySimulation.bestPlan.playback, visibleMinute),
-    [displaySimulation.bestPlan.playback, visibleMinute],
+    () => getPhasePercentages(activePlayback, visibleMinute),
+    [activePlayback, visibleMinute],
   );
   const rigLoads = useMemo(
-    () => getRigLoadCounts(displaySimulation.bestPlan.playback, visibleMinute),
-    [displaySimulation.bestPlan.playback, visibleMinute],
+    () => getRigLoadCounts(activePlayback, visibleMinute),
+    [activePlayback, visibleMinute],
   );
   const lastLog = useMemo(
-    () => displaySimulation.bestPlan.playback.steps.filter((step) => step.minute <= visibleMinute).slice(-1)[0] || displaySimulation.bestPlan.playback.steps[0],
-    [displaySimulation.bestPlan.playback, visibleMinute],
+    () => activePlayback.steps.filter((step) => step.minute <= visibleMinute).slice(-1)[0] || activePlayback.steps[0],
+    [activePlayback, visibleMinute],
   );
   const activePlanSummary = useMemo(
     () => getPlanSummary(selectedScenario),
@@ -3619,22 +3798,22 @@ export function RigMovePage({
       getRigInsightStats({
         side: focusTarget?.kind === "rig" ? focusTarget.side : null,
         move: safeMove,
-        playback: displaySimulation.bestPlan.playback,
+        playback: activePlayback,
         currentMinute: visibleMinute,
         totalMinutes,
       }),
-    [focusTarget, safeMove, displaySimulation, visibleMinute, totalMinutes],
+    [focusTarget, safeMove, activePlayback, visibleMinute, totalMinutes],
   );
   const focusedTruckStats = useMemo(
     () =>
       getTruckFocusStats({
         truckId: focusTarget?.kind === "truck" ? focusTarget.truckId : null,
         move: safeMove,
-        playback: displaySimulation.bestPlan.playback,
+        playback: activePlayback,
         currentMinute: visibleMinute,
         totalMinutes,
       }),
-    [focusTarget, safeMove, displaySimulation, visibleMinute, totalMinutes],
+    [focusTarget, safeMove, activePlayback, visibleMinute, totalMinutes],
   );
   const planComparisonStats = useMemo(
     () => getPlanComparisonStats(scenarioPlans, selectedScenario, safeMove, visibleMinute),
@@ -3644,25 +3823,25 @@ export function RigMovePage({
     () => getPlanRadarComparisonModel(scenarioPlans, selectedScenario, safeMove),
     [scenarioPlans, selectedScenario, safeMove],
   );
-  const previewPlanCard = planRadarModel.plans[0] || null;
-  const previewRoundTrips = 24;
-  const previewTruckUsageLabel = "6/8";
-  const previewCostPerLoad = previewPlanCard ? formatCurrency((previewPlanCard.totalCost || 0) / Math.max(previewRoundTrips, 1)) : formatCurrency(0);
+  const previewPlanCard = planRadarModel.plans.find((plan) => plan.isSelected) || planRadarModel.plans[0] || null;
+  const previewRoundTrips = activePlanSummary.roundTrips;
+  const previewTruckUsageLabel = activePlanDashboard.truckUsageLabel;
+  const previewCostPerLoad = planComparisonStats.costPerLoad;
   const criticalPathChain = useMemo(
-    () => buildCriticalPathChain(displaySimulation.bestPlan.playback),
-    [displaySimulation.bestPlan.playback],
+    () => buildCriticalPathChain(activePlayback),
+    [activePlayback],
   );
   const criticalScheduleRows = useMemo(
-    () => buildCriticalScheduleRows(displaySimulation.bestPlan.playback),
-    [displaySimulation.bestPlan.playback],
+    () => buildCriticalScheduleRows(activePlayback),
+    [activePlayback],
   );
   const plannerScheduleRows = useMemo(
-    () => buildPlannerScheduleRows(displaySimulation.bestPlan.playback),
-    [displaySimulation.bestPlan.playback],
+    () => buildPlannerScheduleRows(activePlayback),
+    [activePlayback],
   );
   const plannerCostRows = useMemo(
-    () => buildPlannerCostRows(selectedScenario, displaySimulation.bestPlan.playback, safeMove),
-    [selectedScenario, displaySimulation.bestPlan.playback, safeMove],
+    () => buildPlannerCostRows(selectedScenario, activePlayback, safeMove),
+    [selectedScenario, activePlayback, safeMove],
   );
   const isPlaybackActiveState = isPlaybackRunning || isPlaybackPaused;
   const operatingSnapshot = useMemo(
@@ -3752,12 +3931,12 @@ export function RigMovePage({
   const isTimelineMode = sceneMode === "timeline";
   const canEditPlan = !readOnly && executionState === "planning" && !isPlaybackRunning && !isPlaybackPaused;
   const loadTimelineRows = useMemo(
-    () => (isTimelineMode && timelineRowType === "load" ? buildLoadScheduleRows(displaySimulation.bestPlan.playback) : []),
-    [isTimelineMode, timelineRowType, displaySimulation.bestPlan.playback],
+    () => (isTimelineMode && timelineRowType === "load" ? buildLoadScheduleRows(activePlayback) : []),
+    [isTimelineMode, timelineRowType, activePlayback],
   );
   const cpmTimelineRows = useMemo(
-    () => (isTimelineMode && timelineRowType === "cpm" ? buildCpmScheduleRows(displaySimulation.bestPlan.playback) : []),
-    [isTimelineMode, timelineRowType, displaySimulation.bestPlan.playback],
+    () => (isTimelineMode && timelineRowType === "cpm" ? buildCpmScheduleRows(activePlayback) : []),
+    [isTimelineMode, timelineRowType, activePlayback],
   );
   const timelineRowsCount = !isTimelineMode
     ? 0
@@ -3769,20 +3948,20 @@ export function RigMovePage({
             ? Math.max(cpmTimelineRows.length, 1)
           : effectiveTruckCount;
   const timelineWorkingMinutes = useMemo(
-    () => (isTimelineMode ? getTimelineWorkingMinutes(displaySimulation.bestPlan.playback, timelineRowType) : 0),
-    [isTimelineMode, displaySimulation.bestPlan.playback, timelineRowType],
+    () => (isTimelineMode ? getTimelineWorkingMinutes(activePlayback, timelineRowType) : 0),
+    [isTimelineMode, activePlayback, timelineRowType],
   );
   const truckTimelineWorkingMinutes = useMemo(
-    () => (isTimelineMode ? getTimelineWorkingMinutes(displaySimulation.bestPlan.playback, "truck") : 0),
-    [isTimelineMode, displaySimulation.bestPlan.playback],
+    () => (isTimelineMode ? getTimelineWorkingMinutes(activePlayback, "truck") : 0),
+    [isTimelineMode, activePlayback],
   );
   const loadTimelineWorkingMinutes = useMemo(
-    () => (isTimelineMode && timelineRowType === "load" ? getTimelineWorkingMinutes(displaySimulation.bestPlan.playback, "load") : 0),
-    [isTimelineMode, timelineRowType, displaySimulation.bestPlan.playback],
+    () => (isTimelineMode && timelineRowType === "load" ? getTimelineWorkingMinutes(activePlayback, "load") : 0),
+    [isTimelineMode, timelineRowType, activePlayback],
   );
   const criticalPathTimelineWorkingMinutes = useMemo(
-    () => (isTimelineMode && timelineRowType === "cpm" ? getTimelineWorkingMinutes(displaySimulation.bestPlan.playback, "cpm") : 0),
-    [isTimelineMode, timelineRowType, displaySimulation.bestPlan.playback],
+    () => (isTimelineMode && timelineRowType === "cpm" ? getTimelineWorkingMinutes(activePlayback, "cpm") : 0),
+    [isTimelineMode, timelineRowType, activePlayback],
   );
   const timelineWorkingMinutesPerTruck = Math.round(
     truckTimelineWorkingMinutes / Math.max(effectiveTruckCount, 1),
@@ -3890,7 +4069,7 @@ export function RigMovePage({
   const progressElapsedLabel = formatProgressDuration(simulationProgress?.elapsedMs || 0);
   const progressRemainingLabel =
     progressPercent >= 100 ? "0s" : formatProgressDuration(simulationProgress?.remainingMs || 0);
-  const simulationOverlay = isSimulating
+  const simulationOverlay = (isSimulating || isCalculatingCustomPlan)
     ? h(
         "div",
         {
@@ -3923,20 +4102,20 @@ export function RigMovePage({
           },
         },
         h("span", { className: "scene-panel-kicker" }, "Planning Engine"),
-        h("strong", { style: { fontSize: "1.15rem" } }, simulationProgress?.message || "Building execution plan"),
-          h("p", { className: "muted-copy", style: { margin: 0 } }, simulationProgress?.detail || "The planner is still running. Large fleet comparisons can take longer."),
-          h(ProgressBar, { value: progressPercent }),
+        h("strong", { style: { fontSize: "1.15rem" } }, isCalculatingCustomPlan ? "Updating custom plan" : (simulationProgress?.message || "Building execution plan")),
+          h("p", { className: "muted-copy", style: { margin: 0 } }, isCalculatingCustomPlan ? "Recalculating the strict planner as you change the truck mix." : (simulationProgress?.detail || "The planner is still running. Large fleet comparisons can take longer.")),
+          h(ProgressBar, { value: isCalculatingCustomPlan ? 65 : progressPercent }),
           h(
             "div",
             { className: "scene-dashboard-pair" },
-            h("div", { className: "scene-dashboard-inline scene-dashboard-pair-item" }, h("span", { className: "scene-dashboard-label" }, "Completed"), h("strong", null, progressStageLabel)),
-            h("div", { className: "scene-dashboard-inline scene-dashboard-pair-item" }, h("span", { className: "scene-dashboard-label" }, "Elapsed"), h("strong", null, progressElapsedLabel)),
+            h("div", { className: "scene-dashboard-inline scene-dashboard-pair-item" }, h("span", { className: "scene-dashboard-label" }, "Completed"), h("strong", null, isCalculatingCustomPlan ? "Custom preview" : progressStageLabel)),
+            h("div", { className: "scene-dashboard-inline scene-dashboard-pair-item" }, h("span", { className: "scene-dashboard-label" }, "Elapsed"), h("strong", null, isCalculatingCustomPlan ? "Live" : progressElapsedLabel)),
           ),
           h(
             "div",
             { className: "scene-dashboard-pair" },
-            h("div", { className: "scene-dashboard-inline scene-dashboard-pair-item" }, h("span", { className: "scene-dashboard-label" }, "Progress"), h("strong", null, `${progressPercent}%`)),
-            h("div", { className: "scene-dashboard-inline scene-dashboard-pair-item" }, h("span", { className: "scene-dashboard-label" }, "Remaining"), h("strong", null, progressRemainingLabel)),
+            h("div", { className: "scene-dashboard-inline scene-dashboard-pair-item" }, h("span", { className: "scene-dashboard-label" }, "Progress"), h("strong", null, `${isCalculatingCustomPlan ? 65 : progressPercent}%`)),
+            h("div", { className: "scene-dashboard-inline scene-dashboard-pair-item" }, h("span", { className: "scene-dashboard-label" }, "Remaining"), h("strong", null, isCalculatingCustomPlan ? "Refreshing..." : progressRemainingLabel)),
           ),
         ),
       )
@@ -4327,7 +4506,7 @@ export function RigMovePage({
               "section",
               { className: "scene-timeline-layout" },
               h(PlannerCanvas, {
-                playback: displaySimulation.bestPlan.playback,
+                playback: activePlayback,
                 zoom: timelineZoom,
                 criticalPathChain,
                 criticalScheduleRows,
@@ -4382,7 +4561,7 @@ export function RigMovePage({
                   h("p", { className: "muted-copy" }, "The map view is loading."),
                 ))
             : h(FullScreenTimeline, {
-                playback: displaySimulation.bestPlan.playback,
+                playback: activePlayback,
                 currentMinute: visibleMinute,
                 zoom: timelineZoom,
               }),
@@ -4589,7 +4768,7 @@ export function RigMovePage({
                 executionStatusRow,
                 executionSummary,
                 startExecutionSetup,
-                simulationError ? h("p", { className: "field-error section-spacing" }, simulationError) : null,
+                simulationError || customPlanError ? h("p", { className: "field-error section-spacing" }, customPlanError || simulationError) : null,
                 readOnlyBanner,
                 !readOnly && isPlanningStage
                   ? h(
@@ -4597,12 +4776,12 @@ export function RigMovePage({
                       { className: "scene-panel-actions" },
                       h(PlaybackActionButton, {
                         isRunning: isPlaybackRunning,
-                        isBusy: isSimulating,
+                        isBusy: isSimulating || isCalculatingCustomPlan,
                         isPaused: isPlaybackPaused,
-                        onRun: () => onRunCustomPlan({ moveId: move.id, truckSetup }),
+                        onRun: onRunPlayback,
                         onEnd: onEndPlayback,
                         onPauseToggle: onPausePlayback,
-                        label: canResumePlayback ? "Resume Simulation" : "Run Simulation",
+                        label: canResumePlayback ? "Resume Playback" : "Run Playback",
                       }),
                       h(Button, {
                         type: "button",
@@ -4964,7 +5143,7 @@ export function RigMovePage({
         isPlaybackRunning || isPlaybackPaused
           ? h(MoveAssistant, {
               move,
-              playback: displaySimulation.bestPlan.playback,
+              playback: activePlayback,
               currentMinute: visibleMinute,
               rigLoads,
               lastLog,
@@ -5041,12 +5220,12 @@ export function RigMovePage({
                       { className: "move-setup-actions" },
                       h(PlaybackActionButton, {
                         isRunning: isPlaybackRunning,
-                        isBusy: isSimulating,
+                        isBusy: isSimulating || isCalculatingCustomPlan,
                         isPaused: isPlaybackPaused,
-                        onRun: () => onRunCustomPlan({ moveId: move.id, truckSetup }),
+                        onRun: onRunPlayback,
                         onEnd: onEndPlayback,
                         onPauseToggle: onPausePlayback,
-                        label: canResumePlayback ? "Resume Simulation" : "Run Simulation",
+                        label: canResumePlayback ? "Resume Playback" : "Run Playback",
                       }),
                       h(Button, {
                         type: "button",
@@ -5096,7 +5275,7 @@ export function RigMovePage({
                 h("span", { className: "section-pill" }, activeScenario.name),
               ),
               h(LoadScheduleTable, {
-                playback: displaySimulation.bestPlan.playback,
+                playback: activePlayback,
                 currentMinute: visibleMinute,
               }),
             ),
@@ -5181,7 +5360,7 @@ export function RigMovePage({
         isPlaybackRunning || isPlaybackPaused
           ? h(MoveAssistant, {
               move,
-              playback: displaySimulation.bestPlan.playback,
+              playback: activePlayback,
               currentMinute: visibleMinute,
               rigLoads,
               lastLog,

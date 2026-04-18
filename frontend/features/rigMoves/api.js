@@ -57,3 +57,69 @@ export async function fetchLocationLabel(point) {
   }
   return label;
 }
+
+export async function fetchMoveRecords(managerId, { summary = false } = {}) {
+  const params = new URLSearchParams();
+  if (managerId) {
+    params.set("managerId", managerId);
+  }
+  if (summary) {
+    params.set("summary", "1");
+  }
+
+  const response = await fetch(`/api/moves${params.toString() ? `?${params.toString()}` : ""}`);
+  if (!response.ok) {
+    throw new Error(`Move list request failed with ${response.status}`);
+  }
+
+  return response.json();
+}
+
+export async function fetchMoveRecord(moveId) {
+  const response = await fetch(`/api/moves/${encodeURIComponent(moveId)}`);
+  if (response.status === 404) {
+    return null;
+  }
+  if (!response.ok) {
+    throw new Error(`Move request failed with ${response.status}`);
+  }
+
+  return response.json();
+}
+
+export async function saveMoveRecord(move) {
+  const response = await fetch(`/api/moves/${encodeURIComponent(move.id)}`, {
+    method: "PUT",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(move),
+  });
+
+  if (!response.ok) {
+    let message = `Move save request failed with ${response.status}`;
+    try {
+      const payload = await response.json();
+      if (payload?.error) {
+        message = payload.error;
+      }
+    } catch {
+      // Keep the default HTTP error message.
+    }
+    throw new Error(message);
+  }
+
+  return response.json();
+}
+
+export async function deleteMoveRecord(moveId) {
+  const response = await fetch(`/api/moves/${encodeURIComponent(moveId)}`, {
+    method: "DELETE",
+  });
+
+  if (!response.ok) {
+    throw new Error(`Move delete request failed with ${response.status}`);
+  }
+
+  return response.json();
+}

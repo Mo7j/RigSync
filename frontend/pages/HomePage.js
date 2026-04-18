@@ -580,57 +580,40 @@ export function HomePage({
         h(
           "div",
           { className: "home-scene-panel home-scene-panel-center" },
-          h("p", { className: "eyebrow" }, "Features"),
-          h("h2", { className: "section-title features-section-title" }, "From Move Planning To Fleet Oversight In One System"),
           h(
             "div",
-            { className: "feature-system" },
+            { className: "feature-showcase" },
             h(
               "div",
-              { className: "feature-system-stage" },
-              h("div", { className: "feature-system-glow feature-system-glow-left", "aria-hidden": "true" }),
-              h("div", { className: "feature-system-glow feature-system-glow-right", "aria-hidden": "true" }),
+              { className: "feature-showcase-head" },
+              h("p", { className: "hero-badge" }, "Features"),
+              h("h2", { className: "section-title features-section-title" }, "From Move Planning To Fleet Oversight In One System"),
               h(
-                "div",
-                { className: "feature-system-center" },
-                h("span", { className: "feature-system-center-kicker" }, "RigSync Operations Core"),
-                h("strong", { className: "feature-system-center-title" }, "Connected Rig Move Intelligence"),
-                h("p", { className: "feature-system-center-copy" }, "Planning, execution, fleet visibility, and decision support connected in one operational system."),
-              ),
-              [FEATURE_ITEMS[0], FEATURE_ITEMS[1], FEATURE_ITEMS[2], FEATURE_ITEMS[3]].map((item, index) =>
-                h(
-                  "div",
-                  {
-                    key: item.title,
-                    className: `feature-node feature-node-${index === 0 ? "top" : index === 1 ? "right" : index === 2 ? "bottom" : "left"}`,
-                  },
-                  h(
-                    "div",
-                    { className: "feature-node-icon-shell", "aria-hidden": "true" },
-                    h("span", { className: "feature-node-icon" }, h(FeatureSymbol, { code: item.icon })),
-                  ),
-                  h(
-                    "div",
-                    { className: "feature-node-copy" },
-                    h("strong", { className: "feature-node-title" }, item.title),
-                    h("p", { className: "feature-node-text" }, item.copy),
-                  ),
-                ),
+                "p",
+                { className: "feature-showcase-lead-copy" },
+                "RigSync combines planning, execution, fleet visibility, and field readiness in one operational system built for live rig move control.",
               ),
             ),
             h(
               "div",
-              { className: "feature-support-row" },
-              FEATURE_ITEMS.slice(4).map((item) =>
+              { className: "feature-showcase-grid" },
+              FEATURE_ITEMS.slice(0, 5).map((item, index) =>
                 h(
                   Card,
-                  { key: item.title, className: "feature-support-card" },
-                  h("span", { className: "feature-support-icon", "aria-hidden": "true" }, h(FeatureSymbol, { code: item.icon })),
+                  {
+                    key: item.title,
+                    className: `feature-showcase-card feature-showcase-card-${index + 1}`,
+                  },
+                  h(
+                    "span",
+                    { className: "feature-showcase-icon", "aria-hidden": "true" },
+                    h(FeatureSymbol, { code: item.icon }),
+                  ),
                   h(
                     "div",
-                    { className: "feature-support-copy" },
-                    h("strong", { className: "feature-support-title" }, item.title),
-                    h("p", { className: "feature-support-text" }, item.copy),
+                    { className: "feature-showcase-copy" },
+                    h("strong", { className: "feature-showcase-title" }, item.title),
+                    h("p", { className: "feature-showcase-text" }, item.copy),
                   ),
                 ),
               ),
@@ -662,18 +645,6 @@ export function HomePage({
                 h("p", { className: "muted-copy faq-answer-compact" }, item.answer),
               ),
             ),
-          ),
-          h(
-            "div",
-            { className: "home-final-cta" },
-            h("strong", null, "Run Every Rig Move From One Operational Twin"),
-            h("p", { className: "muted-copy" }, "Plan the move, compare the trade-offs, execute with confidence, and oversee the full rig network from one platform."),
-            h(Button, {
-              type: "button",
-              className: "hero-primary",
-              onClick: hasSession ? onOpenDashboard : onOpenLogin,
-              children: t("openWorkspace", "Open Workspace"),
-            }),
           ),
         ),
       ),

@@ -16,11 +16,14 @@ def resolve_dataset_path():
         return Path(override).expanduser()
 
     search_roots = [
-        PROJECT_ROOT,
+        Path.home() / "Downloads" / "ise",
         Path.home() / "Downloads",
+        PROJECT_ROOT,
     ]
     candidate_names = (
+        "ise_data_final_v2.xlsx",
         "iseData.xlsx",
+        "FinalData.xlsx",
     )
 
     for search_root in search_roots:
@@ -29,7 +32,7 @@ def resolve_dataset_path():
             if candidate.exists():
                 return candidate
 
-    return PROJECT_ROOT / "FinalData.xlsx"
+    return PROJECT_ROOT / "iseData.xlsx"
 
 
 DATASET_PATH = resolve_dataset_path()
@@ -79,8 +82,8 @@ WORKER_ROLE_ALIASES = {
     "welder": "welder",
     "welders": "welder",
     "yard foreman": "yard_foreman",
+    "truck driver": "truck_driver",
 }
-
 
 TRUCK_TYPE_ALIASES = {
     "flatbed": "Flat-bed",
@@ -108,6 +111,27 @@ SHEET_NAME_CANDIDATES = {
     "truck": ("Trucks Info",),
 }
 
+PHASE_ROW_PATTERN = re.compile(r"^((?:RL|CL|SU)-\d+(?:-L\d+)?)\s*\((RD|RM|RU)\)\s*$", flags=re.IGNORECASE)
+WORKBOOK_ROLE_COLUMNS = [
+    "driller",
+    "assistant_driller",
+    "derrickman",
+    "floorman",
+    "rigger",
+    "crane_operator",
+    "mechanic",
+    "welder",
+    "electrician",
+    "pumpman_mechanic",
+    "bop_tech",
+    "forklift_crane_operator",
+    "operator",
+    "camp_foreman",
+    "yard_foreman",
+    "roustabout",
+    "truck_driver",
+]
+
 
 def normalize_text(value):
     if value is None:
@@ -117,8 +141,6 @@ def normalize_text(value):
 
 
 def normalize_int(value):
-    if value is None:
-        return None
     text = normalize_text(value)
     if text is None:
         return None
@@ -127,8 +149,6 @@ def normalize_int(value):
 
 
 def normalize_float(value):
-    if value is None:
-        return None
     text = normalize_text(value)
     if text is None:
         return None
@@ -138,9 +158,11 @@ def normalize_float(value):
 
 def parse_duration_minutes(value):
     text = normalize_text(value)
-    if not text or text == "—":
+    if not text or text in {"—", "(dist / speed)"}:
         return None
-    match = re.search(r"(\d+(?:\.\d+)?)\s*hr", text, flags=re.IGNORECASE)
+    if "±" in text:
+        text = text.split("±", 1)[0].strip()
+    match = re.search(r"(\d+(?:\.\d+)?)", text, flags=re.IGNORECASE)
     return int(math.ceil(float(match.group(1)) * 60)) if match else None
 
 
@@ -203,179 +225,221 @@ def parse_dependency_codes(value):
     text = normalize_text(value)
     if not text or text == "—":
         return []
-    return [match.upper() for match in re.findall(r"\b(?:RL|SU)-\d+(?:-L\d+)?\b", text, flags=re.IGNORECASE)]
+    return [match.upper() for match in re.findall(r"\b(?:RL|CL|SU)-\d+(?:-L\d+)?\b", text, flags=re.IGNORECASE)]
 
 
-def normalize_header(value):
+def parse_phase_dependency_refs(value):
     text = normalize_text(value)
-    if not text:
-        return None
-    return re.sub(r"[^a-z0-9]+", "", text.lower())
-
-
-def read_sheet_rows(workbook, candidate_names):
-    sheet = next((workbook[name] for name in candidate_names if name in workbook.sheetnames), None)
-    if sheet is None:
-        raise KeyError(f"None of the expected sheets were found: {', '.join(candidate_names)}")
-
-    rows = list(sheet.iter_rows(values_only=True))
-    if not rows:
+    if not text or text == "—":
         return []
-
-    headers = [normalize_header(value) for value in rows[0]]
-    records = []
-    for row in rows[1:]:
-        record = {}
-        for index, header in enumerate(headers):
-            if not header:
-                continue
-            record[header] = row[index] if index < len(row) else None
-        records.append(record)
-    return records
-
-
-def row_value(row, *header_names):
-    for header_name in header_names:
-        value = row.get(normalize_header(header_name))
-        if value is not None:
-            return value
-    return None
+    return [
+        f"{code.upper()} ({phase.upper()})"
+        for code, phase in re.findall(r"\b((?:RL|CL|SU)-\d+(?:-L\d+)?)\s*\((RD|RM|RU)\)", text, flags=re.IGNORECASE)
+    ]
 
 
 def normalize_worker_role(value):
     text = normalize_text(value)
     if not text:
         return None
-    key = text.lower()
-    return WORKER_ROLE_ALIASES.get(key)
+    return WORKER_ROLE_ALIASES.get(text.lower())
 
 
-def parse_crew_section(section, prefix):
-    if not section:
-        return {}
-    match = re.search(rf"{prefix}\s*:\s*(.*)", section, flags=re.IGNORECASE)
-    if not match:
-        return {}
-
-    requirements = {}
-    for part in match.group(1).split(";"):
-        text = normalize_text(part)
-        if not text:
-            continue
-
-        role_match = re.match(r"(.+?)\s+(\d+)\s*$", text)
-        if not role_match:
-            continue
-
-        role_id = normalize_worker_role(role_match.group(1))
-        if not role_id:
-            continue
-
-        requirements[role_id] = requirements.get(role_id, 0) + int(role_match.group(2))
-
-    return requirements
+def resolve_sheet(workbook, candidate_names):
+    sheet = next((workbook[name] for name in candidate_names if name in workbook.sheetnames), None)
+    if sheet is None:
+        raise KeyError(f"None of the expected sheets were found: {', '.join(candidate_names)}")
+    return sheet
 
 
-def parse_crew_counts(value):
+def parse_phase_identifier(value):
     text = normalize_text(value)
     if not text:
-        return {
-            "rig_down": {},
-            "rig_up": {},
-        }
-    sections = [part.strip() for part in text.split("|")]
-    return {
-        "rig_down": parse_crew_section(sections[0] if sections else "", "RD"),
-        "rig_up": parse_crew_section(sections[1] if len(sections) > 1 else "", "RU"),
-    }
+        return None, None
+    match = PHASE_ROW_PATTERN.match(text)
+    if not match:
+        return None, None
+    return match.group(1).upper(), match.group(2).upper()
+
+
+def parse_role_counts_from_columns(values, start_index):
+    role_counts = {}
+    for offset, role_id in enumerate(WORKBOOK_ROLE_COLUMNS):
+        count = normalize_int(values[start_index + offset] if start_index + offset < len(values) else None) or 0
+        if count > 0:
+            role_counts[role_id] = count
+    return role_counts
+
+
+def group_expanded_phase_rows(sheet):
+    grouped = {}
+
+    for values in sheet.iter_rows(min_row=4, values_only=True):
+        code, phase = parse_phase_identifier(values[0] if values else None)
+        if not code:
+            continue
+
+        entry = grouped.setdefault(
+            code,
+            {
+                "code": code,
+                "load_type": code.split("-", 1)[0],
+                "description": None,
+                "category": None,
+                "weight_tons": None,
+                "weight_text": None,
+                "dimensions": None,
+                "dimensions_text": None,
+                "priority": 0,
+                "truck_type": None,
+                "truck_types": [],
+                "is_critical": False,
+                "rig_down_dependency_codes": [],
+                "rig_down_dependency_phase_codes": [],
+                "rig_move_dependency_codes": [],
+                "rig_move_dependency_phase_codes": [],
+                "rig_up_dependency_codes": [],
+                "rig_up_dependency_phase_codes": [],
+                "avg_rig_down_minutes": None,
+                "avg_rig_up_minutes": None,
+                "optimal_rig_down_minutes": None,
+                "optimal_rig_up_minutes": None,
+                "minimum_crew_down_roles": {},
+                "minimum_crew_up_roles": {},
+                "optimal_crew_down_roles": {},
+                "optimal_crew_up_roles": {},
+            },
+        )
+
+        description = normalize_text(values[1] if len(values) > 1 else None)
+        category = normalize_text(values[2] if len(values) > 2 else None)
+        weight_text = normalize_text(values[3] if len(values) > 3 else None)
+        dimensions_text = normalize_text(values[4] if len(values) > 4 else None)
+        priority = normalize_int(values[5] if len(values) > 5 else None)
+        truck_type = normalize_text(values[6] if len(values) > 6 else None)
+        is_critical = parse_yes_no(values[7] if len(values) > 7 else None)
+        duration_minutes = parse_duration_minutes(values[8] if len(values) > 8 else None)
+        predecessor_codes = parse_dependency_codes(values[9] if len(values) > 9 else None)
+        predecessor_phase_codes = parse_phase_dependency_refs(values[9] if len(values) > 9 else None)
+        minimum_role_counts = parse_role_counts_from_columns(values, 10)
+        optimal_role_counts = parse_role_counts_from_columns(values, 28)
+
+        if description:
+            entry["description"] = description
+        if category:
+            entry["category"] = category
+        if weight_text:
+            entry["weight_text"] = weight_text
+            entry["weight_tons"] = parse_weight_tons(weight_text)
+        if dimensions_text:
+            entry["dimensions_text"] = dimensions_text
+            entry["dimensions"] = parse_dimension_triplet(dimensions_text)
+        if priority is not None:
+            entry["priority"] = priority
+        if truck_type:
+            entry["truck_type"] = truck_type
+            entry["truck_types"] = parse_truck_types(truck_type)
+        entry["is_critical"] = entry["is_critical"] or is_critical
+
+        if phase == "RD":
+            entry["rig_down_dependency_codes"] = predecessor_codes
+            entry["rig_down_dependency_phase_codes"] = predecessor_phase_codes
+            entry["avg_rig_down_minutes"] = duration_minutes
+            entry["optimal_rig_down_minutes"] = duration_minutes
+            entry["minimum_crew_down_roles"] = minimum_role_counts
+            entry["optimal_crew_down_roles"] = optimal_role_counts
+        elif phase == "RM":
+            entry["rig_move_dependency_codes"] = predecessor_codes
+            entry["rig_move_dependency_phase_codes"] = predecessor_phase_codes
+        elif phase == "RU":
+            entry["rig_up_dependency_codes"] = predecessor_codes
+            entry["rig_up_dependency_phase_codes"] = predecessor_phase_codes
+            entry["avg_rig_up_minutes"] = duration_minutes
+            entry["optimal_rig_up_minutes"] = duration_minutes
+            entry["minimum_crew_up_roles"] = minimum_role_counts
+            entry["optimal_crew_up_roles"] = optimal_role_counts
+
+    return [grouped[key] for key in sorted(grouped.keys())]
 
 
 def build_rig_load_payload(row):
-    code = normalize_text(row_value(row, "Load ID", "Code"))
-    if not code:
-        return None
-
-    minimum_crew = parse_crew_counts(row_value(row, "Minimum Crew (Rig Down / Rig Up)", "Minimum Crew"))
-    optimal_crew = parse_crew_counts(row_value(row, "Optimal Crew (Rig Down / Rig Up)", "Optimal Crew"))
-    weight_value = row_value(row, "Weight (tons)", "Weight")
-    dimensions_value = row_value(row, "Dimensions (L x W x H)", "Dimensions")
-    is_expanded_code = bool(re.search(r"-L\d+$", code, flags=re.IGNORECASE))
-    load_count = 1 if is_expanded_code else (normalize_int(row_value(row, "Total Loads in Task", "Load Count", "Count")) or 1)
-
     return {
-        "id": normalize_int(code),
-        "code": code,
-        "load_type": normalize_text(row_value(row, "Load Type")),
-        "description": normalize_text(row_value(row, "Description")),
-        "category": normalize_text(row_value(row, "Category")),
-        "load_count": load_count,
-        "weight_tons": parse_weight_tons(weight_value),
-        "weight_text": normalize_text(weight_value),
-        "dimensions": parse_dimension_triplet(dimensions_value),
-        "dimensions_text": normalize_text(dimensions_value),
-        "priority": normalize_int(row_value(row, "Priority")) or 0,
-        "rig_down_dependency_codes": parse_dependency_codes(row_value(row, "Rig Down Predecessor(s)")),
-        "rig_up_dependency_codes": parse_dependency_codes(row_value(row, "Rig Up Predecessor(s)")),
-        "avg_rig_down_minutes": parse_duration_minutes(row_value(row, "Avg Rig Down Time", "Average Rig Down Time")),
-        "avg_rig_up_minutes": parse_duration_minutes(row_value(row, "Avg Rig Up Time", "Average Rig Up Time")),
-        "is_critical": parse_yes_no(row_value(row, "Critical Lift", "Critical")),
-        "truck_type": normalize_text(row_value(row, "Truck Type(s)", "Truck Type")),
-        "truck_types": parse_truck_types(row_value(row, "Truck Type(s)", "Truck Type")),
-        "minimum_crew_down_count": sum(minimum_crew["rig_down"].values()),
-        "minimum_crew_up_count": sum(minimum_crew["rig_up"].values()),
-        "optimal_crew_down_count": sum(optimal_crew["rig_down"].values()),
-        "optimal_crew_up_count": sum(optimal_crew["rig_up"].values()),
-        "minimum_crew_down_roles": minimum_crew["rig_down"],
-        "minimum_crew_up_roles": minimum_crew["rig_up"],
-        "optimal_crew_down_roles": optimal_crew["rig_down"],
-        "optimal_crew_up_roles": optimal_crew["rig_up"],
-        "optimal_rig_down_minutes": parse_duration_minutes(row_value(row, "Optimal Rig Down Time")),
-        "optimal_rig_up_minutes": parse_duration_minutes(row_value(row, "Optimal Rig Up Time")),
+        "id": row["code"],
+        "code": row["code"],
+        "load_type": row.get("load_type"),
+        "description": row.get("description"),
+        "category": row.get("category"),
+        "load_count": 1,
+        "weight_tons": row.get("weight_tons"),
+        "weight_text": row.get("weight_text"),
+        "dimensions": row.get("dimensions"),
+        "dimensions_text": row.get("dimensions_text"),
+        "priority": row.get("priority") or 0,
+        "rig_down_dependency_codes": row.get("rig_down_dependency_codes") or [],
+        "rig_down_dependency_phase_codes": row.get("rig_down_dependency_phase_codes") or [],
+        "rig_move_dependency_codes": row.get("rig_move_dependency_codes") or [],
+        "rig_move_dependency_phase_codes": row.get("rig_move_dependency_phase_codes") or [],
+        "rig_up_dependency_codes": row.get("rig_up_dependency_codes") or [],
+        "rig_up_dependency_phase_codes": row.get("rig_up_dependency_phase_codes") or [],
+        "avg_rig_down_minutes": row.get("avg_rig_down_minutes"),
+        "avg_rig_up_minutes": row.get("avg_rig_up_minutes"),
+        "is_critical": bool(row.get("is_critical")),
+        "truck_type": row.get("truck_type"),
+        "truck_types": row.get("truck_types") or [],
+        "minimum_crew_down_count": sum((row.get("minimum_crew_down_roles") or {}).values()),
+        "minimum_crew_up_count": sum((row.get("minimum_crew_up_roles") or {}).values()),
+        "optimal_crew_down_count": sum((row.get("optimal_crew_down_roles") or {}).values()),
+        "optimal_crew_up_count": sum((row.get("optimal_crew_up_roles") or {}).values()),
+        "minimum_crew_down_roles": row.get("minimum_crew_down_roles") or {},
+        "minimum_crew_up_roles": row.get("minimum_crew_up_roles") or {},
+        "optimal_crew_down_roles": row.get("optimal_crew_down_roles") or {},
+        "optimal_crew_up_roles": row.get("optimal_crew_up_roles") or {},
+        "optimal_rig_down_minutes": row.get("optimal_rig_down_minutes"),
+        "optimal_rig_up_minutes": row.get("optimal_rig_up_minutes"),
     }
 
 
 def build_startup_load_payload(row):
-    code = normalize_text(row_value(row, "Load ID", "Code"))
-    if not code:
-        return None
-    weight_value = row_value(row, "Weight (tons)", "Weight")
-    dimensions_value = row_value(row, "Dimensions (L x W x H)", "Dimensions")
-    is_expanded_code = bool(re.search(r"-L\d+$", code, flags=re.IGNORECASE))
-    count = 1 if is_expanded_code else (normalize_int(row_value(row, "Count", "Load #", "Load Count")) or 1)
-
     return {
-        "id": code,
-        "code": code,
-        "load_type": normalize_text(row_value(row, "Load Type")),
-        "description": normalize_text(row_value(row, "Description")),
-        "count": count,
-        "weight_tons": parse_weight_tons(weight_value),
-        "weight_text": normalize_text(weight_value),
-        "dimensions": parse_dimension_triplet(dimensions_value),
-        "dimensions_text": normalize_text(dimensions_value),
-        "priority": normalize_int(row_value(row, "Priority")) or 0,
-        "dependencyLabel": normalize_text(row_value(row, "Rig Up Predecessor(s)", "Dependency")) or "Standalone startup load",
-        "rig_up_dependency_codes": parse_dependency_codes(row_value(row, "Rig Up Predecessor(s)", "Dependency")),
-        "avg_rig_up_minutes": parse_duration_minutes(row_value(row, "Avg Rig Up Time", "Average Rig Up Time")),
-        "truck_type": normalize_text(row_value(row, "Truck Type(s)", "Truck Type")),
-        "truckTypes": parse_truck_types(row_value(row, "Truck Type(s)", "Truck Type")),
-        "isReusable": any(code.startswith(prefix) for prefix in STARTUP_REUSABLE_IDS),
+        "id": row["code"],
+        "code": row["code"],
+        "load_type": row.get("load_type"),
+        "description": row.get("description"),
+        "count": 1,
+        "weight_tons": row.get("weight_tons"),
+        "weight_text": row.get("weight_text"),
+        "dimensions": row.get("dimensions"),
+        "dimensions_text": row.get("dimensions_text"),
+        "priority": row.get("priority") or 0,
+        "dependencyLabel": ", ".join(row.get("rig_move_dependency_codes") or row.get("rig_up_dependency_codes") or []) or "Standalone startup load",
+        "rig_move_dependency_codes": row.get("rig_move_dependency_codes") or [],
+        "rig_move_dependency_phase_codes": row.get("rig_move_dependency_phase_codes") or [],
+        "rig_up_dependency_codes": row.get("rig_up_dependency_codes") or [],
+        "rig_up_dependency_phase_codes": row.get("rig_up_dependency_phase_codes") or [],
+        "avg_rig_up_minutes": row.get("avg_rig_up_minutes"),
+        "truck_type": row.get("truck_type"),
+        "truckTypes": row.get("truck_types") or [],
+        "isReusable": any(row["code"].startswith(prefix) for prefix in STARTUP_REUSABLE_IDS),
+        "minimum_crew_up_count": sum((row.get("minimum_crew_up_roles") or {}).values()),
+        "optimal_crew_up_count": sum((row.get("optimal_crew_up_roles") or {}).values()),
+        "minimum_crew_up_roles": row.get("minimum_crew_up_roles") or {},
+        "optimal_crew_up_roles": row.get("optimal_crew_up_roles") or {},
     }
 
 
-def build_truck_spec_payload(row):
-    truck_type = normalize_truck_type(row_value(row, "Truck Type", "Type"))
+def build_truck_spec_payload(values):
+    truck_type = normalize_truck_type(values[0] if len(values) > 0 else None)
     if not truck_type:
         return None
 
-    alpha_values = [float(match) for match in re.findall(r"\d+(?:\.\d+)?", normalize_text(row_value(row, "α", "Alpha")) or "")]
+    alpha_values = [float(match) for match in re.findall(r"\d+(?:\.\d+)?", normalize_text(values[4] if len(values) > 4 else None) or "")]
     alpha = sum(alpha_values) / len(alpha_values) if alpha_values else 0.3
 
     return {
         "type": truck_type,
-        "max_weight_tons": normalize_float(row_value(row, "Maximum Weight (tons)", "Maximum Weight")) or 0,
-        "dimensions": parse_dimension_triplet(row_value(row, "Approx. Truck Dimensions (L x W x H, m)", "Dimensions")),
-        "average_speed_kmh": normalize_float(row_value(row, "Average Speed (km/h)", "Average Speed")) or 0,
+        "max_weight_tons": normalize_float(values[1] if len(values) > 1 else None) or 0,
+        "dimensions": parse_dimension_triplet(values[2] if len(values) > 2 else None),
+        "average_speed_kmh": normalize_float(values[3] if len(values) > 3 else None) or 0,
         "alpha": alpha,
     }
 
@@ -385,26 +449,18 @@ def load_planning_dataset():
     workbook = load_workbook(DATASET_PATH, data_only=True)
 
     rig_loads = [
-        payload
-        for payload in (
-            build_rig_load_payload(row)
-            for row in read_sheet_rows(workbook, SHEET_NAME_CANDIDATES["rig"])
-        )
-        if payload
+        build_rig_load_payload(row)
+        for row in group_expanded_phase_rows(resolve_sheet(workbook, SHEET_NAME_CANDIDATES["rig"]))
     ]
     startup_loads = [
-        payload
-        for payload in (
-            build_startup_load_payload(row)
-            for row in read_sheet_rows(workbook, SHEET_NAME_CANDIDATES["startup"])
-        )
-        if payload
+        build_startup_load_payload(row)
+        for row in group_expanded_phase_rows(resolve_sheet(workbook, SHEET_NAME_CANDIDATES["startup"]))
     ]
     truck_specs = [
         payload
         for payload in (
-            build_truck_spec_payload(row)
-            for row in read_sheet_rows(workbook, SHEET_NAME_CANDIDATES["truck"])
+            build_truck_spec_payload(values)
+            for values in resolve_sheet(workbook, SHEET_NAME_CANDIDATES["truck"]).iter_rows(min_row=2, values_only=True)
         )
         if payload
     ]

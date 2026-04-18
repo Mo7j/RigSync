@@ -100,12 +100,15 @@ def serialize_dimensions(load_template):
 
 
 def serialize_load_template(load_template):
-    dependency_groups = {"rig_down": [], "rig_up": []}
+    dependency_groups = {"rig_down": [], "rig_move": [], "rig_up": []}
+    dependency_phase_groups = {"rig_down": [], "rig_move": [], "rig_up": []}
     for dependency in load_template.dependencies:
         depends_on = dependency.depends_on_load_template
         if not depends_on:
             continue
         dependency_groups.setdefault(dependency.dependency_phase, []).append(depends_on.code)
+        if dependency.predecessor_activity_code:
+            dependency_phase_groups.setdefault(dependency.dependency_phase, []).append(dependency.predecessor_activity_code)
 
     compatible_types = [item.truck_type for item in load_template.allowed_truck_types]
     role_requirement_groups = {
@@ -136,7 +139,11 @@ def serialize_load_template(load_template):
                 "category": load_template.category,
                 "load_count": load_template.load_count,
                 "rig_down_dependency_codes": sorted(set(dependency_groups.get("rig_down", []))),
+                "rig_down_dependency_phase_codes": sorted(set(dependency_phase_groups.get("rig_down", []))),
+                "rig_move_dependency_codes": sorted(set(dependency_groups.get("rig_move", []))),
+                "rig_move_dependency_phase_codes": sorted(set(dependency_phase_groups.get("rig_move", []))),
                 "rig_up_dependency_codes": sorted(set(dependency_groups.get("rig_up", []))),
+                "rig_up_dependency_phase_codes": sorted(set(dependency_phase_groups.get("rig_up", []))),
                 "avg_rig_down_minutes": load_template.avg_rig_down_minutes,
                 "avg_rig_up_minutes": load_template.avg_rig_up_minutes,
                 "is_critical": load_template.is_critical,
@@ -159,10 +166,17 @@ def serialize_load_template(load_template):
         {
             "count": load_template.load_count,
             "dependencyLabel": load_template.dependency_label,
+            "rig_move_dependency_codes": sorted(set(dependency_groups.get("rig_move", []))),
+            "rig_move_dependency_phase_codes": sorted(set(dependency_phase_groups.get("rig_move", []))),
             "rig_up_dependency_codes": sorted(set(dependency_groups.get("rig_up", []))),
+            "rig_up_dependency_phase_codes": sorted(set(dependency_phase_groups.get("rig_up", []))),
             "avg_rig_up_minutes": load_template.avg_rig_up_minutes,
             "truckTypes": compatible_types,
             "isReusable": load_template.is_reusable,
+            "minimum_crew_up_count": load_template.minimum_crew_up_count,
+            "optimal_crew_up_count": load_template.optimal_crew_up_count,
+            "minimum_crew_up_roles": role_requirement_groups["minimum"]["rig_up"],
+            "optimal_crew_up_roles": role_requirement_groups["optimal"]["rig_up"],
         }
     )
     return payload

@@ -226,10 +226,16 @@ function buildWorkbookLogicalLoads(rawLoads) {
           1,
         ),
         rig_down_dependency_codes: load.rig_down_dependency_codes || [],
+        rig_down_dependency_phase_codes: load.rig_down_dependency_phase_codes || [],
+        rig_move_dependency_codes: load.rig_move_dependency_codes || [],
+        rig_move_dependency_phase_codes: load.rig_move_dependency_phase_codes || [],
         rig_up_dependency_codes: load.rig_up_dependency_codes || [],
+        rig_up_dependency_phase_codes: load.rig_up_dependency_phase_codes || [],
         rig_down_dependency_ids: [],
+        rig_move_dependency_ids: [],
         rig_up_dependency_ids: [],
         dependency_ids: [],
+        source_kind: load.source_kind || (String(load.category || "").toLowerCase() === "startup" ? "startup" : "rig"),
       };
 
       logicalLoads.push(logicalLoad);
@@ -246,11 +252,15 @@ function buildWorkbookLogicalLoads(rawLoads) {
       .flatMap((code) => codeToLogicalIds.get(code) || [])
       .filter((dependencyId) => dependencyId !== load.id)
       .sort((a, b) => a - b);
+    load.rig_move_dependency_ids = (load.rig_move_dependency_codes || [])
+      .flatMap((code) => codeToLogicalIds.get(code) || [])
+      .filter((dependencyId) => dependencyId !== load.id)
+      .sort((a, b) => a - b);
     load.rig_up_dependency_ids = (load.rig_up_dependency_codes || [])
       .flatMap((code) => codeToLogicalIds.get(code) || [])
       .filter((dependencyId) => dependencyId !== load.id)
       .sort((a, b) => a - b);
-    load.dependency_ids = [...new Set(load.rig_down_dependency_ids)]
+    load.dependency_ids = [...new Set([...load.rig_down_dependency_ids, ...load.rig_move_dependency_ids])]
       .sort((a, b) => a - b);
   });
 

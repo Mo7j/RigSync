@@ -8,7 +8,7 @@ from models import (
     LoadTemplate,
     TruckSpec,
 )
-from planning_dataset import DATASET_PATH, load_planning_dataset
+from planning_dataset import DATASET_PATH, load_planning_dataset, parse_phase_identifier
 
 
 PLANNING_TABLES = [
@@ -196,14 +196,19 @@ def import_dataset():
 
             if source_kind == "rig":
                 dependency_sets = [
-                    ("rig_down", row.get("rig_down_dependency_codes") or []),
-                    ("rig_up", row.get("rig_up_dependency_codes") or []),
+                    ("rig_down", row.get("rig_down_dependency_phase_codes") or []),
+                    ("rig_move", row.get("rig_move_dependency_phase_codes") or []),
+                    ("rig_up", row.get("rig_up_dependency_phase_codes") or []),
                 ]
             else:
-                dependency_sets = [("rig_up", row.get("rig_up_dependency_codes") or [])]
+                dependency_sets = [
+                    ("rig_move", row.get("rig_move_dependency_phase_codes") or []),
+                    ("rig_up", row.get("rig_up_dependency_phase_codes") or []),
+                ]
 
-            for dependency_phase, dependency_codes in dependency_sets:
-                for dependency_code in dependency_codes:
+            for dependency_phase, dependency_refs in dependency_sets:
+                for dependency_ref in dependency_refs:
+                    dependency_code, _ = parse_phase_identifier(dependency_ref)
                     depends_on = templates_by_code.get(dependency_code)
                     if not depends_on or depends_on.id == template.id:
                         continue
@@ -212,6 +217,7 @@ def import_dataset():
                             load_template_id=template.id,
                             depends_on_load_template_id=depends_on.id,
                             dependency_phase=dependency_phase,
+                            predecessor_activity_code=dependency_ref,
                         )
                     )
 
