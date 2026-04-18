@@ -13,18 +13,39 @@ import { persistMoveSession } from "../features/rigMoves/storage.js";
 
 const { useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } = React;
 
+const PROJECT_OVERHEAD_SAR_PER_DAY = 5000;
+const WORKER_ROLE_RATES = {
+  driller: 70,
+  bop_tech: 60,
+  assistant_driller: 55,
+  forklift_crane_operator: 50,
+  derrickman: 55,
+  operator: 50,
+  floorman: 50,
+  camp_foreman: 48,
+  crane_operator: 60,
+  yard_foreman: 48,
+  rigger: 45,
+  roustabout: 38,
+  mechanic: 50,
+  truck_driver: 40,
+  welder: 48,
+  electrician: 50,
+  pumpman_mechanic: 50,
+};
+
 function normalizeTruckTypeKey(type) {
   const normalized = String(type || "")
     .toLowerCase()
     .replace(/[^a-z]/g, "");
 
-  if (normalized.includes("flatbed")) {
+  if (normalized === "fb" || normalized.includes("flatbed")) {
     return "flatbed";
   }
-  if (normalized.includes("lowbed") || normalized.includes("support")) {
+  if (normalized === "lb" || normalized.includes("lowbed") || normalized.includes("support")) {
     return "lowbed";
   }
-  if (normalized.includes("heavyhaul")) {
+  if (normalized === "hh" || normalized.includes("heavyhaul")) {
     return "heavyhauler";
   }
 
@@ -60,6 +81,9 @@ function getTruckShortLabel(type) {
 }
 
 function getLoadDisplayLabel(entity) {
+  if (entity?.executionLoadLabel || entity?.simpleLoadLabel) {
+    return String(entity.executionLoadLabel || entity.simpleLoadLabel);
+  }
   const loadCode = entity?.loadCode || entity?.code;
   if (loadCode) {
     return String(loadCode);
@@ -119,27 +143,249 @@ function formatDistanceCm(value) {
   return `${Number.isInteger(safeValue) ? safeValue : safeValue.toFixed(1)} cm`;
 }
 
-function getUltrasonicDemoSummary(executionProgress = {}) {
+function getExecutionMoveState(assignment = {}) {
+  if (assignment?.taskType === "return") {
+    if (!assignment?.moveStartedAt) {
+      return "readyOutbound";
+    }
+    if (!assignment?.returnedToSourceAt) {
+      return "movingReturn";
+    }
+    return "returned";
+  }
+
+  if (!assignment?.moveStartedAt) {
+    return "readyOutbound";
+  }
+  if (!assignment?.outboundArrivedAt) {
+    return "movingOutbound";
+  }
+  if (!assignment?.returnMoveStartedAt) {
+    return "readyReturn";
+  }
+  if (!assignment?.returnedToSourceAt) {
+    return "movingReturn";
+  }
+  return "returned";
+}
+
+function getPrimaryTransportAssignment(executionAssignments = []) {
+  const visibleAssignments = (executionAssignments || []).filter(
+    (assignment) => assignment?.status === "active" || assignment?.status === "foreman",
+  );
+  if (!visibleAssignments.length) {
+    return null;
+  }
+
+  const returnAssignmentsBySourceId = new Map(
+    (executionAssignments || [])
+      .filter((assignment) => assignment?.taskType === "return" && (assignment?.linkedAssignmentId || assignment?.returnForAssignmentId))
+      .map((assignment) => [String(assignment.linkedAssignmentId || assignment.returnForAssignmentId), assignment]),
+  );
+
+  const candidates = visibleAssignments
+    .map((assignment) => {
+      const moveState = getExecutionMoveState(assignment);
+      if (assignment?.taskType === "return") {
+        const statePriority = moveState === "movingReturn"
+          ? 5
+          : moveState === "readyOutbound"
+            ? 4
+            : moveState === "returned"
+              ? 2
+              : 0;
+        return {
+          assignment,
+          moveState,
+          statePriority,
+          statusPriority: assignment?.status === "active" ? 1 : 0,
+          returnPriority: 1,
+        };
+      }
+
+      const linkedReturnAssignment = returnAssignmentsBySourceId.get(String(assignment.id)) || null;
+      let transportState = moveState;
+      if (linkedReturnAssignment) {
+        const linkedReturnState = getExecutionMoveState(linkedReturnAssignment);
+        if (linkedReturnAssignment?.returnedToSourceAt || linkedReturnAssignment?.status === "completed") {
+          transportState = "returned";
+        } else if (linkedReturnState === "readyOutbound" || linkedReturnState === "movingReturn") {
+          return null;
+        }
+      }
+
+      const statePriority = transportState === "movingOutbound"
+        ? 5
+        : transportState === "readyOutbound"
+          ? 3
+          : transportState === "readyReturn"
+            ? 2
+            : transportState === "returned"
+              ? 1
+              : 0;
+      return {
+        assignment,
+        moveState: transportState,
+        statePriority,
+        statusPriority: assignment?.status === "active" ? 1 : 0,
+        returnPriority: 0,
+      };
+    })
+    .filter((item) => item && item.statePriority > 0)
+    .sort((left, right) =>
+      right.statePriority - left.statePriority ||
+      right.returnPriority - left.returnPriority ||
+      right.statusPriority - left.statusPriority ||
+      ((left.assignment?.sequence || 0) - (right.assignment?.sequence || 0))
+    );
+
+  return candidates[0] || null;
+}
+
+function getLiveTripDirection(executionAssignments = []) {
+  const activeTransport = getPrimaryTransportAssignment(executionAssignments);
+  if (!activeTransport) {
+    return "outbound";
+  }
+
+  return activeTransport.moveState === "movingReturn" ||
+    activeTransport.moveState === "returned" ||
+    activeTransport.assignment?.returnMoveStartedAt
+    ? "return"
+    : "outbound";
+}
+
+function getUltrasonicDemoSummary(executionProgress = {}, executionAssignments = []) {
   const startCm = Math.max(0, Number(executionProgress?.ultrasonicStartCm) || 45);
   const arrivalCm = Math.max(0, Number(executionProgress?.ultrasonicArrivalCm) || 8);
   const latestCm = executionProgress?.ultrasonicLatestCm == null
     ? null
     : Math.max(0, Number(executionProgress.ultrasonicLatestCm) || 0);
-  const totalWindow = Math.max(startCm - arrivalCm, 0.001);
+  const progressStartCm = startCm;
+  const progressEndCm = Math.min(arrivalCm, progressStartCm);
+  const totalWindow = Math.max(progressStartCm - progressEndCm, 0.001);
+  const tripDirection = getLiveTripDirection(executionAssignments);
   const hasReading = latestCm != null;
-  const progressPercent = hasReading
-    ? Math.max(0, Math.min(100, Math.round(((startCm - latestCm) / totalWindow) * 100)))
+  const outboundProgressPercent = hasReading
+    ? Math.max(0, Math.min(100, Math.round(((progressStartCm - latestCm) / totalWindow) * 100)))
     : 0;
-  const arrived = hasReading && latestCm <= arrivalCm;
+  const progressPercent = tripDirection === "return"
+    ? Math.max(0, Math.min(100, 100 - outboundProgressPercent))
+    : outboundProgressPercent;
+  const roadProgressRatio = Math.max(0, Math.min(1, progressPercent / 100));
+  const arrived = hasReading && progressPercent >= 100;
 
   return {
     startCm,
     arrivalCm,
     latestCm,
+    progressStartCm,
+    progressEndCm,
+    tripDirection,
     hasReading,
-    progressPercent: arrived ? 100 : progressPercent,
+    progressPercent,
+    roadProgressRatio,
     arrived,
   };
+}
+
+function getActiveSensorTripWindow(playback, executionAssignments = []) {
+  if (!playback?.trips?.length || !executionAssignments.length) {
+    return null;
+  }
+
+  const activeTransport = getPrimaryTransportAssignment(executionAssignments);
+  const candidateAssignment = activeTransport?.assignment || null;
+  const moveState = activeTransport?.moveState || null;
+
+  if (!candidateAssignment || !moveState) {
+    return null;
+  }
+
+  const isReturnTrip = candidateAssignment?.taskType === "return" || moveState === "movingReturn" || moveState === "returned";
+  const sourceAssignment = isReturnTrip && candidateAssignment?.linkedAssignmentId
+    ? executionAssignments.find((assignment) => String(assignment?.id) === String(candidateAssignment.linkedAssignmentId))
+    : candidateAssignment;
+  const sourceLoadId = sourceAssignment?.loadId;
+  const trip = (playback.trips || []).find((item) => String(item?.loadId) === String(sourceLoadId));
+
+  if (!trip) {
+    return null;
+  }
+
+  if (moveState === "readyOutbound") {
+    if (candidateAssignment?.taskType === "return") {
+      const destinationMinute = trip.arrivalAtDestination ?? trip.moveStart ?? 0;
+      return {
+        direction: "return",
+        startMinute: destinationMinute,
+        endMinute: destinationMinute,
+      };
+    }
+
+    const sourceMinute = trip.moveStart ?? trip.pickupLoadFinish ?? trip.rigDownFinish ?? 0;
+    return {
+      direction: "outbound",
+      startMinute: sourceMinute,
+      endMinute: sourceMinute,
+    };
+  }
+
+  if (moveState === "readyReturn") {
+    const destinationMinute = trip.arrivalAtDestination ?? trip.moveStart ?? 0;
+    return {
+      direction: "outbound",
+      startMinute: destinationMinute,
+      endMinute: destinationMinute,
+    };
+  }
+
+  if (moveState === "returned") {
+    const sourceMinute = trip.returnToSource ?? trip.returnStart ?? trip.arrivalAtDestination ?? 0;
+    return {
+      direction: "return",
+      startMinute: sourceMinute,
+      endMinute: sourceMinute,
+    };
+  }
+
+  if (isReturnTrip || moveState === "movingReturn") {
+    const startMinute = trip.returnStart ?? trip.rigUpFinish ?? trip.arrivalAtDestination ?? null;
+    const endMinute = trip.returnToSource ?? null;
+    if (startMinute == null || endMinute == null) {
+      return null;
+    }
+    return {
+      direction: "return",
+      startMinute,
+      endMinute,
+    };
+  }
+
+  const startMinute = trip.moveStart ?? trip.pickupLoadFinish ?? trip.rigDownFinish ?? null;
+  const endMinute = trip.arrivalAtDestination ?? null;
+  if (startMinute == null || endMinute == null) {
+    return null;
+  }
+
+  return {
+    direction: "outbound",
+    startMinute,
+    endMinute,
+  };
+}
+
+function shouldUseDemoSensorTracking(executionAssignments = []) {
+  const activeTransport = getPrimaryTransportAssignment(executionAssignments);
+  if (!activeTransport) {
+    return false;
+  }
+
+  return (
+    activeTransport.moveState === "movingOutbound" ||
+    activeTransport.moveState === "readyReturn" ||
+    activeTransport.moveState === "movingReturn"
+  );
 }
 
 function normalizeTruckSetup(move, availableFleet = []) {
@@ -396,6 +642,152 @@ function formatCurrency(value) {
   }).format(Math.max(0, value));
 }
 
+function formatWholeNumber(value) {
+  return new Intl.NumberFormat("en-US", {
+    maximumFractionDigits: 0,
+  }).format(Math.max(0, Number(value) || 0));
+}
+
+function formatPercentLabel(value, digits = 1) {
+  const safeValue = Math.max(0, Number(value) || 0);
+  return `${Number(safeValue.toFixed(digits))}%`;
+}
+
+function getDefaultTruckHourlyCost(type) {
+  const normalized = normalizeTruckTypeKey(type);
+  if (normalized === "flatbed") {
+    return 150;
+  }
+  if (normalized === "lowbed" || normalized === "support") {
+    return 220;
+  }
+  if (normalized === "heavyhauler") {
+    return 320;
+  }
+  return 0;
+}
+
+function getScenarioTruckRateMap(scenario) {
+  return new Map(
+    (scenario?.allocatedTruckSetup || scenario?.truckSetup || []).map((truck) => [
+      normalizeTruckTypeKey(truck?.type),
+      Math.max(0, Number(truck?.hourlyCost) || 0) || getDefaultTruckHourlyCost(truck?.type),
+    ]),
+  );
+}
+
+function getDerivedLaborCost(playback) {
+  return Math.round(
+    (playback?.tasks || []).reduce((sum, task) => {
+      if (task?.phaseCode === "RM") {
+        return sum;
+      }
+
+      return sum + Object.entries(task?.roleCounts || {}).reduce((roleSum, [roleId, count]) => {
+        const rate = WORKER_ROLE_RATES[roleId] || 0;
+        return roleSum + ((Math.max(0, Number.parseInt(count, 10) || 0) * rate * Math.max(0, Number(task?.durationMinutes) || 0)) / 60);
+      }, 0);
+    }, 0),
+  );
+}
+
+function getDerivedTransportCost(scenario, playback) {
+  const rateMap = getScenarioTruckRateMap(scenario);
+  const journeys = playback?.journeys?.length ? playback.journeys : (playback?.trips || []);
+
+  return Math.round(
+    journeys.reduce((sum, journey) => {
+      const truckTypeKey = normalizeTruckTypeKey(journey?.truckType);
+      const hourlyRate = rateMap.get(truckTypeKey) || getDefaultTruckHourlyCost(journey?.truckType);
+      const activeMinutes = Math.max(
+        0,
+        Number(journey?.routeMinutes) ||
+          ((journey?.arrivalAtDestination || 0) - (journey?.moveStart || journey?.dispatchStart || 0)),
+      );
+      return sum + ((activeMinutes / 60) * hourlyRate);
+    }, 0),
+  );
+}
+
+function getScenarioCostSummary(scenario, playback) {
+  const totalMinutes = Math.max(0, Number(scenario?.totalMinutes) || Number(playback?.totalMinutes) || 0);
+  const derivedTransportCost = getDerivedTransportCost(scenario, playback);
+  const derivedLaborCost = getDerivedLaborCost(playback);
+  const derivedOverheadCost = Math.round(Math.ceil(totalMinutes / (24 * 60)) * PROJECT_OVERHEAD_SAR_PER_DAY);
+  const transportCost = Math.max(0, Number(scenario?.transportCost));
+  const laborCost = Math.max(0, Number(scenario?.laborCost));
+  const overheadCost = Math.max(0, Number(scenario?.overheadCost));
+  const normalizedTransportCost = transportCost > 0 ? transportCost : derivedTransportCost;
+  const normalizedLaborCost = laborCost > 0 ? laborCost : derivedLaborCost;
+  const normalizedOverheadCost = overheadCost > 0 ? overheadCost : derivedOverheadCost;
+  const computedTotalCost = normalizedTransportCost + normalizedLaborCost + normalizedOverheadCost;
+  const totalProjectCost = Math.max(0, Number(scenario?.costEstimate) || computedTotalCost);
+
+  return {
+    totalProjectCost,
+    transportCost: normalizedTransportCost,
+    laborCost: normalizedLaborCost,
+    overheadCost: normalizedOverheadCost,
+  };
+}
+
+function getScenarioUtilizationScore(scenario) {
+  return Math.max(
+    0,
+    Number(scenario?.utilizationEfficiency) ||
+      Number(scenario?.utilization) ||
+      Number(scenario?.truckUtilization) ||
+      0,
+  );
+}
+
+function buildTruckTripUtilizationRows(playback, totalMinutes) {
+  const truckMap = new Map();
+
+  (playback?.trips || []).forEach((trip) => {
+    const truckId = trip?.truckId;
+    if (truckId == null) {
+      return;
+    }
+
+    const key = String(truckId);
+    const existing = truckMap.get(key) || {
+      key,
+      truckId: key,
+      truckType: trip?.truckType || "Truck",
+      loadCount: 0,
+      activeMinutes: 0,
+    };
+
+    existing.loadCount += 1;
+    existing.activeMinutes += Math.max(
+      0,
+      (trip?.arrivalAtDestination || 0) - (trip?.moveStart || trip?.dispatchStart || 0),
+    );
+    truckMap.set(key, existing);
+  });
+
+  return [...truckMap.values()]
+    .map((truck) => ({
+      ...truck,
+      utilizationPercent: Math.min(100, Math.round((truck.activeMinutes / Math.max(totalMinutes, 1)) * 100)),
+    }))
+    .sort((left, right) => right.loadCount - left.loadCount || right.utilizationPercent - left.utilizationPercent || left.truckId.localeCompare(right.truckId));
+}
+
+function getAverageTruckMoveHours(playback) {
+  const trips = playback?.trips || [];
+  if (!trips.length) {
+    return 0;
+  }
+
+  const totalMoveMinutes = trips.reduce(
+    (sum, trip) => sum + Math.max(0, (trip?.arrivalAtDestination || 0) - (trip?.moveStart || trip?.dispatchStart || 0)),
+    0,
+  );
+  return totalMoveMinutes / trips.length / 60;
+}
+
 function getTaskToneClass(task) {
   const phaseToneMap = {
     rig_down: "scene-timeline-segment-down",
@@ -434,7 +826,7 @@ function getPlaybackTasks(playback) {
   if (directTasks.length) {
     return directTasks.map((task) => ({
       ...task,
-      predecessorIds: [...(task.predecessorIds || [])],
+      predecessorIds: [...(task.criticalPredecessorIds || task.predecessorIds || [])],
       earliestStart: task.earliestStart ?? task.startMinute ?? 0,
       earliestFinish: task.earliestFinish ?? task.endMinute ?? 0,
       latestStart: task.latestStart ?? ((task.startMinute ?? 0) + (task.slack ?? 0)),
@@ -779,7 +1171,7 @@ function getPlanRadarComparisonModel(scenarios, selectedScenario, move) {
         name: scenario.name,
         totalMinutes: Math.max(0, Number(scenario?.totalMinutes) || 0),
         totalCost: Math.max(0, Number(scenario?.costEstimate) || 0),
-        utilization: Math.max(0, Number(scenario?.truckUtilization) || Number(scenario?.utilization) || 0),
+        utilization: getScenarioUtilizationScore(scenario),
         savings: savingsPercent,
         idleMinutes: Math.max(0, Number(scenario?.idleMinutes) || 0),
         fleetUse: totalLoads > 0 ? Math.round((totalLoads / truckCount) * 10) / 10 : 0,
@@ -930,19 +1322,29 @@ function getTruckFocusStats({ truckId, playback, currentMinute, totalMinutes, mo
     return null;
   }
 
+  const getTripEndMinute = (trip) => {
+    if (trip?.returnToSource != null) {
+      return trip.returnToSource;
+    }
+    if (trip?.returnStart != null) {
+      return trip.returnStart;
+    }
+    return trip?.rigUpFinish ?? trip?.unloadDropFinish ?? trip?.arrivalAtDestination;
+  };
+
   const activeTrip = truckTrips.find(
-    (trip) => currentMinute >= (trip.dispatchStart ?? trip.pickupLoadStart ?? trip.loadStart) && currentMinute < (trip.returnToSource ?? trip.unloadDropFinish ?? trip.rigUpFinish),
+    (trip) => currentMinute >= (trip.dispatchStart ?? trip.pickupLoadStart ?? trip.loadStart) && currentMinute < getTripEndMinute(trip),
   ) || null;
   const completedLoads = truckTrips.filter((trip) => currentMinute >= trip.rigUpFinish).length;
   const busyMinutes = truckTrips.reduce(
-    (sum, trip) => sum + Math.max(0, (trip.returnToSource ?? trip.unloadDropFinish ?? trip.rigUpFinish) - (trip.dispatchStart ?? trip.pickupLoadStart ?? trip.loadStart)),
+    (sum, trip) => sum + Math.max(0, getTripEndMinute(trip) - (trip.dispatchStart ?? trip.pickupLoadStart ?? trip.loadStart)),
     0,
   );
   const utilization = Math.min(100, Math.round((busyMinutes / Math.max(totalMinutes, 1)) * 100));
   const nextTrip = truckTrips.find((trip) => currentMinute < (trip.dispatchStart ?? trip.pickupLoadStart ?? trip.loadStart)) || null;
-  const lastTrip = [...truckTrips].reverse().find((trip) => currentMinute >= trip.rigUpFinish) || null;
+  const lastTrip = [...truckTrips].reverse().find((trip) => currentMinute >= getTripEndMinute(trip)) || null;
   const routeKm = Number(move?.routeKm) || 0;
-  const remainingAssignedLoads = truckTrips.filter((trip) => currentMinute < trip.rigUpFinish).length;
+  const remainingAssignedLoads = truckTrips.filter((trip) => currentMinute < getTripEndMinute(trip)).length;
 
   let statusLabel = "Idle";
   let statusDetail = "Waiting for its next assignment.";
@@ -960,9 +1362,12 @@ function getTruckFocusStats({ truckId, playback, currentMinute, totalMinutes, mo
     } else if (currentMinute < (activeTrip.unloadDropFinish ?? activeTrip.rigUpStart ?? activeTrip.rigUpFinish)) {
       statusLabel = "Unload";
       statusDetail = `Dropping #${activeTrip.loadId} at destination.`;
-    } else {
+    } else if (activeTrip.returnStart != null && currentMinute >= activeTrip.returnStart) {
       statusLabel = "Returning";
       statusDetail = "Returning to the source rig.";
+    } else {
+      statusLabel = "At Destination";
+      statusDetail = "Parked at destination and waiting for the return trip to start.";
     }
   } else if (nextTrip) {
     statusLabel = "Queued";
@@ -1139,7 +1544,7 @@ function buildTruckScheduleRows(playback) {
     let rowToneClass = "scene-timeline-segment-truck-heavyhaul";
     const truckTrips = journeys.filter((trip) => trip.truckId === truckId);
     const truckTypeLabel = truckTrips[0]?.truckType || "Truck";
-    const truckItems = truckTrips
+    const rawTruckItems = truckTrips
       .flatMap((trip, tripIndex) => {
         const items = [];
         const toneClass = getTruckToneClass(trip.truckType);
@@ -1158,9 +1563,39 @@ function buildTruckScheduleRows(playback) {
           });
         }
 
+        if ((trip.returnToSource ?? 0) > (trip.returnStart ?? trip.arrivalAtDestination ?? 0)) {
+          items.push({
+            key: `${truckId}-${trip.loadId}-${tripIndex}-return`,
+            loadId: trip.loadIds?.[0] ?? trip.loadId,
+            description: `${trip.description} return`,
+            startMinute: trip.returnStart ?? trip.arrivalAtDestination,
+            endMinute: trip.returnToSource,
+            left: (((trip.returnStart ?? trip.arrivalAtDestination ?? 0) / totalMinutes) * 100),
+            width: (((trip.returnToSource - (trip.returnStart ?? trip.arrivalAtDestination ?? 0)) / totalMinutes) * 100),
+            toneClass: `${toneClass} scene-timeline-segment-return`,
+            label: `Return ${trip.description || getLoadDisplayLabel(trip)}`,
+          });
+        }
+
         return items;
       })
       .sort((left, right) => left.startMinute - right.startMinute);
+
+    const laneEndMinutes = [];
+    let overlapConflictCount = 0;
+    const truckItems = rawTruckItems.map((item) => {
+      const nextLane = laneEndMinutes.findIndex((endMinute) => endMinute <= (item.startMinute ?? 0));
+      const stackLane = nextLane >= 0 ? nextLane : laneEndMinutes.length;
+      if (stackLane > 0) {
+        overlapConflictCount += 1;
+      }
+      laneEndMinutes[stackLane] = item.endMinute ?? item.startMinute ?? 0;
+      return {
+        ...item,
+        stackLane,
+        overlapConflict: stackLane > 0,
+      };
+    });
 
     if (truckItems[0]?.toneClass) {
       rowToneClass = truckItems[0].toneClass;
@@ -1174,7 +1609,12 @@ function buildTruckScheduleRows(playback) {
       subLabel: `${truckTypeLabel} · ${truckItems.length} move segment${truckItems.length === 1 ? "" : "s"}`,
       subLabel: `${truckTypeLabel} | ${truckItems.length} move${truckItems.length === 1 ? "" : "s"}`,
       toneClass: rowToneClass,
+      subLabel: overlapConflictCount
+        ? `${truckTypeLabel} | planner conflict: ${overlapConflictCount + 1} overlapping move segments`
+        : `${truckTypeLabel} | ${truckItems.length} move${truckItems.length === 1 ? "" : "s"}`,
       items: truckItems,
+      laneCount: Math.max(laneEndMinutes.length, 1),
+      hasOverlapConflict: overlapConflictCount > 0,
       loadCount: truckTrips.length,
     };
   }).sort((left, right) => {
@@ -1192,13 +1632,13 @@ function buildLoadScheduleRows(playback) {
     .map((trip, index) => {
       const items = [];
       const sourceKind = trip.sourceKind || "rig";
-      const sourceLabel = getSourceKindLabel(sourceKind);
+      const loadLabel = getLoadDisplayLabel(trip) || `Load ${index + 1}`;
 
       if ((trip.rigDownFinish ?? 0) > (trip.rigDownStart ?? trip.loadStart ?? 0)) {
         items.push({
           key: `load-${trip.loadId}-${index}-down`,
           loadId: trip.loadId,
-          description: `${trip.description} rig down`,
+          description: `${loadLabel} rig down`,
           startMinute: trip.rigDownStart ?? trip.loadStart,
           endMinute: trip.rigDownFinish,
           left: (((trip.rigDownStart ?? trip.loadStart ?? 0) / totalMinutes) * 100),
@@ -1212,7 +1652,7 @@ function buildLoadScheduleRows(playback) {
         items.push({
           key: `load-${trip.loadId}-${index}-move`,
           loadId: trip.loadId,
-          description: `${trip.description} move`,
+          description: `${loadLabel} move`,
           startMinute: trip.moveStart ?? trip.pickupLoadFinish ?? trip.rigDownFinish,
           endMinute: trip.arrivalAtDestination,
           left: (((trip.moveStart ?? trip.pickupLoadFinish ?? trip.rigDownFinish ?? 0) / totalMinutes) * 100),
@@ -1226,7 +1666,7 @@ function buildLoadScheduleRows(playback) {
         items.push({
           key: `load-${trip.loadId}-${index}-up`,
           loadId: trip.loadId,
-          description: `${trip.description} rig up`,
+          description: `${loadLabel} rig up`,
           startMinute: trip.rigUpStart ?? trip.arrivalAtDestination,
           endMinute: trip.rigUpFinish,
           left: (((trip.rigUpStart ?? trip.arrivalAtDestination ?? 0) / totalMinutes) * 100),
@@ -1239,10 +1679,8 @@ function buildLoadScheduleRows(playback) {
       return {
         key: `load-row-${trip.loadId}-${index}`,
         loadId: trip.loadId,
-        label: `${getLoadDisplayLabel(trip)} · ${trip.description || `Load ${getLoadDisplayLabel(trip)}`}`,
-        subLabel: `${sourceLabel} load · ${items.length} task segment${items.length === 1 ? "" : "s"}`,
-        label: getLoadDisplayLabel(trip),
-        subLabel: `${trip.description || `${sourceLabel} load`} | ${sourceLabel}`,
+        label: loadLabel,
+        subLabel: "Rig",
         sourceKind,
         items,
       };
@@ -1252,6 +1690,533 @@ function buildLoadScheduleRows(playback) {
       const rightStart = right.items[0]?.startMinute ?? Number.MAX_SAFE_INTEGER;
       return leftStart - rightStart || left.loadId - right.loadId;
     });
+}
+
+function getExecutionAssignmentMinute(assignment, timestamp) {
+  const executionStartedAtMs = assignment?.executionStartedAt ? new Date(assignment.executionStartedAt).getTime() : null;
+  if (!timestamp || executionStartedAtMs == null) {
+    return null;
+  }
+  return Math.max(0, Math.round((new Date(timestamp).getTime() - executionStartedAtMs) / 60000));
+}
+
+function buildDisplayExecutionAssignments(assignments = [], currentMinute = 0) {
+  if (!assignments.length) {
+    return assignments;
+  }
+
+  const sourceAssignments = (assignments || [])
+    .filter((assignment) => assignment?.taskType !== "return")
+    .sort((left, right) => (left.sequence || 0) - (right.sequence || 0));
+  const returnAssignmentsBySourceId = new Map(
+    (assignments || [])
+      .filter((assignment) => assignment?.taskType === "return" && (assignment?.linkedAssignmentId || assignment?.returnForAssignmentId))
+      .map((assignment) => [String(assignment.linkedAssignmentId || assignment.returnForAssignmentId), assignment]),
+  );
+
+  const orderedAssignments = sourceAssignments.flatMap((assignment) => {
+    const linkedReturn = returnAssignmentsBySourceId.get(String(assignment.id));
+    return linkedReturn ? [assignment, linkedReturn] : [assignment];
+  });
+
+  const recalculatedAssignments = [];
+  let sequenceCursor = 0;
+
+  orderedAssignments.forEach((assignment) => {
+    if (!assignment?.stagePlan) {
+      recalculatedAssignments.push(assignment);
+      return;
+    }
+
+    const stagePlan = assignment.stagePlan || {};
+    const rigDownDuration = Math.max(1, (stagePlan.rigDown?.finishMinute ?? 0) - (stagePlan.rigDown?.startMinute ?? 0) || 1);
+    const rigMoveDuration = Math.max(1, (stagePlan.rigMove?.finishMinute ?? 0) - (stagePlan.rigMove?.startMinute ?? 0) || 1);
+    const rigUpDuration = Math.max(1, (stagePlan.rigUp?.finishMinute ?? 0) - (stagePlan.rigUp?.startMinute ?? 0) || 1);
+    const currentStage = getExecutionAssignmentStage(assignment?.stageStatus || {});
+    const isVisibleAssignment = assignment?.status === "active" || assignment?.status === "foreman";
+
+    if (assignment.taskType === "return") {
+      const actualReturnStart = getExecutionAssignmentMinute(
+        assignment,
+        assignment?.returnMoveStartedAt || assignment?.moveStartedAt,
+      );
+      const actualReturnFinish = getExecutionAssignmentMinute(
+        assignment,
+        assignment?.returnedToSourceAt || assignment?.stageCompletedAt?.rigMove,
+      );
+      const moveStartMinute = actualReturnStart ?? sequenceCursor;
+      const moveFinishMinute = actualReturnFinish ?? (moveStartMinute + rigMoveDuration);
+      sequenceCursor = moveFinishMinute;
+      recalculatedAssignments.push({
+        ...assignment,
+        plannedStartMinute: moveStartMinute,
+        plannedFinishMinute: moveFinishMinute,
+        stagePlan: {
+          ...stagePlan,
+          rigMove: {
+            startMinute: moveStartMinute,
+            finishMinute: moveFinishMinute,
+          },
+        },
+      });
+      return;
+    }
+
+    const actualRigDownFinish = getExecutionAssignmentMinute(assignment, assignment?.stageCompletedAt?.rigDown);
+    const actualMoveStart = getExecutionAssignmentMinute(assignment, assignment?.moveStartedAt);
+    const actualMoveFinish = getExecutionAssignmentMinute(assignment, assignment?.outboundArrivedAt || assignment?.stageCompletedAt?.rigMove);
+    const actualRigUpFinish = getExecutionAssignmentMinute(assignment, assignment?.stageCompletedAt?.rigUp);
+
+    const rigDownStartMinute = actualRigDownFinish != null
+      ? Math.max(sequenceCursor, actualRigDownFinish - rigDownDuration)
+      : sequenceCursor;
+    const rigDownFinishMinute = actualRigDownFinish ?? (rigDownStartMinute + rigDownDuration);
+    const rigMoveStartMinute = actualMoveStart ?? rigDownFinishMinute;
+    const rigMoveFinishMinute = actualMoveFinish ?? (rigMoveStartMinute + rigMoveDuration);
+    const rigUpStartMinute = rigMoveFinishMinute;
+    const rigUpFinishMinute = actualRigUpFinish ?? (rigUpStartMinute + rigUpDuration);
+    sequenceCursor = rigUpFinishMinute;
+
+    recalculatedAssignments.push({
+      ...assignment,
+      plannedStartMinute: rigDownStartMinute,
+      plannedFinishMinute: rigUpFinishMinute,
+      stagePlan: {
+        ...stagePlan,
+        rigDown: {
+          startMinute: rigDownStartMinute,
+          finishMinute: rigDownFinishMinute,
+        },
+        rigMove: {
+          startMinute: rigMoveStartMinute,
+          finishMinute: rigMoveFinishMinute,
+        },
+        rigUp: {
+          startMinute: rigUpStartMinute,
+          finishMinute: rigUpFinishMinute,
+        },
+      },
+    });
+  });
+
+  const recalculatedById = new Map(recalculatedAssignments.map((assignment) => [assignment.id, assignment]));
+  return (assignments || []).map((assignment) => recalculatedById.get(assignment.id) || assignment);
+}
+
+function buildExecutionTimelinePlayback(playback, executionAssignments = [], currentMinute = 0) {
+  if (!playback?.trips?.length || !executionAssignments.length) {
+    return playback;
+  }
+
+  const truckIdMap = new Map();
+  playback.trips.forEach((trip) => {
+    const rawTruckId = String(trip?.truckId ?? "").trim();
+    if (!rawTruckId || truckIdMap.has(rawTruckId)) {
+      return;
+    }
+    truckIdMap.set(rawTruckId, truckIdMap.size + 1);
+  });
+
+  const assignmentByLoadId = new Map(
+    executionAssignments
+      .filter((assignment) => assignment?.taskType !== "return" && assignment?.loadId != null)
+      .map((assignment) => [String(assignment.loadId), assignment]),
+  );
+  const returnAssignmentByLinkedId = new Map(
+    executionAssignments
+      .filter((assignment) => assignment?.taskType === "return" && assignment?.linkedAssignmentId)
+      .map((assignment) => [String(assignment.linkedAssignmentId), assignment]),
+  );
+
+  const remappedTrips = playback.trips.map((trip, index) => {
+    const assignment = assignmentByLoadId.get(String(trip?.loadId));
+    const returnAssignment = assignment?.id ? returnAssignmentByLinkedId.get(String(assignment.id)) : null;
+    const executionLoadLabel = assignment?.simpleLoadLabel || `Load ${index + 1}`;
+    if (!assignment?.stagePlan) {
+      return {
+        ...trip,
+        executionLoadLabel,
+        description: executionLoadLabel,
+      };
+    }
+
+    const rigDown = assignment.stagePlan.rigDown || {};
+    const rigMove = assignment.stagePlan.rigMove || {};
+    const rigUp = assignment.stagePlan.rigUp || {};
+    const executionStartedAtMs = assignment?.executionStartedAt ? new Date(assignment.executionStartedAt).getTime() : null;
+    const getActualMinute = (timestamp) =>
+      timestamp && executionStartedAtMs != null
+        ? Math.max(0, Math.round((new Date(timestamp).getTime() - executionStartedAtMs) / 60000))
+        : null;
+    const rigDownDuration = Math.max(1, (rigDown.finishMinute ?? 0) - (rigDown.startMinute ?? 0) || 1);
+    const rigMoveDuration = Math.max(1, (rigMove.finishMinute ?? 0) - (rigMove.startMinute ?? 0) || 1);
+    const rigUpDuration = Math.max(1, (rigUp.finishMinute ?? 0) - (rigUp.startMinute ?? 0) || 1);
+    const actualRigDownFinish = getActualMinute(assignment?.stageCompletedAt?.rigDown);
+    const actualMoveStart = getActualMinute(assignment?.moveStartedAt);
+    const actualOutboundArrival = getActualMinute(assignment?.outboundArrivedAt || assignment?.stageCompletedAt?.rigMove);
+    const actualReturnStart = getActualMinute(returnAssignment?.moveStartedAt || returnAssignment?.returnMoveStartedAt || assignment?.returnMoveStartedAt);
+    const actualReturnFinish = getActualMinute(
+      returnAssignment?.returnedToSourceAt ||
+      returnAssignment?.stageCompletedAt?.rigMove ||
+      assignment?.returnedToSourceAt,
+    );
+    const actualRigUpFinish = getActualMinute(assignment?.stageCompletedAt?.rigUp);
+    const returnRigMove = returnAssignment?.stagePlan?.rigMove || {};
+    const plannedReturnStart = returnRigMove.startMinute ?? trip.returnStart ?? trip.arrivalAtDestination ?? 0;
+    const plannedReturnFinish = returnRigMove.finishMinute ?? trip.returnToSource ?? plannedReturnStart;
+    const returnDuration = Math.max(1, plannedReturnFinish - plannedReturnStart || 1);
+    const rigDownStartMinute = rigDown.startMinute ?? trip.rigDownStart ?? trip.loadStart ?? 0;
+    const rigDownFinishMinute = actualRigDownFinish ?? rigDown.finishMinute ?? (rigDownStartMinute + rigDownDuration);
+    const moveStartMinute = actualMoveStart == null
+      ? Math.max(currentMinute + 1, rigMove.startMinute ?? rigDownFinishMinute)
+      : actualMoveStart;
+    const moveFinishMinute = actualOutboundArrival != null
+      ? actualOutboundArrival
+      : actualMoveStart != null
+        ? Math.max(moveStartMinute + rigMoveDuration, currentMinute + 1)
+        : moveStartMinute + rigMoveDuration;
+    const returnStartMinute = actualReturnStart != null
+      ? actualReturnStart
+      : actualReturnFinish != null
+        ? Math.max(moveFinishMinute, actualReturnFinish - returnDuration)
+        : null;
+    const returnFinishMinute = actualReturnFinish != null
+      ? actualReturnFinish
+      : actualReturnStart != null
+        ? Math.max(returnStartMinute + returnDuration, currentMinute + 1)
+        : null;
+    const rigUpStartMinute = moveFinishMinute;
+    const rigUpFinishMinute = actualRigUpFinish != null
+      ? actualRigUpFinish
+      : assignment?.stageStatus?.rigMoveCompleted
+        ? Math.max(rigUpStartMinute + rigUpDuration, currentMinute + 1)
+        : rigUp.startMinute ?? rigUp.finishMinute ?? (rigUpStartMinute + rigUpDuration);
+
+    return {
+      ...trip,
+      truckId: truckIdMap.get(String(trip?.truckId ?? "").trim()) || 1,
+      originalTruckId: trip?.truckId ?? null,
+      executionLoadLabel,
+      description: executionLoadLabel,
+      loadStart: rigDownStartMinute,
+      dispatchStart: moveStartMinute,
+      rigDownStart: rigDownStartMinute,
+      rigDownFinish: rigDownFinishMinute,
+      pickupLoadFinish: rigDownFinishMinute,
+      moveStart: moveStartMinute,
+      arrivalAtDestination: moveFinishMinute,
+      unloadDropStart: moveFinishMinute,
+      unloadDropFinish: moveFinishMinute,
+      rigUpStart: rigUpStartMinute,
+      rigUpFinish: rigUpFinishMinute,
+      moveFinish: moveFinishMinute,
+      returnStart: returnStartMinute,
+      returnToSource: returnFinishMinute,
+    };
+  });
+
+  const totalMinutes = remappedTrips.reduce(
+    (maxValue, trip) => Math.max(
+      maxValue,
+      trip?.returnToSource ??
+      trip?.rigUpFinish ??
+      trip?.arrivalAtDestination ??
+      0,
+    ),
+    0,
+  );
+
+  return {
+    ...playback,
+    trips: remappedTrips,
+    journeys: remappedTrips,
+    totalMinutes: Math.max(totalMinutes, 1),
+  };
+}
+
+function normalizeScenePlayback(playback) {
+  if (!playback?.trips?.length) {
+    return playback;
+  }
+
+  const truckIdMap = new Map();
+  const normalizedTrips = playback.trips.map((trip) => {
+    const rawTruckId = String(trip?.truckId ?? "").trim() || "truck-1";
+    if (!truckIdMap.has(rawTruckId)) {
+      truckIdMap.set(rawTruckId, truckIdMap.size + 1);
+    }
+    return {
+      ...trip,
+      truckId: truckIdMap.get(rawTruckId) || 1,
+      originalTruckId: trip?.truckId ?? null,
+    };
+  });
+
+  const normalizedJourneys = (playback.journeys || playback.trips || []).map((trip) => {
+    const rawTruckId = String(trip?.truckId ?? "").trim() || "truck-1";
+    if (!truckIdMap.has(rawTruckId)) {
+      truckIdMap.set(rawTruckId, truckIdMap.size + 1);
+    }
+    return {
+      ...trip,
+      truckId: truckIdMap.get(rawTruckId) || 1,
+      originalTruckId: trip?.truckId ?? null,
+    };
+  });
+
+  return {
+    ...playback,
+    trips: normalizedTrips,
+    journeys: normalizedJourneys,
+    truckCount: Math.max(truckIdMap.size, 1),
+  };
+}
+
+function buildPhaseScheduleRows(playback) {
+  const trips = playback?.trips || [];
+  const totalMinutes = Math.max(playback?.totalMinutes || 1, 1);
+  const phaseBuckets = new Map([
+    ["rigDown", []],
+    ["move", []],
+    ["rigUp", []],
+  ]);
+
+  trips.forEach((trip, index) => {
+    const loadLabel = getLoadDisplayLabel(trip);
+    const description = trip.description || `Load ${loadLabel}`;
+
+    if ((trip.rigDownFinish ?? 0) > (trip.rigDownStart ?? trip.loadStart ?? 0)) {
+      phaseBuckets.get("rigDown").push({
+        key: `phase-rd-item-${trip.loadId}-${index}`,
+        loadId: trip.loadId,
+        description: `${description} rig down`,
+        startMinute: trip.rigDownStart ?? trip.loadStart ?? 0,
+        endMinute: trip.rigDownFinish ?? 0,
+        left: (((trip.rigDownStart ?? trip.loadStart ?? 0) / totalMinutes) * 100),
+        width: (((trip.rigDownFinish || 0) - (trip.rigDownStart ?? trip.loadStart ?? 0)) / totalMinutes) * 100,
+        toneClass: "scene-timeline-segment-down",
+        label: loadLabel,
+        typeCode: "RD",
+        subLabel: description,
+      });
+    }
+
+    if ((trip.arrivalAtDestination ?? 0) > (trip.moveStart ?? trip.pickupLoadFinish ?? trip.rigDownFinish ?? 0)) {
+      phaseBuckets.get("move").push({
+        key: `phase-rm-item-${trip.loadId}-${index}`,
+        loadId: trip.loadId,
+        description: `${description} move`,
+        startMinute: trip.moveStart ?? trip.pickupLoadFinish ?? trip.rigDownFinish ?? 0,
+        endMinute: trip.arrivalAtDestination ?? 0,
+        left: (((trip.moveStart ?? trip.pickupLoadFinish ?? trip.rigDownFinish ?? 0) / totalMinutes) * 100),
+        width: (((trip.arrivalAtDestination || 0) - (trip.moveStart ?? trip.pickupLoadFinish ?? trip.rigDownFinish ?? 0)) / totalMinutes) * 100,
+        toneClass: "scene-timeline-segment-move",
+        label: loadLabel,
+        typeCode: "RM",
+        truckId: trip.truckId,
+        truckType: trip.truckType,
+        subLabel: trip.truckType || "Truck",
+      });
+    }
+
+    if ((trip.rigUpFinish ?? 0) > (trip.rigUpStart ?? trip.arrivalAtDestination ?? 0)) {
+      phaseBuckets.get("rigUp").push({
+        key: `phase-ru-item-${trip.loadId}-${index}`,
+        loadId: trip.loadId,
+        description: `${description} rig up`,
+        startMinute: trip.rigUpStart ?? trip.arrivalAtDestination ?? 0,
+        endMinute: trip.rigUpFinish ?? 0,
+        left: (((trip.rigUpStart ?? trip.arrivalAtDestination ?? 0) / totalMinutes) * 100),
+        width: (((trip.rigUpFinish || 0) - (trip.rigUpStart ?? trip.arrivalAtDestination ?? 0)) / totalMinutes) * 100,
+        toneClass: "scene-timeline-segment-up",
+        label: loadLabel,
+        typeCode: "RU",
+        subLabel: description,
+      });
+    }
+  });
+
+  const phaseLabels = {
+    rigDown: "Rig Down",
+    move: "Move",
+    rigUp: "Rig Up",
+  };
+  return ["rigDown", "move", "rigUp"].map((phaseKey) => {
+    const items = [...(phaseBuckets.get(phaseKey) || [])].sort((left, right) => {
+      const leftStart = left.startMinute ?? Number.MAX_SAFE_INTEGER;
+      const rightStart = right.startMinute ?? Number.MAX_SAFE_INTEGER;
+      return leftStart - rightStart || String(left.label).localeCompare(String(right.label));
+    });
+    let stackedItems = [];
+    let laneCount = 1;
+
+    if (phaseKey === "move") {
+      const truckLaneMap = new Map();
+      items.forEach((item) => {
+        const truckKey = `${item.truckType || "Truck"}::${item.truckId ?? "0"}`;
+        if (!truckLaneMap.has(truckKey)) {
+          truckLaneMap.set(truckKey, truckLaneMap.size);
+        }
+      });
+      stackedItems = items.map((item) => {
+        const truckKey = `${item.truckType || "Truck"}::${item.truckId ?? "0"}`;
+        return {
+          ...item,
+          stackLane: truckLaneMap.get(truckKey) || 0,
+        };
+      });
+      laneCount = Math.max(truckLaneMap.size, 1);
+    } else {
+      const laneEndMinutes = [0, 0, 0];
+      stackedItems = items.map((item) => {
+        const startMinute = item.startMinute ?? 0;
+        let nextLane = laneEndMinutes.findIndex((endMinute) => endMinute <= startMinute);
+        if (nextLane < 0) {
+          nextLane = 0;
+          for (let index = 1; index < laneEndMinutes.length; index += 1) {
+            if (laneEndMinutes[index] <= laneEndMinutes[nextLane]) {
+              nextLane = index;
+            }
+          }
+        }
+        laneEndMinutes[nextLane] = item.endMinute ?? startMinute;
+        return {
+          ...item,
+          stackLane: nextLane,
+        };
+      });
+      laneCount = 3;
+    }
+
+    return {
+      key: `phase-row-${phaseKey}`,
+      phaseKey,
+      label: phaseLabels[phaseKey],
+      subLabel: "",
+      items: stackedItems,
+      laneCount,
+    };
+  });
+}
+
+function getTimelineBarLabel(rowType, row, trip) {
+  if (rowType === "load") {
+    return `${row.label} ${trip.label || ""}`.trim();
+  }
+  if (rowType === "truck") {
+    return getLoadDisplayLabel(trip);
+  }
+  if (rowType === "phase") {
+    return `${trip.label || ""}${trip.subLabel ? ` | ${trip.subLabel}` : ""}`.trim();
+  }
+  return trip.label || trip.description || row.label || "";
+}
+
+function getExecutionAssignmentStage(stageStatus = {}) {
+  if (!stageStatus.rigDownCompleted) {
+    return "rigDown";
+  }
+  if (!stageStatus.rigMoveCompleted) {
+    return "rigMove";
+  }
+  if (!stageStatus.rigUpCompleted) {
+    return "rigUp";
+  }
+  return "completed";
+}
+
+function isDemoExecutionAssignment(assignment) {
+  return Boolean(
+    assignment?.isDemoMove ||
+    (Number.isFinite(Number(assignment?.delayThresholdMinutes)) && Number(assignment.delayThresholdMinutes) < 1) ||
+    String(assignment?.loadCode || "").toUpperCase().startsWith("DM-"),
+  );
+}
+
+function getExecutionDelayThresholdMinutes(assignment) {
+  if (isDemoExecutionAssignment(assignment)) {
+    return 20 / 60;
+  }
+  if (Number.isFinite(Number(assignment?.delayThresholdMinutes))) {
+    return Math.max(0, Number(assignment.delayThresholdMinutes));
+  }
+  return 20;
+}
+
+function formatExecutionDelayAmount(minutes, assignment) {
+  const safeMinutes = Math.max(0, Number(minutes) || 0);
+  if (safeMinutes < 1 || isDemoExecutionAssignment(assignment)) {
+    return `${Math.round(safeMinutes * 60)} sec`;
+  }
+  return `${Math.round(safeMinutes)} min`;
+}
+
+function formatExecutionTimeAmount(minutes, assignment) {
+  const safeMinutes = Math.max(0, Number(minutes) || 0);
+  if (isDemoExecutionAssignment(assignment)) {
+    const totalSeconds = Math.round(safeMinutes * 60);
+    const wholeMinutes = Math.floor(totalSeconds / 60);
+    const seconds = totalSeconds % 60;
+    if (wholeMinutes > 0) {
+      return `${wholeMinutes} min ${seconds} sec`;
+    }
+    return `${seconds} sec`;
+  }
+  return formatMinutes(Math.round(safeMinutes));
+}
+
+function getExecutionStageTitle(stage) {
+  if (stage === "rigDown") {
+    return "Rig Down";
+  }
+  if (stage === "rigMove") {
+    return "Move";
+  }
+  if (stage === "rigUp") {
+    return "Rig Up";
+  }
+  return "Task";
+}
+
+function buildTimelineHoverCard(rowType, row, trip, startMinute, endMinute) {
+  if (rowType === "phase") {
+    return {
+      title: row.label,
+      lines: [
+        `${trip.label || ""}${trip.subLabel ? ` | ${trip.subLabel}` : ""}`.trim(),
+        `${formatTimelineWindowLabel(startMinute)} -> ${formatTimelineWindowLabel(endMinute)}`,
+      ].filter(Boolean),
+    };
+  }
+
+  if (rowType === "load") {
+    return {
+      title: row.label || getLoadDisplayLabel(trip),
+      lines: [
+        trip.description || row.subLabel || "Load segment",
+        `${trip.label || "Task"} | ${formatTimelineWindowLabel(startMinute)} -> ${formatTimelineWindowLabel(endMinute)}`,
+      ],
+    };
+  }
+
+  if (rowType === "truck") {
+    return {
+      title: `Truck ${row.truckId}`,
+      lines: [
+        `${trip.description || getLoadDisplayLabel(trip)} | ${row.subLabel || "Truck move"}`,
+        trip.overlapConflict ? "Planner conflict: overlaps another move on the same truck" : null,
+        `${formatTimelineWindowLabel(startMinute)} -> ${formatTimelineWindowLabel(endMinute)}`,
+      ].filter(Boolean),
+    };
+  }
+
+  return {
+    title: row.label || trip.label || "Timeline item",
+    lines: [
+      trip.description || trip.label || "",
+      `${trip.critical ? "Critical path | " : ""}${formatTimelineWindowLabel(startMinute)} -> ${formatTimelineWindowLabel(endMinute)}`,
+    ].filter(Boolean),
+  };
 }
 
 function buildCriticalPathRows(playback) {
@@ -1753,6 +2718,7 @@ function FullScreenTimeline({
   showRM = true,
   showRU = true,
   showFloatBar = true,
+  hideFixedColumn = false,
 }) {
   const headerScrollRef = useRef(null);
   const bodyScrollRef = useRef(null);
@@ -1782,21 +2748,32 @@ function FullScreenTimeline({
   }, [showRD, showRM, showRU]);
   const rows = useMemo(() => {
     const baseRows =
-      rowType === "load"
+      rowType === "phase"
+        ? buildPhaseScheduleRows(playback)
+        : rowType === "load"
         ? buildLoadScheduleRows(playback)
         : rowType === "truck"
           ? buildTruckScheduleRows(playback)
           : buildCpmScheduleRows(playback);
-    return baseRows
-      .map((row) => ({
-        ...row,
-        items: (row.items || []).filter((trip) =>
+    const filteredRows = baseRows
+      .map((row) => {
+        const visibleItems = (row.items || []).filter((trip) =>
           (trip.endMinute ?? 0) > visibleStartMinute &&
           (trip.startMinute ?? 0) < visibleEndMinute &&
-          shouldShowTrip(trip),
-        ),
-      }))
+          shouldShowTrip(trip));
+        return {
+          ...row,
+          items: visibleItems,
+          laneCount: row.laneCount,
+        };
+      })
       .filter((row) => {
+        if (rowType === "phase") {
+          return true;
+        }
+        if ((rowType === "load" || rowType === "truck") && !cpOnly) {
+          return true;
+        }
         if (!row.items?.length) {
           return false;
         }
@@ -1805,6 +2782,7 @@ function FullScreenTimeline({
         }
         return true;
       });
+    return filteredRows;
   }, [playback, rowType, cpOnly, shouldShowTrip, visibleStartMinute, visibleEndMinute]);
   const tickStepMinutes = Math.max(60, tickMinutes || (visibleRangeMinutes <= 12 * 60 ? 2 * 60 : 4 * 60));
   const tickCount = Math.max(1, Math.ceil(visibleRangeMinutes / tickStepMinutes));
@@ -1858,7 +2836,7 @@ function FullScreenTimeline({
     }
   }
 
-  function handleTripHover(event, label) {
+  function handleTripHover(event, card) {
     const bodyNode = bodyScrollRef.current;
     if (!bodyNode) {
       return;
@@ -1866,7 +2844,7 @@ function FullScreenTimeline({
 
     const bounds = bodyNode.getBoundingClientRect();
     const cardWidth = 280;
-    const cardHeight = 44;
+    const cardHeight = 84;
     const rawLeft = event.clientX - bounds.left + bodyNode.scrollLeft + 14;
     const rawTop = event.clientY - bounds.top + bodyNode.scrollTop + 16;
     const minLeft = bodyNode.scrollLeft + 8;
@@ -1875,7 +2853,7 @@ function FullScreenTimeline({
     const maxTop = bodyNode.scrollTop + bodyNode.clientHeight - cardHeight - 8;
 
     setHoverCard({
-      label,
+      ...card,
       left: Math.max(minLeft, Math.min(maxLeft, rawLeft)),
       top: Math.max(minTop, Math.min(maxTop, rawTop)),
     });
@@ -1906,41 +2884,65 @@ function FullScreenTimeline({
 
   return h(
     "section",
-    { className: "scene-timeline-shell" },
-    h(
-      "div",
-      { className: "scene-timeline-fixed-column" },
-      h(
-        "div",
-        { className: "scene-timeline-header-copy" },
-        h("span", null, title || (rowType === "cpm" ? "CPM" : rowType === "load" ? "Load" : "Truck")),
-        h("strong", null, "Chart"),
-      ),
-      h(
-        "div",
-        { ref: fixedBodyRef, className: "scene-timeline-fixed-body" },
-        rows.map((row) =>
+    { className: `scene-timeline-shell${hideFixedColumn ? " scene-timeline-shell-wide" : ""}` },
+    !hideFixedColumn
+      ? h(
+          "div",
+          { className: "scene-timeline-fixed-column" },
           h(
             "div",
-            { key: `timeline-copy-${row.key || row.truckId}`, className: "scene-timeline-row-copy" },
-            h("strong", null, rowType === "phase" ? row.label : rowType === "load" ? row.label : rowType === "cpm" ? row.label : row.label || `Truck ${row.truckId}`),
-            h(
-              "span",
-              null,
-              row.subLabel
-                ? row.subLabel
-                : rowType === "phase"
-                ? `${row.items.length} active window${row.items.length === 1 ? "" : "s"}`
-                : rowType === "load"
-                  ? `${row.items.length} task segment${row.items.length === 1 ? "" : "s"}`
-                  : rowType === "cpm"
-                    ? row.subLabel
-                    : `${row.loadCount || row.items.length} road segment${(row.loadCount || row.items.length) === 1 ? "" : "s"}`,
+            { className: "scene-timeline-header-copy" },
+            h("span", null, title || (rowType === "cpm" ? "CPM" : rowType === "load" ? "Load" : "Truck")),
+            h("strong", null, "Chart"),
+          ),
+          h(
+            "div",
+            { ref: fixedBodyRef, className: "scene-timeline-fixed-body" },
+            rows.map((row) =>
+              (() => {
+                const phaseLaneCount = rowType === "phase"
+                  ? Math.max(
+                      Number(row.laneCount) || 0,
+                      ...((row.items || []).map((item) => (Number(item.stackLane) || 0) + 1)),
+                      1,
+                    )
+                  : rowType === "truck" && Number(row.laneCount) > 1
+                    ? Math.max(
+                        Number(row.laneCount) || 0,
+                        ...((row.items || []).map((item) => (Number(item.stackLane) || 0) + 1)),
+                        1,
+                      )
+                  : 1;
+                const rowHeightPx = rowType === "phase" || (rowType === "truck" && phaseLaneCount > 1)
+                  ? Math.max(phaseLaneCount * 28 + 16, 48)
+                  : null;
+                return h(
+                  "div",
+                  {
+                    key: `timeline-copy-${row.key || row.truckId}`,
+                    className: "scene-timeline-row-copy",
+                    style: rowHeightPx ? { height: `${rowHeightPx}px` } : undefined,
+                  },
+                  h("strong", null, rowType === "phase" ? row.label : rowType === "load" ? row.label : rowType === "cpm" ? row.label : row.label || `Truck ${row.truckId}`),
+                  rowType === "phase"
+                    ? null
+                    : h(
+                        "span",
+                        null,
+                        row.subLabel
+                          ? row.subLabel
+                          : rowType === "load"
+                            ? `${row.items.length} task segment${row.items.length === 1 ? "" : "s"}`
+                            : rowType === "cpm"
+                              ? row.subLabel
+                              : `${row.loadCount || row.items.length} road segment${(row.loadCount || row.items.length) === 1 ? "" : "s"}`,
+                      ),
+                )
+              })(),
             ),
           ),
-        ),
-      ),
-    ),
+        )
+      : null,
     h(
       "div",
       { className: "scene-timeline-main" },
@@ -2002,12 +3004,34 @@ function FullScreenTimeline({
                     top: `${hoverCard.top}px`,
                   },
                 },
-                h("div", { className: "scene-timeline-hover-card-title" }, hoverCard.label),
+                h("div", { className: "scene-timeline-hover-card-title" }, hoverCard.title),
+                ...(hoverCard.lines || []).map((line, index) =>
+                  h("div", { key: `timeline-hover-line-${index}`, className: "scene-timeline-hover-card-line" }, line),
+                ),
               )
             : null,
           rows.map((row) => {
             const rowKey = row.key || row.truckId;
+            const phaseLaneCount = rowType === "phase"
+              ? Math.max(
+                  Number(row.laneCount) || 0,
+                  ...((row.items || []).map((item) => (Number(item.stackLane) || 0) + 1)),
+                  1,
+                )
+              : rowType === "truck" && Number(row.laneCount) > 1
+                ? Math.max(
+                    Number(row.laneCount) || 0,
+                    ...((row.items || []).map((item) => (Number(item.stackLane) || 0) + 1)),
+                    1,
+                  )
+              : 1;
+            const rowHeightPx = rowType === "phase" || (rowType === "truck" && phaseLaneCount > 1)
+              ? Math.max(phaseLaneCount * 28 + 16, 48)
+              : null;
             const rowTrips = (row.items || row.trips || []).map((trip) => {
+              const tripIndex = rowType === "phase" || rowType === "truck"
+                ? Math.max(0, Number(trip.stackLane) || 0)
+                : 0;
               const tripStartMinute =
                 rowType === "phase" || rowType === "load" || rowType === "cpm"
                   ? trip.startMinute
@@ -2028,13 +3052,8 @@ function FullScreenTimeline({
                 : 0;
               const toneClass = trip.toneClass || row.toneClass || "scene-timeline-segment-truck-heavyhaul";
               const leftPercent = ((Math.max(tripStartMinute, visibleStartMinute) - visibleStartMinute) / visibleRangeMinutes) * 100;
-              const hoverText = rowType === "phase"
-                ? `${row.label} | ${getLoadDisplayLabel(trip)} | ${formatTimelineWindowLabel(tripStartMinute)} -> ${formatTimelineWindowLabel(tripEndMinute)}`
-                : rowType === "load"
-                    ? `${row.label} | ${trip.label} | ${formatTimelineWindowLabel(tripStartMinute)} -> ${formatTimelineWindowLabel(tripEndMinute)}`
-                  : rowType === "cpm"
-                    ? `${row.label} | ${trip.description || trip.label} | ${trip.critical ? "Critical path | " : ""}${formatTimelineWindowLabel(tripStartMinute)} -> ${formatTimelineWindowLabel(tripEndMinute)}`
-                  : `Truck ${row.truckId} | ${getLoadDisplayLabel(trip)} | ${formatTimelineWindowLabel(tripStartMinute)} -> ${formatTimelineWindowLabel(tripEndMinute)}`;
+              const hoverCardData = buildTimelineHoverCard(rowType, row, trip, tripStartMinute, tripEndMinute);
+              const barLabel = getTimelineBarLabel(rowType, row, trip);
 
               return [
                 showFloatBar && !trip.critical && trip.floatMinutes > 0
@@ -2055,9 +3074,12 @@ function FullScreenTimeline({
                     style: {
                       left: `${leftPercent}%`,
                       width: `${tripWidthPercent}%`,
+                      top: rowType === "phase" || (rowType === "truck" && phaseLaneCount > 1)
+                        ? `${8 + (tripIndex * 28)}px`
+                        : undefined,
                     },
-                    onPointerEnter: (event) => handleTripHover(event, hoverText),
-                    onPointerMove: (event) => handleTripHover(event, hoverText),
+                    onPointerEnter: (event) => handleTripHover(event, hoverCardData),
+                    onPointerMove: (event) => handleTripHover(event, hoverCardData),
                     onPointerLeave: () => setHoverCard(null),
                   },
                   h(
@@ -2080,6 +3102,9 @@ function FullScreenTimeline({
                           width: `${activeFillPercent}%`,
                         },
                       }),
+                      !tripSizeClass
+                        ? h("span", { key: `${trip.key}-label`, className: "scene-timeline-trip-label" }, barLabel)
+                        : null,
                     ],
                   ),
                 ),
@@ -2088,10 +3113,14 @@ function FullScreenTimeline({
 
             return h(
               "article",
-              { key: `timeline-row-${rowKey}`, className: `scene-timeline-row${row.critical ? " is-critical" : ""}` },
+              {
+                key: `timeline-row-${rowKey}`,
+                className: `scene-timeline-row${rowType === "phase" || (rowType === "truck" && phaseLaneCount > 1) ? " is-phase-row" : ""}${row.hasOverlapConflict ? " is-conflict" : ""}${row.critical ? " is-critical" : ""}`,
+                style: rowHeightPx ? { height: `${rowHeightPx}px`, minHeight: `${rowHeightPx}px` } : undefined,
+              },
               h(
                 "div",
-                { className: "scene-timeline-row-track" },
+                { className: `scene-timeline-row-track${rowType === "phase" || (rowType === "truck" && phaseLaneCount > 1) ? " is-phase-row-track" : ""}`, style: rowHeightPx ? { height: `${rowHeightPx}px` } : undefined },
                 ticks.map((tick) =>
                   h("span", {
                     key: `timeline-grid-${rowKey}-${tick.key}`,
@@ -2104,25 +3133,6 @@ function FullScreenTimeline({
             );
           }),
         ),
-      ),
-    ),
-  );
-}
-
-function renderPlannerMetricGrid(metrics, className = "") {
-  return h(
-    "div",
-    { className: `scene-planner-metric-grid${className ? ` ${className}` : ""}` },
-    metrics.map((metric) =>
-      h(
-        "article",
-        {
-          key: metric.label,
-          className: `scene-planner-metric-card${metric.tone ? ` is-${metric.tone}` : ""}`,
-        },
-        h("span", { className: "scene-planner-metric-label" }, metric.label),
-        h("strong", { className: "scene-planner-metric-value" }, metric.value),
-        metric.meta ? h("span", { className: "scene-planner-metric-meta" }, metric.meta) : null,
       ),
     ),
   );
@@ -2233,6 +3243,344 @@ function getProjectSummaryMetrics({ scenario, playback, move, activePlanDashboar
       tone: "purple",
     },
   ];
+}
+
+function getProjectSummaryDashboardModel({
+  scenario,
+  playback,
+  move,
+  activePlanDashboard,
+  planningStartDate,
+  planningStartTime,
+  scenarios = [],
+}) {
+  const journeys = playback?.journeys?.length ? playback.journeys : (playback?.trips || []);
+  const trips = playback?.trips || [];
+  const totalMinutes = Math.max(0, Number(scenario?.totalMinutes) || Number(playback?.totalMinutes) || 0);
+  const totalHours = totalMinutes / 60;
+  const totalDays = totalMinutes / (24 * 60);
+  const routeKm = Math.max(0, Number(move?.routeKm) || Number(scenario?.routeDistanceKm) || 0);
+  const averageMoveHours = getAverageTruckMoveHours(playback);
+  const totalDistanceKm = Math.round(
+    journeys.reduce(
+      (sum, journey) => sum + (Number(journey?.routeDistanceKm) || (routeKm * Math.max((journey.loadIds || []).length || 1, 1))),
+      0,
+    ),
+  );
+  const { totalProjectCost, transportCost, laborCost, overheadCost } = getScenarioCostSummary(scenario, playback);
+  const truckUtilization = Math.max(0, Number(scenario?.truckUtilization) || Number(activePlanDashboard?.truckUtilizationValue) || 0);
+  const crewUtilization = Math.max(0, Number(scenario?.workerUtilization) || Number(scenario?.utilization) || 0);
+  const baselineCost = Math.max(0, Number(scenario?.manualBaseline?.costEstimate) || 0);
+  const baselineMinutes = Math.max(0, Number(scenario?.manualBaseline?.totalMinutes) || 0);
+  const hasBaseline = baselineCost > 0;
+  const savingsPercent = hasBaseline
+    ? Math.max(0, ((baselineCost - totalProjectCost) / baselineCost) * 100)
+    : null;
+  const savingsAmount = Math.max(0, baselineCost - totalProjectCost);
+  const truckTripRows = buildTruckTripUtilizationRows(playback, totalMinutes);
+  const scenarioPlans = (scenarios || [])
+    .filter((item) => (Number(item?.totalMinutes) || 0) > 0)
+    .map((item) => ({
+      key: item.name || "scenario",
+      name: item.name || "Plan",
+      totalMinutes: Math.max(0, Number(item?.totalMinutes) || 0),
+      costEstimate: getScenarioCostSummary(item, item?.bestVariant?.playback || item?.playback || playback).totalProjectCost,
+      truckUtilization: getScenarioUtilizationScore(item),
+      savingsPercent: Math.max(0, Number(item?.manualBaseline?.costEstimate) || 0) > 0
+        ? Math.max(0, (((Number(item?.manualBaseline?.costEstimate) || 0) - getScenarioCostSummary(item, item?.bestVariant?.playback || item?.playback || playback).totalProjectCost) / Math.max(Number(item?.manualBaseline?.costEstimate) || 1, 1)) * 100)
+        : null,
+      isSelected: item?.name === scenario?.name,
+    }));
+  const selectedPlan = scenarioPlans.find((item) => item.isSelected) || {
+    key: scenario?.name || "selected-plan",
+    name: scenario?.name || "Selected Plan",
+    totalMinutes,
+    costEstimate: totalProjectCost,
+    truckUtilization,
+    savingsPercent,
+    isSelected: true,
+  };
+  const fastestPlan = scenarioPlans.reduce((best, item) => (!best || item.totalMinutes < best.totalMinutes ? item : best), null);
+  const cheapestPlan = scenarioPlans.reduce((best, item) => (!best || item.costEstimate < best.costEstimate ? item : best), null);
+  let scenarioNarrative = "Scenario selected for review.";
+
+  if (selectedPlan.name === "Cheapest" && fastestPlan) {
+    const slowerDays = Math.max(0, (selectedPlan.totalMinutes - fastestPlan.totalMinutes) / (24 * 60));
+    const savingsVsFastest = fastestPlan.costEstimate > 0
+      ? Math.max(0, ((fastestPlan.costEstimate - selectedPlan.costEstimate) / fastestPlan.costEstimate) * 100)
+      : 0;
+    scenarioNarrative = `Lowest total cost. Saves ${formatPercentLabel(savingsVsFastest)} against ${fastestPlan.name}${slowerDays > 0.1 ? `, but runs ${slowerDays.toFixed(1)} days longer.` : "."}`;
+  } else if (selectedPlan.name === "Fastest" && cheapestPlan) {
+    const daysSaved = Math.max(0, (cheapestPlan.totalMinutes - selectedPlan.totalMinutes) / (24 * 60));
+    const costPremium = cheapestPlan.costEstimate > 0
+      ? Math.max(0, ((selectedPlan.costEstimate - cheapestPlan.costEstimate) / cheapestPlan.costEstimate) * 100)
+      : 0;
+    scenarioNarrative = `Shortest makespan. Finishes ${daysSaved.toFixed(1)} days ahead of ${cheapestPlan.name}${costPremium > 0.1 ? `, with a ${formatPercentLabel(costPremium)} cost premium.` : "."}`;
+  } else if (selectedPlan.name === "Utilized" && cheapestPlan) {
+    const extraDays = Math.max(0, (selectedPlan.totalMinutes - cheapestPlan.totalMinutes) / (24 * 60));
+    scenarioNarrative = `Best fleet loading profile. Truck utilization reaches ${formatPercentLabel(selectedPlan.truckUtilization)}${extraDays > 0.1 ? `, with ${extraDays.toFixed(1)} extra days over ${cheapestPlan.name}.` : "."}`;
+  }
+
+  const maxScenarioMinutes = Math.max(...scenarioPlans.map((item) => item.totalMinutes), selectedPlan.totalMinutes, 1);
+  const maxScenarioCost = Math.max(...scenarioPlans.map((item) => item.costEstimate), selectedPlan.costEstimate, 1);
+
+  return {
+    coreKpis: [
+      {
+        key: "duration",
+        label: "Project Duration",
+        value: `${totalDays.toFixed(1)} days`,
+        meta: `${totalHours.toFixed(1)} hrs`,
+        subtext: `ETA: ${getPlanEtaLabel(planningStartDate, planningStartTime, totalMinutes)}`,
+        tone: "amber",
+      },
+      {
+        key: "cost",
+        label: "Total Project Cost",
+        value: formatCurrency(totalProjectCost),
+        meta: "Includes labor + transport + overhead",
+        subtext: `Transport ${formatCurrency(transportCost)} · Labor ${formatCurrency(laborCost)} · Overhead ${formatCurrency(overheadCost)}`,
+        tone: "green",
+      },
+      {
+        key: "savings",
+        label: "Savings vs Baseline",
+        value: hasBaseline ? formatPercentLabel(savingsPercent) : "N/A",
+        meta: "vs manual scheduling",
+        subtext: baselineCost > 0 ? `${formatCurrency(savingsAmount)} saved vs ${formatCurrency(baselineCost)} baseline` : "Baseline scenario not available",
+        tone: "blue",
+      },
+    ],
+    operationalKpis: [
+      {
+        key: "utilization",
+        label: "Fleet Utilization",
+        value: `${formatPercentLabel(truckUtilization)} trucks · ${formatPercentLabel(crewUtilization)} crews`,
+        meta: `${activePlanDashboard.usedTruckCount}/${activePlanDashboard.allocatedTruckCount} trucks active`,
+        tone: "purple",
+      },
+      {
+        key: "trips",
+        label: "Total Trips",
+        value: `${formatWholeNumber(trips.length)} trips`,
+        meta: `${truckTripRows.length} trucks assigned in this plan`,
+        tone: "amber",
+      },
+      {
+        key: "distance",
+        label: "Total Distance",
+        value: `${formatWholeNumber(routeKm)} km`,
+        meta: `${averageMoveHours.toFixed(1)}h average truck travel time`,
+        subtext: `${formatWholeNumber(totalDistanceKm)} km cumulative across all trips`,
+        tone: "blue",
+      },
+      {
+        key: "scenario",
+        label: "Makespan Scenario",
+        value: selectedPlan.name,
+        meta: scenarioNarrative,
+        subtext: baselineMinutes > 0 ? `Manual baseline: ${(baselineMinutes / (24 * 60)).toFixed(1)} days` : "",
+        tone: "red",
+      },
+    ],
+    costBreakdown: [
+      { key: "transport", label: "Transport", value: transportCost, color: "#f0b34a" },
+      { key: "labor", label: "Labor", value: laborCost, color: "#62c98a" },
+      { key: "overhead", label: "Overhead", value: overheadCost, color: "#6fb3ff" },
+    ],
+    utilization: {
+      truck: truckUtilization,
+      crew: crewUtilization,
+    },
+    hasBaseline,
+    truckTripRows,
+    selectedPlan,
+    scenarioNarrative,
+    scenarioRows: scenarioPlans.map((item) => ({
+      ...item,
+      timeWidth: `${Math.max(16, Math.round((item.totalMinutes / maxScenarioMinutes) * 100))}%`,
+      costWidth: `${Math.max(16, Math.round((item.costEstimate / maxScenarioCost) * 100))}%`,
+      utilizationWidth: `${Math.max(16, Math.round(item.truckUtilization))}%`,
+      durationLabel: `${(item.totalMinutes / (24 * 60)).toFixed(1)} d`,
+      costLabel: formatCurrency(item.costEstimate),
+      utilizationLabel: formatPercentLabel(item.truckUtilization),
+      savingsLabel: item.savingsPercent == null ? "N/A" : formatPercentLabel(item.savingsPercent),
+    })),
+  };
+}
+
+function renderProjectSummaryDashboard({ model, radarModel }) {
+  const costTotal = Math.max(1, model.costBreakdown.reduce((sum, item) => sum + item.value, 0));
+  const radarConcepts = [
+    { key: "time", label: "Time", description: "Shorter project duration is better." },
+    { key: "cost", label: "Cost", description: "Lower total project cost is better." },
+    { key: "utilization", label: "Utilization", description: "Higher truck usage is better." },
+    { key: "idle", label: "Idle", description: "Lower idle minutes are better." },
+    { key: "savings", label: "Savings", description: model.hasBaseline ? "Higher reduction versus manual baseline is better." : "Shown when a manual baseline exists." },
+  ];
+
+  return h(
+    "div",
+    { className: "scene-project-summary-dashboard" },
+    h(
+      "div",
+      { className: "scene-project-summary-grid scene-project-summary-grid-core" },
+      model.coreKpis.map((metric) =>
+        h(
+          "article",
+          { key: metric.key, className: `scene-project-kpi-card is-${metric.tone}` },
+          h("span", { className: "scene-project-kpi-label" }, metric.label),
+          h("strong", { className: "scene-project-kpi-value" }, metric.value),
+          h("span", { className: "scene-project-kpi-meta" }, metric.meta),
+          metric.key === "cost"
+            ? h(
+                "div",
+                { className: "scene-project-cost-stack" },
+                h(
+                  "div",
+                  { className: "scene-project-cost-bar" },
+                  model.costBreakdown.map((item) =>
+                    h("span", {
+                      key: item.key,
+                      className: "scene-project-cost-bar-segment",
+                      style: {
+                        width: `${(item.value / costTotal) * 100}%`,
+                        background: item.color,
+                      },
+                    }),
+                  ),
+                ),
+                h(
+                  "div",
+                  { className: "scene-project-cost-legend" },
+                  model.costBreakdown.map((item) =>
+                    h(
+                      "span",
+                      { key: `${item.key}-legend`, className: "scene-project-cost-legend-item" },
+                      h("i", { style: { background: item.color } }),
+                      `${item.label} ${formatCurrency(item.value)}`,
+                    ),
+                  ),
+                ),
+              )
+            : null,
+          metric.subtext ? h("span", { className: "scene-project-kpi-subtext" }, metric.subtext) : null,
+        ),
+      ),
+    ),
+    h(
+      "div",
+      { className: "scene-project-summary-grid scene-project-summary-grid-ops" },
+      model.operationalKpis.map((metric) =>
+        h(
+          "article",
+          { key: metric.key, className: `scene-project-kpi-card is-${metric.tone}` },
+          h("span", { className: "scene-project-kpi-label" }, metric.label),
+          h("strong", { className: "scene-project-kpi-value" }, metric.value),
+          h("span", { className: "scene-project-kpi-meta" }, metric.meta),
+          metric.key === "utilization"
+            ? h(
+                "div",
+                { className: "scene-project-utilization-chart" },
+                h(
+                  "div",
+                  { className: "scene-project-utilization-row" },
+                  h("span", null, "Trucks"),
+                  h("div", { className: "scene-project-utilization-bar" }, h("span", { style: { width: `${Math.max(4, model.utilization.truck)}%` } })),
+                  h("strong", null, formatPercentLabel(model.utilization.truck)),
+                ),
+                h(
+                  "div",
+                  { className: "scene-project-utilization-row" },
+                  h("span", null, "Crews"),
+                  h("div", { className: "scene-project-utilization-bar is-crew" }, h("span", { style: { width: `${Math.max(4, model.utilization.crew)}%` } })),
+                  h("strong", null, formatPercentLabel(model.utilization.crew)),
+                ),
+              )
+            : metric.key === "trips"
+              ? h(
+                  "div",
+                  { className: "scene-project-trip-list" },
+                  model.truckTripRows.slice(0, 4).map((truck) =>
+                    h(
+                      "div",
+                      { key: `trip-${truck.key}`, className: "scene-project-trip-row" },
+                      h("strong", null, `${truck.truckType} ${truck.truckId}`),
+                      h("span", null, `${truck.loadCount} loads`),
+                      h("span", null, `${truck.utilizationPercent}% util.`),
+                    ),
+                  ),
+                  model.truckTripRows.length > 4
+                    ? h("span", { className: "scene-project-trip-more" }, `+${model.truckTripRows.length - 4} more trucks`)
+                    : null,
+                )
+            : null,
+          metric.subtext ? h("span", { className: "scene-project-kpi-subtext" }, metric.subtext) : null,
+        ),
+      ),
+    ),
+    h(
+      "div",
+      { className: "scene-project-summary-bottom" },
+      h(
+        "article",
+        { className: "scene-project-summary-panel scene-project-summary-panel-radar" },
+        h("span", { className: "scene-project-panel-label" }, "Scenario Comparison"),
+        h("strong", { className: "scene-project-panel-title" }, "How to read the comparison"),
+        h(
+          "div",
+          { className: "scene-project-radar-concepts" },
+          radarConcepts.map((concept) =>
+            h(
+              "div",
+              { key: concept.key, className: "scene-project-radar-concept" },
+              h("strong", null, concept.label),
+              h("span", null, concept.description),
+            ),
+          ),
+        ),
+        h("p", { className: "scene-radar-subtitle" }, `${model.selectedPlan.name} is currently selected. ${model.scenarioNarrative}`),
+        h(PlanComparisonRadar, { model: radarModel }),
+      ),
+      h(
+        "article",
+        { className: "scene-project-summary-panel" },
+        h("span", { className: "scene-project-panel-label" }, "Scenario Benchmarks"),
+        h("strong", { className: "scene-project-panel-title" }, "Time, cost, and utilization"),
+        h(
+          "div",
+          { className: "scene-project-bar-legend" },
+          h("span", { className: "scene-project-bar-legend-item" }, h("i", { className: "is-time" }), "Blue = Time"),
+          h("span", { className: "scene-project-bar-legend-item" }, h("i", { className: "is-cost" }), "Amber = Cost"),
+          h("span", { className: "scene-project-bar-legend-item" }, h("i", { className: "is-utilization" }), "Green = Utilization"),
+        ),
+        h(
+          "div",
+          { className: "scene-project-plan-list" },
+          model.scenarioRows.map((plan) =>
+            h(
+              "div",
+              { key: plan.key, className: `scene-project-plan-row${plan.isSelected ? " is-selected" : ""}` },
+              h(
+                "div",
+                { className: "scene-project-plan-head" },
+                h("strong", null, plan.name),
+                h("span", null, `${plan.costLabel} · ${plan.durationLabel} · ${plan.utilizationLabel}`),
+              ),
+              h(
+                "div",
+                { className: "scene-project-plan-bars" },
+                h("span", { className: "scene-project-plan-bar is-time", style: { width: plan.timeWidth } }),
+                h("span", { className: "scene-project-plan-bar is-cost", style: { width: plan.costWidth } }),
+                h("span", { className: "scene-project-plan-bar is-utilization", style: { width: plan.utilizationWidth } }),
+              ),
+              h("div", { className: "scene-project-plan-meta" }, h("span", null, `Baseline savings ${plan.savingsLabel}`)),
+            ),
+          ),
+        ),
+      ),
+    ),
+  );
 }
 
 function buildTruckTypeCostBreakdown(scenario, playback, move) {
@@ -2373,9 +3721,12 @@ function PlannerCanvas({
   operatingSnapshot,
   drillingReadinessPercent,
   activePlanDashboard,
-  planComparisonStats,
+  planRadarModel,
+  scenarios = [],
   scenario,
   move,
+  planningStartDate,
+  planningStartTime,
   currentMinute = 0,
   timelineGapMinutes = 180,
 }) {
@@ -2390,9 +3741,18 @@ function PlannerCanvas({
     showDays: true,
     showFloatBar: true,
   });
-  const summaryMetrics = useMemo(
-    () => getProjectSummaryMetrics({ scenario, playback, move, activePlanDashboard, planComparisonStats }),
-    [scenario, playback, move, activePlanDashboard, planComparisonStats],
+  const [ganttView, setGanttView] = useState("load");
+  const projectSummaryModel = useMemo(
+    () => getProjectSummaryDashboardModel({
+      scenario,
+      playback,
+      move,
+      activePlanDashboard,
+      planningStartDate,
+      planningStartTime,
+      scenarios,
+    }),
+    [scenario, playback, move, activePlanDashboard, planningStartDate, planningStartTime, scenarios],
   );
   const costBreakdownRows = useMemo(
     () => buildTruckTypeCostBreakdown(scenario, playback, move),
@@ -2444,27 +3804,7 @@ function PlannerCanvas({
       Card,
       { className: "scene-planner-canvas-card scene-planner-summary-card" },
       h("span", { className: "scene-panel-kicker" }, "Project Summary"),
-      h(
-        "div",
-        { className: "scene-planner-summary-layout" },
-        renderPlannerMetricGrid(summaryMetrics),
-        costBreakdownRows.map((row) =>
-          h(
-            "article",
-            { key: row.key, className: `scene-planner-cost-card is-${row.tone}` },
-            h("span", { className: "scene-planner-cost-label" }, `${row.label} (${row.shortLabel})`),
-            h("strong", { className: "scene-planner-cost-value" }, formatCurrency(row.tripCost)),
-            h("span", { className: "scene-planner-cost-meta" }, `${row.tripCount} trips - ${row.distanceKm} km`),
-          ),
-        ),
-        h(
-          "article",
-          { className: "scene-planner-cost-card is-total" },
-          h("span", { className: "scene-planner-cost-label" }, "TOTAL PROJECT"),
-          h("strong", { className: "scene-planner-cost-value" }, formatCurrency(totalTransportCost)),
-          h("span", { className: "scene-planner-cost-meta" }, `${transportRows.length} trips - ${totalTransportDistance} km total`),
-        ),
-      ),
+      renderProjectSummaryDashboard({ model: projectSummaryModel, radarModel: planRadarModel }),
     ),
     h(
       "div",
@@ -2633,7 +3973,7 @@ function PlannerCanvas({
     h(
       Card,
       { className: "scene-planner-canvas-card scene-planner-gantt-card" },
-      h("span", { className: "scene-panel-kicker" }, "Load Gantt"),
+      h("span", { className: "scene-panel-kicker" }, "Gantt"),
       h(
         "div",
         { className: "scene-gantt-toolbar" },
@@ -2673,7 +4013,23 @@ function PlannerCanvas({
         { className: "scene-gantt-toolbar" },
         h("label", { className: "scene-gantt-check" }, h("input", {
           type: "checkbox",
+          checked: ganttView === "load",
+          onChange: () => setGanttView("load"),
+        }), h("span", null, "Loads")),
+        h("label", { className: "scene-gantt-check" }, h("input", {
+          type: "checkbox",
+          checked: ganttView === "truck",
+          onChange: () => setGanttView("truck"),
+        }), h("span", null, "Trucks")),
+        h("label", { className: "scene-gantt-check" }, h("input", {
+          type: "checkbox",
+          checked: ganttView === "phase",
+          onChange: () => setGanttView("phase"),
+        }), h("span", null, "Phases")),
+        h("label", { className: "scene-gantt-check" }, h("input", {
+          type: "checkbox",
           checked: ganttFilters.showRD,
+          disabled: ganttView === "truck",
           onChange: (event) => setGanttFilters((current) => ({ ...current, showRD: event.target.checked })),
         }), h("span", null, "RD")),
         h("label", { className: "scene-gantt-check" }, h("input", {
@@ -2684,6 +4040,7 @@ function PlannerCanvas({
         h("label", { className: "scene-gantt-check" }, h("input", {
           type: "checkbox",
           checked: ganttFilters.showRU,
+          disabled: ganttView === "truck",
           onChange: (event) => setGanttFilters((current) => ({ ...current, showRU: event.target.checked })),
         }), h("span", null, "RU")),
         h("label", { className: "scene-gantt-check" }, h("input", {
@@ -2701,49 +4058,29 @@ function PlannerCanvas({
       h(
         "div",
         { className: "scene-gantt-legend" },
-        h("span", { className: "scene-gantt-legend-item" }, h("i", { className: "scene-gantt-legend-dot is-rd" }), "Rig Down"),
-        h("span", { className: "scene-gantt-legend-item" }, h("i", { className: "scene-gantt-legend-dot is-rm" }), "Moving"),
-        h("span", { className: "scene-gantt-legend-item" }, h("i", { className: "scene-gantt-legend-dot is-ru" }), "Rig Up"),
+        ganttView === "truck"
+          ? h("span", { className: "scene-gantt-legend-item" }, h("i", { className: "scene-gantt-legend-dot is-rm" }), "Truck Moving")
+          : [
+              h("span", { key: "legend-rd", className: "scene-gantt-legend-item" }, h("i", { className: "scene-gantt-legend-dot is-rd" }), "Rig Down"),
+              h("span", { key: "legend-rm", className: "scene-gantt-legend-item" }, h("i", { className: "scene-gantt-legend-dot is-rm" }), "Moving"),
+              h("span", { key: "legend-ru", className: "scene-gantt-legend-item" }, h("i", { className: "scene-gantt-legend-dot is-ru" }), "Rig Up"),
+            ],
       ),
       h(FullScreenTimeline, {
         playback,
         currentMinute,
         zoom,
-        rowType: "load",
-        title: "Load",
+        rowType: ganttView,
+        title: ganttView === "load" ? "Load" : ganttView === "truck" ? "Truck" : "Phase",
         windowStartMinute: ganttWindowStartMinute,
         windowMinutes: ganttWindowMinutes,
         tickMinutes: ganttTickMinutes,
         gapMinutes: timelineGapMinutes,
-        showRD: ganttFilters.showRD,
+        showRD: ganttView === "truck" ? false : ganttFilters.showRD,
         showRM: ganttFilters.showRM,
-        showRU: ganttFilters.showRU,
-        showFloatBar: false,
-      }),
-    ),
-    h(
-      Card,
-      { className: "scene-planner-canvas-card scene-planner-gantt-card" },
-      h("span", { className: "scene-panel-kicker" }, "Truck Gantt"),
-      h(
-        "div",
-        { className: "scene-gantt-legend" },
-        h("span", { className: "scene-gantt-legend-item" }, h("i", { className: "scene-gantt-legend-dot is-rm" }), "Truck Moving"),
-      ),
-      h(FullScreenTimeline, {
-        playback,
-        currentMinute,
-        zoom,
-        rowType: "truck",
-        title: "Truck",
-        windowStartMinute: ganttWindowStartMinute,
-        windowMinutes: ganttWindowMinutes,
-        tickMinutes: ganttTickMinutes,
-        gapMinutes: timelineGapMinutes,
-        showRD: false,
-        showRM: true,
-        showRU: false,
-        showFloatBar: false,
+        showRU: ganttView === "truck" ? false : ganttFilters.showRU,
+        showFloatBar: ganttView === "load" ? ganttFilters.showFloatBar : false,
+        hideFixedColumn: false,
       }),
     ),
   );
@@ -3286,6 +4623,7 @@ export function RigMovePage({
   onEndPlayback,
   onStartExecution,
   onUpdateExecutionProgress,
+  onCompleteAssignmentStage,
   onDeleteMove,
   onBack,
   onLogout,
@@ -3331,15 +4669,11 @@ export function RigMovePage({
   const [trackingMode, setTrackingMode] = useState(executionProgress?.trackingMode === "demoUltrasonic" ? "demoUltrasonic" : "driverApp");
   const [ultrasonicStartInput, setUltrasonicStartInput] = useState(String(Math.max(0, Number(executionProgress?.ultrasonicStartCm) || 45)));
   const [ultrasonicArrivalInput, setUltrasonicArrivalInput] = useState(String(Math.max(0, Number(executionProgress?.ultrasonicArrivalCm) || 8)));
-  const [ultrasonicReadingInput, setUltrasonicReadingInput] = useState(
-    executionProgress?.ultrasonicLatestCm == null
-      ? String(Math.max(0, Number(executionProgress?.ultrasonicStartCm) || 45))
-      : String(Math.max(0, Number(executionProgress.ultrasonicLatestCm) || 0)),
-  );
   const [liveDemoMinute, setLiveDemoMinute] = useState(0);
   const [customScenario, setCustomScenario] = useState(null);
   const [isCalculatingCustomPlan, setIsCalculatingCustomPlan] = useState(false);
   const [customPlanError, setCustomPlanError] = useState("");
+  const stableDemoTargetMinuteRef = useRef(null);
 
   function handleSceneModeChange(nextMode) {
     if (nextMode === "timeline") {
@@ -3450,11 +4784,6 @@ export function RigMovePage({
       setTrackingMode(move?.executionProgress?.trackingMode === "demoUltrasonic" ? "demoUltrasonic" : "driverApp");
       setUltrasonicStartInput(String(Math.max(0, Number(move?.executionProgress?.ultrasonicStartCm) || 45)));
       setUltrasonicArrivalInput(String(Math.max(0, Number(move?.executionProgress?.ultrasonicArrivalCm) || 8)));
-      setUltrasonicReadingInput(
-        move?.executionProgress?.ultrasonicLatestCm == null
-          ? String(Math.max(0, Number(move?.executionProgress?.ultrasonicStartCm) || 45))
-          : String(Math.max(0, Number(move?.executionProgress?.ultrasonicLatestCm) || 0)),
-      );
     }
   }, [move?.id, move?.updatedAt, availableFleet, activeScenarioName, move?.simulation]);
 
@@ -3466,16 +4795,10 @@ export function RigMovePage({
     setTrackingMode(executionProgress?.trackingMode === "demoUltrasonic" ? "demoUltrasonic" : "driverApp");
     setUltrasonicStartInput(String(Math.max(0, Number(executionProgress?.ultrasonicStartCm) || 45)));
     setUltrasonicArrivalInput(String(Math.max(0, Number(executionProgress?.ultrasonicArrivalCm) || 8)));
-    setUltrasonicReadingInput(
-      executionProgress?.ultrasonicLatestCm == null
-        ? String(Math.max(0, Number(executionProgress?.ultrasonicStartCm) || 45))
-        : String(Math.max(0, Number(executionProgress?.ultrasonicLatestCm) || 0)),
-    );
   }, [
     executionProgress?.trackingMode,
     executionProgress?.ultrasonicStartCm,
     executionProgress?.ultrasonicArrivalCm,
-    executionProgress?.ultrasonicLatestCm,
   ]);
 
   useEffect(() => {
@@ -3699,38 +5022,87 @@ export function RigMovePage({
         count: String(truck.count),
       }));
 
-  const displaySimulation = useMemo(
-    () => ({
+  const displaySimulation = useMemo(() => {
+    const rawBestPlan = selectedScenario?.bestVariant || safeMove.simulation?.bestPlan || fallbackScenario.bestVariant;
+    const normalizedBestPlanPlayback = normalizeScenePlayback(rawBestPlan?.playback || fallbackPlayback);
+    return {
       ...(safeMove.simulation || {}),
-      truckCount: selectedScenario?.truckCount || safeMove.simulation?.truckCount || 0,
-      bestPlan: selectedScenario?.bestVariant || safeMove.simulation?.bestPlan || fallbackScenario.bestVariant,
+      truckCount: Math.max(
+        selectedScenario?.truckCount || 0,
+        safeMove.simulation?.truckCount || 0,
+        normalizedBestPlanPlayback?.truckCount || 0,
+      ),
+      bestPlan: {
+        ...(rawBestPlan || {}),
+        playback: normalizedBestPlanPlayback,
+      },
       bestScenario: selectedScenario || safeMove.simulation?.bestScenario || fallbackScenario,
       routeGeometry: selectedScenario?.routeGeometry || safeMove.simulation?.routeGeometry || [],
       routeMinutes: selectedScenario?.routeMinutes || safeMove.simulation?.routeMinutes || 0,
       truckSetup: effectiveTruckSetup,
-    }),
-    [safeMove.simulation, selectedScenario, effectiveTruckSetup, fallbackScenario],
-  );
+    };
+  }, [safeMove.simulation, selectedScenario, effectiveTruckSetup, fallbackScenario, fallbackPlayback]);
   const activeBestPlan = displaySimulation.bestPlan || fallbackScenario.bestVariant;
   const activePlayback = activeBestPlan?.playback || fallbackPlayback;
 
   const activeTrackingMode = executionProgress?.trackingMode === "demoUltrasonic" ? "demoUltrasonic" : "driverApp";
-  const ultrasonicDemo = getUltrasonicDemoSummary(executionProgress);
+  const ultrasonicDemo = getUltrasonicDemoSummary(executionProgress, executionAssignments);
   const totalMinutes = activeBestPlan?.totalMinutes || 0;
   const baseVisibleMinute = sceneAssetsReady ? Math.min(currentMinute, totalMinutes) : 0;
+  const hasStartedLiveMove = executionAssignments.some((assignment) => Boolean(assignment?.moveStartedAt));
+  const isOutboundSensorTracking = shouldUseDemoSensorTracking(executionAssignments);
+  const sensorTripWindow = useMemo(
+    () => getActiveSensorTripWindow(activePlayback, executionAssignments),
+    [activePlayback, executionAssignments],
+  );
   const demoCompletionPercent = Math.max(
     0,
     Math.min(
       100,
       Number(
         activeTrackingMode === "demoUltrasonic"
-          ? (move?.completionPercentage ?? executionProgress?.completionPercentage ?? ultrasonicDemo.progressPercent)
+          ? ultrasonicDemo.progressPercent
           : 0,
       ) || ultrasonicDemo.progressPercent,
     ),
   );
-  const isLiveDemoTracking = activeTrackingMode === "demoUltrasonic" && (executionState === "active" || executionState === "completed");
-  const demoTargetMinute = Math.min(totalMinutes, Math.max(0, (demoCompletionPercent / 100) * Math.max(totalMinutes, 0)));
+  const isLiveDemoTracking =
+    activeTrackingMode === "demoUltrasonic" &&
+    (executionState === "active" || executionState === "completed") &&
+    hasStartedLiveMove &&
+    isOutboundSensorTracking;
+  const roadProgressRatio = Math.max(
+    0,
+    Math.min(
+      1,
+      activeTrackingMode === "demoUltrasonic"
+        ? ultrasonicDemo.roadProgressRatio
+        : demoCompletionPercent / 100,
+    ),
+  );
+  const rawDemoTargetMinute = sensorTripWindow
+    ? (
+        Number(sensorTripWindow.startMinute) +
+        ((Number(sensorTripWindow.endMinute) - Number(sensorTripWindow.startMinute)) * roadProgressRatio)
+      )
+    : Math.min(totalMinutes, Math.max(0, roadProgressRatio * Math.max(totalMinutes, 0)));
+  const demoTargetMinute =
+    !isLiveDemoTracking || !ultrasonicDemo.hasReading
+      ? null
+      : rawDemoTargetMinute;
+
+  useEffect(() => {
+    if (!isLiveDemoTracking) {
+      stableDemoTargetMinuteRef.current = null;
+      return;
+    }
+
+    if (demoTargetMinute == null) {
+      return;
+    }
+
+    stableDemoTargetMinuteRef.current = demoTargetMinute;
+  }, [demoTargetMinute, isLiveDemoTracking]);
 
   useEffect(() => {
     if (!isLiveDemoTracking) {
@@ -3739,25 +5111,27 @@ export function RigMovePage({
     }
 
     setLiveDemoMinute((current) => {
-      if (!Number.isFinite(current) || Math.abs(current - demoTargetMinute) > Math.max(totalMinutes * 0.35, 120)) {
-        return demoTargetMinute;
+      const targetMinute = demoTargetMinute ?? current ?? baseVisibleMinute;
+      if (!Number.isFinite(current) || Math.abs(current - targetMinute) > Math.max(totalMinutes * 0.35, 120)) {
+        return targetMinute;
       }
       return current;
     });
 
     const intervalId = window.setInterval(() => {
       setLiveDemoMinute((current) => {
-        const delta = demoTargetMinute - current;
+        const targetMinute = demoTargetMinute ?? current ?? baseVisibleMinute;
+        const delta = targetMinute - current;
         if (Math.abs(delta) < 0.35) {
-          return demoTargetMinute;
+          return targetMinute;
         }
 
         const step = Math.sign(delta) * Math.max(0.45, Math.abs(delta) * 0.22);
         const nextValue = current + step;
         if (delta > 0) {
-          return Math.min(nextValue, demoTargetMinute);
+          return Math.min(nextValue, targetMinute);
         }
-        return Math.max(nextValue, demoTargetMinute);
+        return Math.max(nextValue, targetMinute);
       });
     }, 50);
 
@@ -3792,28 +5166,6 @@ export function RigMovePage({
   const displayedTruckCounts = useMemo(
     () => buildDisplayedTruckCounts(effectiveTruckSetup, effectiveTruckCount),
     [effectiveTruckSetup, effectiveTruckCount],
-  );
-  const focusedRigStats = useMemo(
-    () =>
-      getRigInsightStats({
-        side: focusTarget?.kind === "rig" ? focusTarget.side : null,
-        move: safeMove,
-        playback: activePlayback,
-        currentMinute: visibleMinute,
-        totalMinutes,
-      }),
-    [focusTarget, safeMove, activePlayback, visibleMinute, totalMinutes],
-  );
-  const focusedTruckStats = useMemo(
-    () =>
-      getTruckFocusStats({
-        truckId: focusTarget?.kind === "truck" ? focusTarget.truckId : null,
-        move: safeMove,
-        playback: activePlayback,
-        currentMinute: visibleMinute,
-        totalMinutes,
-      }),
-    [focusTarget, safeMove, activePlayback, visibleMinute, totalMinutes],
   );
   const planComparisonStats = useMemo(
     () => getPlanComparisonStats(scenarioPlans, selectedScenario, safeMove, visibleMinute),
@@ -3864,18 +5216,6 @@ export function RigMovePage({
         : buildStartupTransferSchedule(operatingSnapshot.startupLoads, formatLocationLabel(safeMove?.endLabel, "Destination")),
     [safeMove?.simulation?.supportRoutes, operatingSnapshot, safeMove?.endLabel],
   );
-  const focusedTruckOverviewTitle = !isPlaybackActiveState
-    ? "Truck Overview"
-    : focusedTruckStats && (focusedTruckStats.statusLabel === "In Transit" || focusedTruckStats.statusLabel === "Returning")
-      ? "Moving"
-      : "Idle";
-  const focusedRigOverviewTitle = !isPlaybackActiveState
-    ? "Rig Overview"
-    : focusedRigStats?.side === "source" && focusedRigStats.loadingNow > 0
-      ? "Rigging Down"
-      : focusedRigStats?.side === "destination" && focusedRigStats.riggingNow > 0
-        ? "Rigging Up"
-        : "Idle";
 
   function updateTruckCount(truckId, nextCountValue) {
     const parsedCount = Math.max(0, Number.parseInt(nextCountValue, 10) || 0);
@@ -3930,13 +5270,27 @@ export function RigMovePage({
   );
   const isTimelineMode = sceneMode === "timeline";
   const canEditPlan = !readOnly && executionState === "planning" && !isPlaybackRunning && !isPlaybackPaused;
+  const preliminaryExecutionMinute = move?.executionStartedAt
+    ? Math.max(
+        0,
+        ((move?.executionCompletedAt ? new Date(move.executionCompletedAt).getTime() : executionNow) - new Date(move.executionStartedAt).getTime()) / 60000,
+      )
+    : visibleMinute;
+  const displayExecutionAssignments = useMemo(
+    () => (executionState !== "planning" ? buildDisplayExecutionAssignments(executionAssignments, preliminaryExecutionMinute) : executionAssignments),
+    [executionAssignments, executionState, preliminaryExecutionMinute],
+  );
+  const timelinePlayback = useMemo(
+    () => (executionState !== "planning" ? buildExecutionTimelinePlayback(activePlayback, displayExecutionAssignments, preliminaryExecutionMinute) : activePlayback),
+    [activePlayback, displayExecutionAssignments, executionState, preliminaryExecutionMinute],
+  );
   const loadTimelineRows = useMemo(
-    () => (isTimelineMode && timelineRowType === "load" ? buildLoadScheduleRows(activePlayback) : []),
-    [isTimelineMode, timelineRowType, activePlayback],
+    () => (isTimelineMode && timelineRowType === "load" ? buildLoadScheduleRows(timelinePlayback) : []),
+    [isTimelineMode, timelineRowType, timelinePlayback],
   );
   const cpmTimelineRows = useMemo(
-    () => (isTimelineMode && timelineRowType === "cpm" ? buildCpmScheduleRows(activePlayback) : []),
-    [isTimelineMode, timelineRowType, activePlayback],
+    () => (isTimelineMode && timelineRowType === "cpm" ? buildCpmScheduleRows(timelinePlayback) : []),
+    [isTimelineMode, timelineRowType, timelinePlayback],
   );
   const timelineRowsCount = !isTimelineMode
     ? 0
@@ -3948,20 +5302,20 @@ export function RigMovePage({
             ? Math.max(cpmTimelineRows.length, 1)
           : effectiveTruckCount;
   const timelineWorkingMinutes = useMemo(
-    () => (isTimelineMode ? getTimelineWorkingMinutes(activePlayback, timelineRowType) : 0),
-    [isTimelineMode, activePlayback, timelineRowType],
+    () => (isTimelineMode ? getTimelineWorkingMinutes(timelinePlayback, timelineRowType) : 0),
+    [isTimelineMode, timelinePlayback, timelineRowType],
   );
   const truckTimelineWorkingMinutes = useMemo(
-    () => (isTimelineMode ? getTimelineWorkingMinutes(activePlayback, "truck") : 0),
-    [isTimelineMode, activePlayback],
+    () => (isTimelineMode ? getTimelineWorkingMinutes(timelinePlayback, "truck") : 0),
+    [isTimelineMode, timelinePlayback],
   );
   const loadTimelineWorkingMinutes = useMemo(
-    () => (isTimelineMode && timelineRowType === "load" ? getTimelineWorkingMinutes(activePlayback, "load") : 0),
-    [isTimelineMode, timelineRowType, activePlayback],
+    () => (isTimelineMode && timelineRowType === "load" ? getTimelineWorkingMinutes(timelinePlayback, "load") : 0),
+    [isTimelineMode, timelineRowType, timelinePlayback],
   );
   const criticalPathTimelineWorkingMinutes = useMemo(
-    () => (isTimelineMode && timelineRowType === "cpm" ? getTimelineWorkingMinutes(activePlayback, "cpm") : 0),
-    [isTimelineMode, timelineRowType, activePlayback],
+    () => (isTimelineMode && timelineRowType === "cpm" ? getTimelineWorkingMinutes(timelinePlayback, "cpm") : 0),
+    [isTimelineMode, timelineRowType, timelinePlayback],
   );
   const timelineWorkingMinutesPerTruck = Math.round(
     truckTimelineWorkingMinutes / Math.max(effectiveTruckCount, 1),
@@ -3980,9 +5334,12 @@ export function RigMovePage({
   const planEtaLabel = getPlanEtaLabel(planningStartDate, planningStartTime, activePlanSummary.totalMinutes);
   const previewPlanEtaLabel = getPlanEtaLabel(planningStartDate, planningStartTime, previewPlanCard?.totalMinutes || 0);
   const executionAssignmentMetrics = useMemo(
-    () => getAssignmentExecutionMetrics(executionAssignments, executionProgress),
-    [executionAssignments, executionProgress],
+    () => getAssignmentExecutionMetrics(displayExecutionAssignments, executionProgress),
+    [displayExecutionAssignments, executionProgress],
   );
+  const executionTimelineTotalMinutes = executionState === "planning"
+    ? totalMinutes
+    : Math.max(timelinePlayback?.totalMinutes || 0, 1);
   const fallbackExecutionStartedAt = move?.executionStartedAt || executionAssignments[0]?.assignedAt || null;
   const executionStartedAtMs = fallbackExecutionStartedAt ? new Date(fallbackExecutionStartedAt).getTime() : null;
   const executionCompletedAtMs = move?.executionCompletedAt ? new Date(move.executionCompletedAt).getTime() : null;
@@ -3991,20 +5348,83 @@ export function RigMovePage({
     : 0;
   const executionVisibleMinute =
     executionState === "active" || executionState === "completed"
-      ? Math.min(executionElapsedMinutes, totalMinutes)
+      ? Math.min(executionElapsedMinutes, executionTimelineTotalMinutes)
       : visibleMinute;
-  const plannedCompletionPercent = Math.min(100, Math.round((executionVisibleMinute / Math.max(totalMinutes, 1)) * 100));
+  const liveSceneMinute = isLiveDemoTracking ? visibleMinute : executionVisibleMinute;
+  const sceneMinute = executionState === "planning" ? visibleMinute : liveSceneMinute;
+  // Keep demo ultrasonic motion on the original route playback so 100% maps to the real road endpoint.
+  const scenePlayback = executionState === "planning"
+    ? activePlayback
+    : isLiveDemoTracking
+      ? activePlayback
+      : timelinePlayback;
+  const sceneSimulation = useMemo(
+    () => (
+      executionState === "planning"
+        ? displaySimulation
+        : {
+            ...displaySimulation,
+            bestPlan: {
+              ...(displaySimulation.bestPlan || {}),
+              playback: scenePlayback,
+              totalMinutes: scenePlayback?.totalMinutes || displaySimulation.bestPlan?.totalMinutes || 0,
+            },
+          }
+    ),
+    [displaySimulation, executionState, scenePlayback],
+  );
+  const focusedRigStats = useMemo(
+    () =>
+      getRigInsightStats({
+        side: focusTarget?.kind === "rig" ? focusTarget.side : null,
+        move: safeMove,
+        playback: scenePlayback,
+        currentMinute: sceneMinute,
+        totalMinutes,
+      }),
+    [focusTarget, safeMove, scenePlayback, sceneMinute, totalMinutes],
+  );
+  const focusedTruckStats = useMemo(
+    () =>
+      getTruckFocusStats({
+        truckId: focusTarget?.kind === "truck" ? focusTarget.truckId : null,
+        move: safeMove,
+        playback: scenePlayback,
+        currentMinute: sceneMinute,
+        totalMinutes,
+      }),
+    [focusTarget, safeMove, scenePlayback, sceneMinute, totalMinutes],
+  );
+  const focusedTruckOverviewTitle = !isPlaybackActiveState
+    ? "Truck Overview"
+    : focusedTruckStats && (focusedTruckStats.statusLabel === "In Transit" || focusedTruckStats.statusLabel === "Returning")
+      ? "Moving"
+      : "Idle";
+  const focusedRigOverviewTitle = !isPlaybackActiveState
+    ? "Rig Overview"
+    : focusedRigStats?.side === "source" && focusedRigStats.loadingNow > 0
+      ? "Rigging Down"
+      : focusedRigStats?.side === "destination" && focusedRigStats.riggingNow > 0
+        ? "Rigging Up"
+        : "Idle";
+  const plannedCompletionPercent = Math.min(100, Math.round((executionVisibleMinute / Math.max(executionTimelineTotalMinutes, 1)) * 100));
   const actualCompletionPercent = executionAssignmentMetrics.actualPercent;
   const completionVariance = actualCompletionPercent - plannedCompletionPercent;
   const completionVarianceLabel = `${completionVariance >= 0 ? "+" : ""}${completionVariance}%`;
   const executionPaceLabel = completionVariance >= 5 ? "Ahead of plan" : completionVariance <= -5 ? "Behind plan" : "On plan";
   const plannedTasksByNow = Math.round((plannedCompletionPercent / 100) * executionAssignmentMetrics.totalStageTasks);
   const actualTasksDone = executionAssignmentMetrics.completedStageTasks;
-  const nextExecutionAssignment = executionAssignments.find((assignment) => assignment.status !== "completed") || null;
+  const nextExecutionAssignment = displayExecutionAssignments.find((assignment) => assignment.status !== "completed") || null;
   const nextExecutionTaskLabel = nextExecutionAssignment
     ? `${nextExecutionAssignment.driverName || "Driver"} • ${nextExecutionAssignment.currentStage === "rigDown" ? "Rig Down" : nextExecutionAssignment.currentStage === "rigMove" ? "Rig Move" : "Rig Up"}`
     : "All assigned tasks complete";
-  const timeLeftLabel = formatMinutes(Math.max(0, Math.round(totalMinutes - executionVisibleMinute)));
+  const timeLeftLabel = formatMinutes(Math.max(0, Math.round(executionTimelineTotalMinutes - executionVisibleMinute)));
+  const executionProjectedFinishMs = executionStartedAtMs != null
+    ? executionStartedAtMs + (executionTimelineTotalMinutes * 60000)
+    : null;
+  const executionEtcLabel = executionProjectedFinishMs != null
+    ? new Date(executionProjectedFinishMs).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })
+    : "--";
   const isExecutionActive = executionState === "active";
   const isExecutionCompleted = executionState === "completed";
   const isPlanningStage = executionState === "planning";
@@ -4013,41 +5433,20 @@ export function RigMovePage({
   const rigMoveCompleted = Boolean(executionProgress?.rigMoveCompleted);
   const rigUpCompleted = Boolean(executionProgress?.rigUpCompleted);
   const trackingStatusLabel = activeTrackingMode === "demoUltrasonic"
-    ? ultrasonicDemo.arrived
-      ? "Arrived at destination"
-      : ultrasonicDemo.hasReading
-        ? `${formatDistanceCm(ultrasonicDemo.latestCm)} remaining`
-        : "Waiting for demo reading"
+    ? !hasStartedLiveMove
+      ? "Waiting for driver to start moving"
+      : !isOutboundSensorTracking
+        ? "Return trip uses driver start/arrival states"
+        : ultrasonicDemo.tripDirection === "return"
+          ? (ultrasonicDemo.hasReading ? "Returning to source" : "Waiting for return reading")
+        : ultrasonicDemo.arrived
+            ? "Arrived at destination"
+            : ultrasonicDemo.hasReading
+              ? `${formatDistanceCm(ultrasonicDemo.latestCm)} remaining`
+              : "Holding last valid reading"
     : executionProgress?.liveDataRequested
       ? "Waiting on driver app"
       : "Driver app not requested";
-  function handleApplyUltrasonicReading(nextReadingInput = ultrasonicReadingInput) {
-    const parsedReadingCm = parseDistanceCm(nextReadingInput);
-    if (parsedReadingCm == null || !move?.id || typeof onUpdateExecutionProgress !== "function") {
-      return;
-    }
-
-    const parsedStartCm = Math.max(0, parseDistanceCm(ultrasonicStartInput) ?? ultrasonicDemo.startCm);
-    const parsedArrivalCm = Math.max(0, parseDistanceCm(ultrasonicArrivalInput) ?? ultrasonicDemo.arrivalCm);
-    const safeArrivalCm = Math.min(parsedStartCm, parsedArrivalCm);
-    const totalWindow = Math.max(parsedStartCm - safeArrivalCm, 0.001);
-    const progressRatio = Math.max(0, Math.min(1, (parsedStartCm - parsedReadingCm) / totalWindow));
-    const progressMinute = Math.round(totalMinutes * progressRatio);
-    const hasArrived = parsedReadingCm <= safeArrivalCm;
-
-    onUpdateExecutionProgress(move.id, {
-      trackingMode: "demoUltrasonic",
-      liveDataRequested: false,
-      ultrasonicStartCm: parsedStartCm,
-      ultrasonicArrivalCm: safeArrivalCm,
-      ultrasonicLatestCm: parsedReadingCm,
-      ultrasonicLastUpdatedAt: new Date().toISOString(),
-      rigMoveCompleted: rigMoveCompleted || hasArrived,
-      completionPercentage: Math.round(progressRatio * 100),
-      progressMinute,
-    });
-  }
-
   const executionDetailRows = isPlanningStage
     ? []
     : [
@@ -4058,6 +5457,211 @@ export function RigMovePage({
         { key: "rigmove", label: "Rig Move", value: rigMoveCompleted ? "Completed" : "Pending" },
         { key: "rigup", label: "Rig Up", value: rigUpCompleted ? "Completed" : "Pending" },
       ];
+  const executionAlerts = useMemo(() => {
+    if (isPlanningStage) {
+      return [];
+    }
+
+    const alerts = [];
+    const stageKeys = ["rigDown", "rigMove", "rigUp"];
+    const activeTripAssignment = (displayExecutionAssignments || []).find((assignment) => {
+      if (assignment?.status !== "active" && assignment?.status !== "foreman") {
+        return false;
+      }
+
+      const moveState = !assignment?.moveStartedAt
+        ? "readyOutbound"
+        : !assignment?.outboundArrivedAt
+          ? "movingOutbound"
+          : !assignment?.returnMoveStartedAt
+            ? "readyReturn"
+            : !assignment?.returnedToSourceAt
+              ? "movingReturn"
+              : "returned";
+
+      return moveState === "movingOutbound" || moveState === "movingReturn";
+    });
+
+    if (activeTripAssignment) {
+      const isReturnTrip = activeTripAssignment?.taskType === "return" || Boolean(activeTripAssignment?.returnMoveStartedAt);
+      const linkedSourceAssignment = isReturnTrip
+        ? (displayExecutionAssignments || []).find((assignment) =>
+            String(assignment?.id) === String(activeTripAssignment?.linkedAssignmentId || activeTripAssignment?.returnForAssignmentId || ""),
+          ) || null
+        : null;
+      const timingAssignment = linkedSourceAssignment || activeTripAssignment;
+      const tripPlan = activeTripAssignment?.stagePlan?.rigMove || {};
+      const plannedTripFinish = Number(tripPlan?.finishMinute);
+      const tripTimeLeftMinutes = Math.max(0, plannedTripFinish - executionVisibleMinute);
+      const tripLateMinutes = Math.max(0, executionVisibleMinute - plannedTripFinish);
+      const tripDelayThresholdMinutes = getExecutionDelayThresholdMinutes(timingAssignment);
+      const tripTone = tripLateMinutes > tripDelayThresholdMinutes ? "red" : tripLateMinutes > 0 ? "amber" : "blue";
+      const tripIcon = tripLateMinutes > tripDelayThresholdMinutes ? "danger" : tripLateMinutes > 0 ? "warning" : "task";
+
+      alerts.push({
+        key: `execution-alert-trip-${activeTripAssignment?.id || "active"}`,
+        order: 0,
+        actionable: false,
+        tone: tripTone,
+        icon: tripIcon,
+        title: isReturnTrip ? "Trip: Return to source" : "Trip: To destination",
+        meta: activeTripAssignment?.driverName || activeTripAssignment?.simpleLoadLabel || "Active trip",
+        copy: tripLateMinutes > tripDelayThresholdMinutes
+          ? `${formatExecutionDelayAmount(tripLateMinutes, timingAssignment)} late.`
+          : tripLateMinutes > 0
+            ? `${formatExecutionDelayAmount(tripLateMinutes, timingAssignment)} late.`
+            : `${formatExecutionTimeAmount(tripTimeLeftMinutes, timingAssignment)} left to finish this trip.`,
+        detail: Number.isFinite(plannedTripFinish)
+          ? `Planned finish ${formatExecutionTimeAmount(plannedTripFinish, timingAssignment)}`
+          : "Live trip in progress",
+      });
+    }
+
+    (displayExecutionAssignments || []).forEach((assignment, assignmentIndex) => {
+      const currentStage = getExecutionAssignmentStage(assignment?.stageStatus || {});
+      const isExecutionVisibleAssignment = assignment?.status === "active" || assignment?.status === "foreman";
+      if (!isExecutionVisibleAssignment || currentStage === "completed") {
+        return;
+      }
+      if (currentStage === "rigMove") {
+        return;
+      }
+
+      const currentStageIndex = stageKeys.indexOf(currentStage);
+      const stepNumber = ((assignment.sequence || (assignmentIndex + 1)) - 1) * 3 + Math.max(currentStageIndex, 0) + 1;
+      const stagePlan = assignment?.stagePlan?.[currentStage];
+      const plannedStart = Number(stagePlan?.startMinute);
+      const plannedFinish = Number(stagePlan?.finishMinute);
+      const loadLabel = assignment?.simpleLoadLabel || `Load ${assignmentIndex + 1}`;
+      const timeLeftMinutes = Math.max(0, plannedFinish - executionVisibleMinute);
+      const lateMinutes = Math.max(0, executionVisibleMinute - plannedFinish);
+      const delayThresholdMinutes = getExecutionDelayThresholdMinutes(assignment);
+      const tone = lateMinutes > delayThresholdMinutes ? "red" : lateMinutes > 0 ? "amber" : "blue";
+      const icon = lateMinutes > delayThresholdMinutes ? "danger" : lateMinutes > 0 ? "warning" : "task";
+      const isForemanActionableStage = currentStage === "rigDown" || currentStage === "rigUp";
+
+      alerts.push({
+        key: `execution-alert-${assignment?.id || `${loadLabel}-${currentStage}`}-${currentStage}`,
+        order: stepNumber,
+        assignmentId: assignment?.id || null,
+        stage: currentStage,
+        actionable: isForemanActionableStage,
+        tone,
+        icon,
+        title: `Step ${stepNumber}: ${loadLabel} ${getExecutionStageTitle(currentStage)}`,
+        meta: loadLabel,
+        copy: lateMinutes > delayThresholdMinutes
+          ? `${formatExecutionDelayAmount(lateMinutes, assignment)} late. Mark done when finished.`
+          : lateMinutes > 0
+            ? `${formatExecutionDelayAmount(lateMinutes, assignment)} late.`
+            : `${formatExecutionTimeAmount(timeLeftMinutes, assignment)} left.`,
+        detail: Number.isFinite(plannedFinish)
+          ? `Planned finish ${formatExecutionTimeAmount(plannedFinish, assignment)}`
+          : Number.isFinite(plannedStart)
+            ? `Started ${formatExecutionTimeAmount(plannedStart, assignment)}`
+            : "",
+      });
+    });
+
+    return alerts
+      .sort((left, right) => (left.order ?? 0) - (right.order ?? 0))
+      .slice(0, 3);
+  }, [displayExecutionAssignments, executionVisibleMinute, isPlanningStage]);
+  const activeTripAlertState = useMemo(() => {
+    if (isPlanningStage) {
+      return null;
+    }
+
+    const activeTripAssignment = (displayExecutionAssignments || []).find((assignment) => {
+      if (assignment?.status !== "active" && assignment?.status !== "foreman") {
+        return false;
+      }
+
+      const moveState = !assignment?.moveStartedAt
+        ? "readyOutbound"
+        : !assignment?.outboundArrivedAt
+          ? "movingOutbound"
+          : !assignment?.returnMoveStartedAt
+            ? "readyReturn"
+            : !assignment?.returnedToSourceAt
+              ? "movingReturn"
+              : "returned";
+
+      return moveState === "movingOutbound" || moveState === "movingReturn";
+    });
+
+    if (!activeTripAssignment) {
+      return null;
+    }
+
+    const isReturnTrip = activeTripAssignment?.taskType === "return" || Boolean(activeTripAssignment?.returnMoveStartedAt);
+    const linkedSourceAssignment = isReturnTrip
+      ? (displayExecutionAssignments || []).find((assignment) =>
+          String(assignment?.id) === String(activeTripAssignment?.linkedAssignmentId || activeTripAssignment?.returnForAssignmentId || ""),
+        ) || null
+      : null;
+    const timingAssignment = linkedSourceAssignment || activeTripAssignment;
+    const plannedTripFinish = Number(activeTripAssignment?.stagePlan?.rigMove?.finishMinute);
+    const lateMinutes = Math.max(0, executionVisibleMinute - plannedTripFinish);
+    const delayThresholdMinutes = getExecutionDelayThresholdMinutes(timingAssignment);
+
+    return {
+      assignmentId: activeTripAssignment.id || null,
+      sourceAssignmentId: linkedSourceAssignment?.id || activeTripAssignment.id || null,
+      linkedAssignmentId: activeTripAssignment.linkedAssignmentId || activeTripAssignment.returnForAssignmentId || null,
+      loadId: activeTripAssignment.loadId ?? linkedSourceAssignment?.loadId ?? null,
+      tone: lateMinutes > delayThresholdMinutes ? "red" : lateMinutes > 0 ? "amber" : "blue",
+      lateMinutes,
+      plannedFinishMinute: plannedTripFinish,
+    };
+  }, [displayExecutionAssignments, executionVisibleMinute, isPlanningStage]);
+
+  function renderDelayAlertIcon(tone, icon = "task") {
+    const stroke = tone === "red" ? "#fda4af" : tone === "blue" ? "#93c5fd" : "#fcd34d";
+    if (icon === "danger") {
+      return h(
+        "svg",
+        { viewBox: "0 0 24 24", className: "scene-delay-alert-icon", "aria-hidden": "true" },
+        h("path", {
+          d: "M12 7.75v4.5m0 3.25h.01M10.05 4.78l-6.2 10.74A1.5 1.5 0 0 0 5.15 17.75h13.7a1.5 1.5 0 0 0 1.3-2.23l-6.2-10.74a1.5 1.5 0 0 0-2.6 0Z",
+          fill: "none",
+          stroke,
+          strokeWidth: "1.7",
+          strokeLinecap: "round",
+          strokeLinejoin: "round",
+        }),
+      );
+    }
+    if (icon === "task") {
+      return h(
+        "svg",
+        { viewBox: "0 0 24 24", className: "scene-delay-alert-icon", "aria-hidden": "true" },
+        h("path", {
+          d: "M8 6.75h8M8 12h8M8 17.25h5M6.75 4.5h10.5A2.25 2.25 0 0 1 19.5 6.75v10.5a2.25 2.25 0 0 1-2.25 2.25H6.75A2.25 2.25 0 0 1 4.5 17.25V6.75A2.25 2.25 0 0 1 6.75 4.5Z",
+          fill: "none",
+          stroke,
+          strokeWidth: "1.8",
+          strokeLinecap: "round",
+          strokeLinejoin: "round",
+        }),
+      );
+    }
+    if (icon === "warning") {
+      return h(
+        "svg",
+        { viewBox: "0 0 24 24", className: "scene-delay-alert-icon", "aria-hidden": "true" },
+        h("path", {
+          d: "M12 7.75v4.5m0 3.25h.01M10.05 4.78l-6.2 10.74A1.5 1.5 0 0 0 5.15 17.75h13.7a1.5 1.5 0 0 0 1.3-2.23l-6.2-10.74a1.5 1.5 0 0 0-2.6 0Z",
+          fill: "none",
+          stroke,
+          strokeWidth: "1.7",
+          strokeLinecap: "round",
+          strokeLinejoin: "round",
+        }),
+      );
+    }
+    return null;
+  }
   const readOnlyBanner = readOnly
     ? h("p", { className: "muted-copy section-spacing" }, "Manager inspection mode. Planning and playback controls are disabled for this rig.")
     : null;
@@ -4122,104 +5726,71 @@ export function RigMovePage({
     : null;
   const operatingStatusLabel = operatingState === "drilling" ? "Drilling" : "Standby";
   const executionStatusLabel = isExecutionCompleted ? "Drilling" : isExecutionActive ? "Reserved and active" : "Planning only";
-  const executionStatusRow = !isPlanningStage
-    ? h("div", { className: "truck-count-row" }, h("span", null, "Execution Status"), h("strong", null, executionStatusLabel))
-    : null;
-  const executionStatusOverlayRow = !isPlanningStage
-    ? h("div", { className: "truck-count-row scene-passive-overlay" }, h("span", null, "Execution Status"), h("strong", null, executionStatusLabel))
-    : null;
-  const executionSummary = !isPlanningStage
+  const executionStatusRow = null;
+  const executionStatusOverlayRow = null;
+  const executionSummary = null;
+  const delayAlertsPanel = !isPlanningStage
     ? h(
         "section",
-        { className: "scene-panel-section scene-panel-section-plain" },
-        executionDetailRows.map((item) =>
-          h(
-            "div",
-            { key: item.key, className: "truck-count-row" },
-            h("span", null, item.label),
-            h("strong", null, item.value),
+        { className: "scene-panel-section scene-panel-section-plain scene-delay-alerts-panel" },
+        h(
+          "div",
+          { className: "scene-delay-alerts-head" },
+          h("strong", null, "Execution Alerts"),
+          h("span", { className: "scene-delay-alerts-count" }, `${executionAlerts.length} active`),
+        ),
+        h(
+          "div",
+          { className: "scene-delay-alerts" },
+          executionAlerts.map((alert) =>
+            h(
+              "article",
+              { key: alert.key, className: `scene-delay-alert scene-delay-alert-${alert.tone}` },
+              h(
+                "div",
+                { className: "scene-delay-alert-badge", "aria-hidden": "true" },
+                renderDelayAlertIcon(alert.tone, alert.icon),
+              ),
+              h(
+                "div",
+                { className: "scene-delay-alert-body" },
+                h("strong", null, alert.title),
+                h(
+                  "p",
+                  null,
+                  h("span", { className: "scene-delay-alert-meta" }, alert.meta),
+                  h("span", null, alert.copy),
+                ),
+                alert.detail ? h("p", { className: "muted-copy" }, alert.detail) : null,
+              ),
+              alert.actionable
+                ? h(
+                    "button",
+                    {
+                      type: "button",
+                      className: "scene-delay-alert-check",
+                      "aria-label": `Mark ${alert.title} done`,
+                      disabled: readOnly || typeof onCompleteAssignmentStage !== "function" || !alert.assignmentId || !alert.stage,
+                      onClick: () => {
+                        if (!alert.assignmentId || !alert.stage) {
+                          return;
+                        }
+                        onCompleteAssignmentStage?.({
+                          assignmentId: alert.assignmentId,
+                          stage: alert.stage,
+                        });
+                      },
+                    },
+                    h("span", { className: "scene-delay-alert-check-box", "aria-hidden": "true" }),
+                  )
+                : null,
+            ),
           ),
         ),
       )
     : null;
   const startExecutionSetup = null;
-  const executionActions = !readOnly && isExecutionActive
-    ? activeTrackingMode === "demoUltrasonic"
-      ? h(
-          "div",
-          { className: "scene-panel-actions" },
-          h(
-            "section",
-            { className: "scene-panel-section scene-panel-section-plain" },
-            h(
-              "div",
-              { className: "scene-panel-head" },
-              h("span", { className: "scene-panel-kicker" }, "Demo Tracking"),
-              h("strong", null, ultrasonicDemo.arrived ? "Arrived" : `${ultrasonicDemo.progressPercent}%`),
-            ),
-            h("p", { className: "muted-copy section-spacing" }, "Demo-only mode. Enter the toy truck ultrasonic reading. 45 cm is the start reference and 8 cm marks arrival."),
-            h(
-              "div",
-              { className: "scene-stat-grid" },
-              h("div", { className: "scene-stat-card" }, h("span", null, "Latest"), h("strong", null, ultrasonicDemo.hasReading ? formatDistanceCm(ultrasonicDemo.latestCm) : "--")),
-              h("div", { className: "scene-stat-card" }, h("span", null, "Start"), h("strong", null, formatDistanceCm(ultrasonicDemo.startCm))),
-              h("div", { className: "scene-stat-card" }, h("span", null, "Arrival"), h("strong", null, formatDistanceCm(ultrasonicDemo.arrivalCm))),
-              h("div", { className: "scene-stat-card" }, h("span", null, "Move Progress"), h("strong", null, `${ultrasonicDemo.progressPercent}%`)),
-            ),
-            h(
-              Field,
-              {
-                label: "Sensor Reading",
-                hint: "Accepts values like 45 or 45cm.",
-              },
-              h(TextInput, {
-                type: "text",
-                value: ultrasonicReadingInput,
-                placeholder: "45cm",
-                onChange: (event) => setUltrasonicReadingInput(event.target.value),
-              }),
-            ),
-            h(
-              "div",
-              { className: "scene-panel-actions scene-panel-actions-inline" },
-              [45, 40, 34, 28, 20, 12, 8].map((reading) =>
-                h(Button, {
-                  key: `demo-reading-${reading}`,
-                  type: "button",
-                  variant: "ghost",
-                  className: "scene-top-action-button",
-                  onClick: () => {
-                    const nextValue = `${reading}cm`;
-                    setUltrasonicReadingInput(nextValue);
-                    handleApplyUltrasonicReading(nextValue);
-                  },
-                  children: `${reading}cm`,
-                }),
-              ),
-            ),
-            h(
-              "div",
-              { className: "scene-panel-actions scene-panel-actions-inline" },
-              h(Button, {
-                type: "button",
-                variant: "ghost",
-                className: "scene-top-action-button",
-                onClick: () => handleApplyUltrasonicReading(),
-                children: ultrasonicDemo.arrived ? "Update Demo Reading" : "Apply Reading",
-              }),
-            ),
-          ),
-        )
-      : h(
-          "div",
-          { className: "scene-panel-actions scene-panel-actions-inline" },
-          h(
-            "span",
-            { className: "muted-copy" },
-            "Execution completion is controlled by assigned drivers in the driver app.",
-          ),
-        )
-    : null;
+  const executionActions = null;
   const startupKpiSection = h(
     "section",
     { className: "scene-panel-section" },
@@ -4515,22 +6086,28 @@ export function RigMovePage({
                 operatingSnapshot,
                 drillingReadinessPercent,
                 activePlanDashboard,
-                planComparisonStats,
+                planRadarModel,
+                scenarios: scenarioPlans,
                 scenario: selectedScenario,
                 move: safeMove,
-                currentMinute: visibleMinute,
+                planningStartDate,
+                planningStartTime,
+                currentMinute: sceneMinute,
                 timelineGapMinutes,
               }),
             )
           : sceneMode === "3d"
-          ? (SimulationScene3DComponent
+              ? (SimulationScene3DComponent
             ? h(SimulationScene3DComponent, {
                 startPoint: move.startPoint,
                 endPoint: move.endPoint,
                 startLabel: move.startLabel,
                 endLabel: move.endLabel,
-                simulation: displaySimulation,
-                currentMinute: visibleMinute,
+                simulation: sceneSimulation,
+                currentMinute: sceneMinute,
+                delayMinute: executionVisibleMinute,
+                executionAssignments: displayExecutionAssignments,
+                activeTripAlert: activeTripAlertState,
                 sceneFocusResetKey,
                 heightClass: "scene-only-canvas",
                 showOverlay: false,
@@ -4548,8 +6125,10 @@ export function RigMovePage({
               ? h(LeafletMapComponent, {
                   startPoint: move.startPoint,
                   endPoint: move.endPoint,
-                  simulation: displaySimulation,
-                  currentMinute: visibleMinute,
+                  simulation: sceneSimulation,
+                  currentMinute: sceneMinute,
+                  delayMinute: executionVisibleMinute,
+                  executionAssignments: displayExecutionAssignments,
                   supportRoutes: startupTransferSchedule,
                   heightClass: "scene-only-canvas",
                   onFocusChange: handleFocusChange,
@@ -4561,8 +6140,8 @@ export function RigMovePage({
                   h("p", { className: "muted-copy" }, "The map view is loading."),
                 ))
             : h(FullScreenTimeline, {
-                playback: activePlayback,
-                currentMinute: visibleMinute,
+                playback: timelinePlayback,
+                currentMinute: executionState === "planning" ? visibleMinute : liveSceneMinute,
                 zoom: timelineZoom,
               }),
         !isTimelineMode
@@ -4572,6 +6151,30 @@ export function RigMovePage({
           h(
             "div",
             { className: "scene-move-info-grid" },
+            h(
+              "div",
+              { className: "scene-dashboard-inline scene-dashboard-kpi-item" },
+              h("span", { className: "scene-dashboard-label" }, "Sensor"),
+              h(
+                "strong",
+                null,
+                activeTrackingMode === "demoUltrasonic"
+                  ? (ultrasonicDemo.hasReading ? formatDistanceCm(ultrasonicDemo.latestCm) : "--")
+                  : "--",
+              ),
+            ),
+            h(
+              "div",
+              { className: "scene-dashboard-inline scene-dashboard-kpi-item" },
+              h("span", { className: "scene-dashboard-label" }, "Progress"),
+              h(
+                "strong",
+                null,
+                activeTrackingMode === "demoUltrasonic"
+                  ? (ultrasonicDemo.hasReading ? `${ultrasonicDemo.progressPercent}%` : "--")
+                  : "--",
+              ),
+            ),
             h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item scene-move-info-row-full" }, h("span", { className: "scene-dashboard-label" }, "From"), h("strong", null, formatLocationLabel(move.startLabel, "Source"))),
             h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item scene-move-info-row-full" }, h("span", { className: "scene-dashboard-label" }, "To"), h("strong", null, formatLocationLabel(move.endLabel, "Destination"))),
             h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Distance"), h("strong", null, `${move.routeKm || 0} km`)),
@@ -4579,57 +6182,59 @@ export function RigMovePage({
           ),
         )
           : null,
-        !isTimelineMode && isPlanningStage
+        !isTimelineMode
           ? h(
           "div",
           { className: "scene-bottom-controls" },
-          h(
-            "div",
-            {
-              ref: speedDropdownRef,
-              className: `scene-speed-dropdown${isSpeedDropdownOpen ? " is-open" : ""}`,
-              onPointerDown: (event) => event.stopPropagation(),
-              onPointerMove: (event) => event.stopPropagation(),
-            },
-            h(
-              "button",
-              {
-                type: "button",
-                className: "scene-speed-select",
-                onClick: () => setIsSpeedDropdownOpen((current) => !current),
-                "aria-haspopup": "listbox",
-                "aria-expanded": isSpeedDropdownOpen ? "true" : "false",
-              },
-              h("span", null, "Speed"),
-            ),
-            isSpeedDropdownOpen
-              ? h(
-                  "div",
+          isPlanningStage
+            ? h(
+                "div",
+                {
+                  ref: speedDropdownRef,
+                  className: `scene-speed-dropdown${isSpeedDropdownOpen ? " is-open" : ""}`,
+                  onPointerDown: (event) => event.stopPropagation(),
+                  onPointerMove: (event) => event.stopPropagation(),
+                },
+                h(
+                  "button",
                   {
-                    className: "scene-speed-menu",
-                    role: "listbox",
-                    "aria-label": "Playback speed",
-                    onPointerDown: (event) => event.stopPropagation(),
-                    onPointerMove: (event) => event.stopPropagation(),
+                    type: "button",
+                    className: "scene-speed-select",
+                    onClick: () => setIsSpeedDropdownOpen((current) => !current),
+                    "aria-haspopup": "listbox",
+                    "aria-expanded": isSpeedDropdownOpen ? "true" : "false",
                   },
-                  playbackSpeedOptions.map((option) =>
-                    h(
-                      "button",
+                  h("span", null, "Speed"),
+                ),
+                isSpeedDropdownOpen
+                  ? h(
+                      "div",
                       {
-                        key: `speed-${option.value}`,
-                        type: "button",
-                        className: `scene-speed-option${String(playbackSpeed) === option.value ? " is-active" : ""}`,
-                        onClick: () => {
-                          onPlaybackSpeedChange?.(Number(option.value));
-                          setIsSpeedDropdownOpen(false);
-                        },
+                        className: "scene-speed-menu",
+                        role: "listbox",
+                        "aria-label": "Playback speed",
+                        onPointerDown: (event) => event.stopPropagation(),
+                        onPointerMove: (event) => event.stopPropagation(),
                       },
-                      option.label,
-                    ),
-                  ),
-                )
-              : null,
-          ),
+                      playbackSpeedOptions.map((option) =>
+                        h(
+                          "button",
+                          {
+                            key: `speed-${option.value}`,
+                            type: "button",
+                            className: `scene-speed-option${String(playbackSpeed) === option.value ? " is-active" : ""}`,
+                            onClick: () => {
+                              onPlaybackSpeedChange?.(Number(option.value));
+                              setIsSpeedDropdownOpen(false);
+                            },
+                          },
+                          option.label,
+                        ),
+                      ),
+                    )
+                  : null,
+              )
+            : null,
           h(
             "div",
             { className: "scene-mode-switcher" },
@@ -4639,14 +6244,14 @@ export function RigMovePage({
               ["3d", "2d"].map((mode) =>
                 h(
                   "button",
-                {
-                  key: `scene-mode-${mode}`,
-                  type: "button",
-                  className: `scene-dimension-toggle scene-mode-mini-nav-button${sceneMode === mode ? " is-active" : ""}`,
-                  onClick: () => handleSceneModeChange(mode),
-                },
-                mode === "3d" ? "3D" : "2D",
-              ),
+                  {
+                    key: `scene-mode-${mode}`,
+                    type: "button",
+                    className: `scene-dimension-toggle scene-mode-mini-nav-button${sceneMode === mode ? " is-active" : ""}`,
+                    onClick: () => handleSceneModeChange(mode),
+                  },
+                  mode === "3d" ? "3D" : "2D",
+                ),
               ),
             ),
           ),
@@ -4682,7 +6287,7 @@ export function RigMovePage({
         !isTimelineMode
           ? h(
           "aside",
-          { className: "scene-panel scene-panel-left scene-panel-left-merged" },
+          { className: `scene-panel scene-panel-left scene-panel-left-merged${isPlanningStage ? " scene-panel-left-merged-planning" : " scene-panel-left-merged-execution"}` },
           isCustomizeActive
             ? [
                 h(
@@ -4765,8 +6370,7 @@ export function RigMovePage({
                       )
                     : null,
                 ),
-                executionStatusRow,
-                executionSummary,
+                delayAlertsPanel,
                 startExecutionSetup,
                 simulationError || customPlanError ? h("p", { className: "field-error section-spacing" }, customPlanError || simulationError) : null,
                 readOnlyBanner,
@@ -4802,16 +6406,18 @@ export function RigMovePage({
                   : executionActions,
               ]
             : [
-                h(
-                  "div",
-                  { className: "scene-plan-summary-stack scene-passive-overlay" },
-                  h(
-                  "div",
-                  { className: "scene-plan-summary-card scene-plan-summary-card-title" },
-                  h("span", { className: "scene-panel-kicker" }, "Selected Plan"),
-                  h("strong", { className: "scene-plan-summary-title" }, isCustomizeActive ? "Custom Plan" : activeScenario.name),
-                ),
-                ),
+                isPlanningStage
+                  ? h(
+                      "div",
+                      { className: "scene-plan-summary-stack scene-passive-overlay" },
+                      h(
+                        "div",
+                        { className: "scene-plan-summary-card scene-plan-summary-card-title" },
+                        h("span", { className: "scene-panel-kicker" }, "Selected Plan"),
+                        h("strong", { className: "scene-plan-summary-title" }, isCustomizeActive ? "Custom Plan" : activeScenario.name),
+                      ),
+                    )
+                  : null,
                 h(
                   "section",
                   { className: "scene-panel-section scene-panel-section-plain scene-passive-overlay" },
@@ -4842,8 +6448,7 @@ export function RigMovePage({
                       ]
                     : [],
                 ),
-                executionStatusOverlayRow,
-                executionSummary,
+                delayAlertsPanel,
                 startExecutionSetup,
                 readOnlyBanner,
                 !readOnly && isPlanningStage
@@ -4961,6 +6566,7 @@ export function RigMovePage({
               h(
                 "div",
                 { className: "scene-plan-kpis" },
+                h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "ETC"), h("strong", null, executionEtcLabel)),
                 h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Actual Completion"), h("strong", null, `${actualCompletionPercent}%`)),
                 h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Planned By Now"), h("strong", null, `${plannedCompletionPercent}%`)),
                 h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Variance"), h("strong", null, completionVarianceLabel)),
@@ -5025,6 +6631,7 @@ export function RigMovePage({
               h(
                 "div",
                 { className: "scene-plan-kpis" },
+                h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "ETC"), h("strong", null, executionEtcLabel)),
                 h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, t("timePassed", "Time Passed")), h("strong", null, renderElapsedTimeValue(executionVisibleMinute))),
                 h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Completion"), h("strong", null, `${actualCompletionPercent}%`)),
                 h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Plan By Now"), h("strong", null, `${plannedCompletionPercent}%`)),
@@ -5140,7 +6747,7 @@ export function RigMovePage({
               ),
             )
           : null,
-        isPlaybackRunning || isPlaybackPaused
+        (isPlaybackRunning || isPlaybackPaused || (!isTimelineMode && !isPlanningStage))
           ? h(MoveAssistant, {
               move,
               playback: activePlayback,
@@ -5208,8 +6815,7 @@ export function RigMovePage({
                     onRemoveRow: (truckId) =>
                       setTruckSetup((current) => current.filter((item) => item.id !== truckId)),
                   }),
-              executionStatusRow,
-              executionSummary,
+              delayAlertsPanel,
               simulationError ? h("p", { className: "field-error section-spacing" }, simulationError) : null,
               readOnlyBanner,
               !readOnly && isPlanningStage
@@ -5357,7 +6963,7 @@ export function RigMovePage({
             ),
           ),
         ),
-        isPlaybackRunning || isPlaybackPaused
+        (isPlaybackRunning || isPlaybackPaused || (!isTimelineMode && !isPlanningStage))
           ? h(MoveAssistant, {
               move,
               playback: activePlayback,

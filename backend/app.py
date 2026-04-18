@@ -1,5 +1,8 @@
 from pathlib import Path
 import json
+import logging
+import os
+import socket
 import time
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
@@ -24,18 +27,59 @@ from models import (
 FRONTEND_DIR = Path(__file__).resolve().parent.parent / "frontend"
 
 app = Flask(__name__, static_folder=str(FRONTEND_DIR), static_url_path="")
+logging.getLogger("werkzeug").setLevel(logging.INFO)
 STATE_TABLES_READY = False
 FIREBASE_API_KEY = "AIzaSyDPNmHSjioHB6k1vGS2g05SIHQ30Vw54aM"
 FIREBASE_PROJECT_ID = "rigsync-38f79"
 FIREBASE_MANAGER_EMAIL = "manager@rigsync.com"
 FIREBASE_MANAGER_PASSWORD = "123123"
 firebase_token_cache = {"idToken": None, "expiresAt": 0.0}
+QUIET_LOG_ENDPOINTS = {
+    "/api/demo-ultrasonic",
+    "/api/moves/<move_id>",
+}
+
+
+class QuietWerkzeugFilter(logging.Filter):
+    def filter(self, record):
+        message = record.getMessage()
+        return (
+            "POST /api/demo-ultrasonic " not in message
+            and "GET /api/moves/" not in message
+        )
+
+
+werkzeug_logger = logging.getLogger("werkzeug")
+werkzeug_logger.setLevel(logging.INFO)
+werkzeug_logger.addFilter(QuietWerkzeugFilter())
 
 
 def log_timing(endpoint, started_at, **fields):
-    elapsed_ms = round((time.perf_counter() - started_at) * 1000, 1)
-    details = " ".join(f"{key}={value}" for key, value in fields.items())
-    print(f"[timing] endpoint={endpoint} elapsed_ms={elapsed_ms}{(' ' + details) if details else ''}", flush=True)
+    if endpoint in QUIET_LOG_ENDPOINTS:
+        return None
+
+    elapsed_ms = max(0, round((time.perf_counter() - started_at) * 1000))
+    details = " ".join(
+        f"{key}={value}"
+        for key, value in fields.items()
+        if value is not None and value != ""
+    )
+    suffix = f" {details}" if details else ""
+    print(f"[api] {endpoint} {elapsed_ms}ms{suffix}")
+    return None
+
+
+def get_startup_urls(port):
+    urls = [f"http://127.0.0.1:{port}"]
+    try:
+        lan_ip = socket.gethostbyname(socket.gethostname())
+    except OSError:
+        lan_ip = ""
+
+    if lan_ip and lan_ip not in {"127.0.0.1", "0.0.0.0"}:
+        urls.append(f"http://{lan_ip}:{port}")
+
+    return urls
 
 
 def resolve_location_label(lat, lng):
@@ -567,10 +611,62 @@ def normalize_demo_tracking_progress(execution_progress):
             else max(0, float(base_progress.get("ultrasonicLatestCm") or 0))
         ),
         "ultrasonicLastUpdatedAt": base_progress.get("ultrasonicLastUpdatedAt"),
+        "sensorDeviceId": str(base_progress.get("sensorDeviceId") or "").strip() or None,
     }
 
 
-def apply_demo_ultrasonic_reading(move, distance_cm, start_cm=None, arrival_cm=None):
+def is_demo_move_payload(move):
+    if not isinstance(move, dict):
+        return False
+
+    created_by = move.get("createdBy") or {}
+    execution_progress = move.get("executionProgress") or {}
+    return (
+        created_by.get("id") == "foreman-demo"
+        or created_by.get("managerId") == "manager-demo"
+        or execution_progress.get("trackingMode") == "demoUltrasonic"
+    )
+
+
+def select_demo_move_record(session, device_id=None):
+    records = session.query(MoveRecord).all()
+    ranked = []
+
+    for record in records:
+        payload = record.payload if isinstance(record.payload, dict) else None
+        if not payload or not is_demo_move_payload(payload):
+            continue
+
+        execution_progress = normalize_demo_tracking_progress(payload.get("executionProgress"))
+        matches_device = bool(device_id) and execution_progress.get("sensorDeviceId") == device_id
+        has_bound_device = bool(str(execution_progress.get("sensorDeviceId") or "").strip())
+        execution_state = str(payload.get("executionState") or "planning").strip().lower()
+        tracking_mode = execution_progress.get("trackingMode")
+        is_live_demo = tracking_mode == "demoUltrasonic" and execution_state in {"planning", "active", "completed"}
+        state_rank = 2 if execution_state == "active" else 1 if execution_state == "planning" else 0
+        created_at = payload.get("createdAt") or ""
+        updated_at = payload.get("updatedAt") or payload.get("createdAt") or ""
+
+        ranked.append(
+            (
+                2 if not has_bound_device else 1 if matches_device else 0,
+                created_at,
+                1 if is_live_demo else 0,
+                state_rank,
+                1 if matches_device else 0,
+                updated_at,
+                record,
+            )
+        )
+
+    if not ranked:
+        return None
+
+    ranked.sort(key=lambda item: item[:-1], reverse=True)
+    return ranked[0][-1]
+
+
+def apply_demo_ultrasonic_reading(move, distance_cm, start_cm=None, arrival_cm=None, device_id=None):
     simulation = move.get("simulation") or {}
     best_plan = simulation.get("bestPlan") or {}
     total_minutes = best_plan.get("totalMinutes") or move.get("progressMinute") or 0
@@ -598,6 +694,7 @@ def apply_demo_ultrasonic_reading(move, distance_cm, start_cm=None, arrival_cm=N
         "ultrasonicArrivalCm": safe_arrival_cm,
         "ultrasonicLatestCm": safe_distance_cm,
         "ultrasonicLastUpdatedAt": now_iso,
+        "sensorDeviceId": str(device_id or execution_progress.get("sensorDeviceId") or "").strip() or None,
         "rigMoveCompleted": bool(execution_progress.get("rigMoveCompleted")) or has_arrived,
     }
 
@@ -731,12 +828,10 @@ def put_move(move_id):
 def post_demo_ultrasonic():
     payload = request.get_json(silent=True) or {}
     move_id = str(payload.get("moveId") or "").strip()
+    device_id = str(payload.get("deviceId") or "").strip() or None
     distance_cm = payload.get("distanceCm")
     start_cm = payload.get("startCm")
     arrival_cm = payload.get("arrivalCm")
-
-    if not move_id:
-        return jsonify({"error": "moveId is required"}), 400
 
     try:
         safe_distance_cm = max(0, float(distance_cm))
@@ -760,11 +855,19 @@ def post_demo_ultrasonic():
     started_at = time.perf_counter()
     session = SessionLocal()
     try:
-        record = session.get(MoveRecord, move_id)
+        record = session.get(MoveRecord, move_id) if move_id else None
         move_payload = record.payload if record and isinstance(record.payload, dict) else None
         source = "sqlite"
 
         if not move_payload:
+            auto_record = select_demo_move_record(session, device_id=device_id)
+            if auto_record and isinstance(auto_record.payload, dict):
+                record = auto_record
+                move_payload = auto_record.payload
+                move_id = auto_record.id
+                source = "sqlite-auto"
+
+        if not move_payload and move_id:
             try:
                 move_payload = fetch_move_from_firestore(move_id)
                 source = "firestore"
@@ -773,14 +876,15 @@ def post_demo_ultrasonic():
                 return jsonify({"error": f"move not found in local db and Firestore fetch failed: {fetch_error}"}), 404
 
         if not move_payload:
-            log_timing("/api/demo-ultrasonic", started_at, move_id=move_id, found=0, source="none")
-            return jsonify({"error": "move not found"}), 404
+            log_timing("/api/demo-ultrasonic", started_at, move_id=move_id or "auto", found=0, source="none")
+            return jsonify({"error": "move not found and no active demo move could be resolved"}), 404
 
         updated_move, sensor_state = apply_demo_ultrasonic_reading(
             move_payload,
             safe_distance_cm,
             start_cm=safe_start_cm,
             arrival_cm=safe_arrival_cm,
+            device_id=device_id,
         )
         manager_id = derive_manager_id_from_move(updated_move)
         created_by = updated_move.get("createdBy") or {}
@@ -812,6 +916,8 @@ def post_demo_ultrasonic():
         response_payload = {
             "ok": True,
             "moveId": move_id,
+            "resolvedMoveId": move_id,
+            "deviceId": device_id,
             "trackingMode": "demoUltrasonic",
             "source": source,
             "sensor": sensor_state,
@@ -1007,4 +1113,8 @@ def static_files(path):
 
 if __name__ == "__main__":
     initialize_app_state_tables()
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    port = 5000
+    debug_mode = str(os.getenv("RIGSYNC_DEBUG", "")).strip().lower() in {"1", "true", "yes", "on"}
+    startup_urls = ", ".join(get_startup_urls(port))
+    print(f"RigSync backend listening on {startup_urls} (debug={'on' if debug_mode else 'off'})")
+    app.run(host="0.0.0.0", port=port, debug=debug_mode, use_reloader=debug_mode)

@@ -121,6 +121,9 @@ export function DashboardPage({
   const drillingCompletion = Math.max(0, Math.min(100, Number(rig?.drillingCompletion) || 0));
   const reusableSummary = rigInventory?.reusableSummary || { totalUnits: 0, categoryCount: 0, criticalUnits: 0 };
   const startupSummary = rigInventory?.startupSummary || { totalUnits: 0, coveredUnits: 0, missingUnits: 0 };
+  const canOpenActiveMove = Boolean(
+    activeMove?.id && (moves || []).some((move) => move && String(move.id) === String(activeMove.id)),
+  );
   const reusableNeededLoads = (rigInventory?.startupLoads || []).filter((item) => item.isReusable);
   const [inventoryDraft, setInventoryDraft] = useState(() =>
     Object.fromEntries(
@@ -309,7 +312,7 @@ export function DashboardPage({
       h(
         "aside",
         { className: "dashboard-column" },
-        activeMove && activeMove.operatingState !== "drilling"
+        canOpenActiveMove && activeMove && activeMove.operatingState !== "drilling"
           ? h(
               Card,
               { className: "dashboard-section-card" },

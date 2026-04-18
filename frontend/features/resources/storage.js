@@ -7,9 +7,22 @@ const DEFAULT_MANAGER_FLEETS = {
     { id: "flatbed", type: "Flat-bed", count: 4, hourlyCost: 105 },
     { id: "low-bed", type: "Low-bed", count: 3, hourlyCost: 155 },
   ],
+  "manager-demo": [
+    { id: "demo-low-bed", type: "Low-bed", count: 1, hourlyCost: 95 },
+  ],
 };
 
-const DEFAULT_MANAGER_DRIVERS = {};
+const DEFAULT_MANAGER_DRIVERS = {
+  "manager-demo": [
+    {
+      id: "driver-demo",
+      name: "Demo Driver",
+      email: "driver-demo@rigsync.com",
+      truckType: "Low-bed",
+      truckId: "truck-lowbed-1",
+    },
+  ],
+};
 
 const managerResourceCache = new Map();
 
@@ -19,13 +32,13 @@ function normalizeTypeKey(type) {
 
 function normalizePlannerTruckType(type) {
   const normalized = normalizeTypeKey(type);
-  if (normalized.includes("heavy")) {
+  if (normalized === "hh" || normalized.includes("heavy")) {
     return "Heavy Hauler";
   }
-  if (normalized.includes("flat")) {
+  if (normalized === "fb" || normalized.includes("flat")) {
     return "Flat-bed";
   }
-  if (normalized.includes("low") || normalized.includes("support")) {
+  if (normalized === "lb" || normalized.includes("low") || normalized.includes("support")) {
     return "Low-bed";
   }
   return "";
@@ -63,6 +76,23 @@ function buildDefaultTruckRecords(managerId) {
     const prefix = getTypePrefix(entry.type);
 
     for (let index = 0; index < total; index += 1) {
+      trucks.push({
+        id: `truck-${normalizeTypeKey(entry.type)}-${index + 1}`,
+        name: `${prefix}-${String(index + 1).padStart(2, "0")}`,
+        type: entry.type,
+      });
+    }
+  });
+
+  return trucks;
+}
+
+function buildTruckRecordsFromFleet(fleet = []) {
+  const trucks = [];
+
+  normalizeFleet(fleet).forEach((entry) => {
+    const prefix = getTypePrefix(entry.type);
+    for (let index = 0; index < entry.count; index += 1) {
       trucks.push({
         id: `truck-${normalizeTypeKey(entry.type)}-${index + 1}`,
         name: `${prefix}-${String(index + 1).padStart(2, "0")}`,
@@ -130,12 +160,20 @@ function normalizeTaskAssignmentEntry(entry, index) {
     endLabel: String(entry.endLabel || "").trim(),
     loadId: entry.loadId ?? null,
     loadCode: String(entry.loadCode || "").trim(),
+    simpleLoadLabel: String(entry.simpleLoadLabel || "").trim(),
     tripLabel: String(entry.tripLabel || "").trim(),
     tripNumber: Math.max(1, Number.parseInt(entry.tripNumber, 10) || index + 1),
     plannedTripCount: Math.max(1, Number.parseInt(entry.plannedTripCount, 10) || 1),
     plannedStartMinute: Number.isFinite(Number(entry.plannedStartMinute)) ? Number(entry.plannedStartMinute) : null,
     plannedFinishMinute: Number.isFinite(Number(entry.plannedFinishMinute)) ? Number(entry.plannedFinishMinute) : null,
     journeyId: String(entry.journeyId || "").trim(),
+    moveStartedAt: entry.moveStartedAt || null,
+    outboundArrivedAt: entry.outboundArrivedAt || null,
+    returnMoveStartedAt: entry.returnMoveStartedAt || null,
+    returnedToSourceAt: entry.returnedToSourceAt || null,
+    taskType: String(entry.taskType || "").trim() || "load",
+    linkedAssignmentId: entry.linkedAssignmentId || null,
+    returnForAssignmentId: entry.returnForAssignmentId || null,
     currentStage,
     stageStatus: {
       rigDownCompleted: Boolean(stageStatus.rigDownCompleted),
@@ -242,24 +280,64 @@ function deriveFleetFromTrucks(trucks) {
   return [...grouped.values()];
 }
 
+function assignDriverTruckIds(drivers, trucks) {
+  const truckQueuesByType = new Map();
+  const truckById = new Map((trucks || []).map((truck) => [truck.id, truck]));
+  const usedTruckIds = new Set();
+
+  normalizeTrucks(trucks).forEach((truck) => {
+    const key = normalizeTypeKey(truck.type);
+    if (!truckQueuesByType.has(key)) {
+      truckQueuesByType.set(key, []);
+    }
+    truckQueuesByType.get(key).push(truck);
+  });
+
+  return (drivers || []).map((driver) => {
+    const existingTruck = driver.truckId ? truckById.get(driver.truckId) : null;
+    if (existingTruck) {
+      usedTruckIds.add(existingTruck.id);
+      return driver;
+    }
+
+    const typeKey = normalizeTypeKey(driver.truckType);
+    const queue = truckQueuesByType.get(typeKey) || [];
+    const matchedTruck = queue.find((truck) => !usedTruckIds.has(truck.id)) || null;
+    if (matchedTruck) {
+      usedTruckIds.add(matchedTruck.id);
+    }
+
+    return {
+      ...driver,
+      truckId: matchedTruck?.id || "",
+    };
+  });
+}
+
 function normalizeManagerResources(managerId, resources = {}) {
   const normalizedDrivers = normalizeDrivers(resources.drivers?.length ? resources.drivers : DEFAULT_MANAGER_DRIVERS[managerId] || [], managerId);
-  const trucks = normalizeTrucks(
-    normalizedDrivers.length
-      ? deriveTrucksFromDrivers(normalizedDrivers)
-      : resources.trucks?.length
-        ? resources.trucks
-        : [],
-  );
-  const fleet = normalizeFleet(deriveFleetFromTrucks(trucks));
+  const explicitFleet = normalizeFleet(resources.fleet);
+  const explicitTrucks = normalizeTrucks(resources.trucks);
+  const trucks = explicitTrucks.length
+    ? explicitTrucks
+    : explicitFleet.length
+      ? buildTruckRecordsFromFleet(explicitFleet)
+      : normalizedDrivers.length
+        ? deriveTrucksFromDrivers(normalizedDrivers)
+        : buildDefaultTruckRecords(managerId);
+  const fleet = explicitFleet.length
+    ? explicitFleet
+    : normalizeFleet(
+        explicitTrucks.length || normalizedDrivers.length
+          ? deriveFleetFromTrucks(trucks)
+          : DEFAULT_MANAGER_FLEETS[managerId] || DEFAULT_TRUCK_SETUP,
+      );
+  const drivers = assignDriverTruckIds(normalizedDrivers, trucks);
 
   return {
     fleet,
     trucks,
-    drivers: normalizedDrivers.map((driver, index) => ({
-      ...driver,
-      truckId: driver.truckId || trucks[index]?.id || "",
-    })),
+    drivers,
     taskAssignments: normalizeTaskAssignments(resources.taskAssignments || resources.task_assignments || []),
   };
 }
@@ -295,11 +373,9 @@ export function readManagerFleet(managerId) {
 
 export async function writeManagerResources(managerId, resources) {
   const normalized = normalizeManagerResources(managerId, resources);
-  const derivedTrucks = deriveTrucksFromDrivers(normalized.drivers);
-  const derivedFleet = deriveFleetFromTrucks(derivedTrucks);
   const payload = {
-    fleet: derivedFleet,
-    trucks: derivedTrucks,
+    fleet: normalized.fleet,
+    trucks: normalized.trucks,
     drivers: normalized.drivers,
     taskAssignments: normalized.taskAssignments,
   };

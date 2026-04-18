@@ -1,8 +1,6 @@
 import { React, createRoot, h } from "./lib/react.js";
 import { useHashRoute, navigateTo } from "./lib/router.js";
-import {
-  DEFAULT_TRUCK_SETUP,
-} from "./lib/constants.js";
+import { DEFAULT_TRUCK_SETUP } from "./lib/constants.js";
 import { fetchLoads, fetchLocationLabel } from "./features/rigMoves/api.js";
 import { buildLogicalLoads, fetchRouteData, fallbackRouteData } from "./features/rigMoves/simulation.js";
 import { buildScenarioPlans } from "./features/rigMoves/isePlanner.js";
@@ -31,6 +29,7 @@ import {
   setManagerResourcesCache,
   readManagerResources,
   readManagerFleet,
+  hydrateManagerResources,
   writeManagerResources,
   writeManagerFleet,
   buildFleetAvailability,
@@ -50,6 +49,247 @@ import { formatCoordinate, formatDate, formatMinutes } from "./lib/format.js";
 import { DEFAULT_LANGUAGE, LANGUAGE_STORAGE_KEY, getLanguageDirection } from "./lib/language.js";
 
 const { useEffect, useRef, useState } = React;
+const DEMO_ACCOUNT_EMAIL = "demo@rigsync.com";
+const NORMAL_PLAYBACK_SPEED = 1500;
+const DEFAULT_PLAYBACK_SPEED = 15000;
+const DEMO_SENSOR_SYNC_INTERVAL_MS = 2500;
+const DEMO_RIG_LOADS = [
+  {
+    id: "demo-load-1",
+    code: "DM-01",
+    description: "Demo power skid",
+    category: "Demo",
+    priority: 1,
+    truck_type: "Low-bed",
+    truck_types: ["Low-bed"],
+    load_count: 1,
+    weight_tons: 12,
+    avg_rig_down_minutes: 20,
+    avg_rig_up_minutes: 20,
+    optimal_rig_down_minutes: 15,
+    optimal_rig_up_minutes: 15,
+    minimum_crew_down_count: 1,
+    minimum_crew_up_count: 1,
+    optimal_crew_down_count: 1,
+    optimal_crew_up_count: 1,
+    minimum_crew_down_roles: { operator: 1 },
+    minimum_crew_up_roles: { operator: 1 },
+    optimal_crew_down_roles: { operator: 1 },
+    optimal_crew_up_roles: { operator: 1 },
+  },
+  {
+    id: "demo-load-2",
+    code: "DM-02",
+    description: "Demo pipe basket",
+    category: "Demo",
+    priority: 2,
+    truck_type: "Low-bed",
+    truck_types: ["Low-bed"],
+    load_count: 1,
+    weight_tons: 8,
+    avg_rig_down_minutes: 15,
+    avg_rig_up_minutes: 15,
+    optimal_rig_down_minutes: 10,
+    optimal_rig_up_minutes: 10,
+    minimum_crew_down_count: 1,
+    minimum_crew_up_count: 1,
+    optimal_crew_down_count: 1,
+    optimal_crew_up_count: 1,
+    minimum_crew_down_roles: { operator: 1 },
+    minimum_crew_up_roles: { operator: 1 },
+    optimal_crew_down_roles: { operator: 1 },
+    optimal_crew_up_roles: { operator: 1 },
+    rig_down_dependency_codes: ["DM-01"],
+    rig_move_dependency_codes: ["DM-01"],
+  },
+];
+const DEMO_TRUCK_SPECS = [
+  {
+    type: "Low-bed",
+    max_weight_tons: 20,
+    average_speed_kmh: 25,
+    alpha: 0.2,
+    hourlyCost: 95,
+  },
+];
+
+function isDemoSession(session) {
+  return Boolean(session?.isDemo || String(session?.email || "").trim().toLowerCase() === DEMO_ACCOUNT_EMAIL);
+}
+
+function getAssignmentDelayThresholdMinutes(assignment) {
+  if (Number.isFinite(Number(assignment?.delayThresholdMinutes))) {
+    return Math.max(0, Number(assignment.delayThresholdMinutes));
+  }
+  return 20;
+}
+
+function buildSimpleDemoPlayback({
+  loads,
+  routeGeometry,
+  startLabel,
+  endLabel,
+  truckType = "Low-bed",
+  truckId = "demo-low-bed-1",
+}) {
+  const selectedLoads = (loads || []).slice(0, 2);
+  const pickupBufferMinutes = 0;
+  const destinationBufferMinutes = 0;
+  const stagingGapMinutes = 1;
+  const trips = [];
+  const steps = [];
+  const tasks = [];
+  let nextDispatchMinute = 1;
+
+  selectedLoads.forEach((load, index) => {
+    const loadId = index + 1;
+    const loadCode = `${load?.code || `DM-0${loadId}`}-L1`;
+    const description = load?.description || `Demo load ${loadId}`;
+    const routeMinutes = 1;
+    const rigDownDuration = 1 + (index % 2);
+    const rigUpDuration = 1 + ((index + 1) % 2);
+    const rigDownStart = Math.max(0, nextDispatchMinute - pickupBufferMinutes - rigDownDuration);
+    const rigDownFinish = rigDownStart + rigDownDuration;
+    const pickupLoadStart = rigDownFinish;
+    const pickupLoadFinish = pickupLoadStart + pickupBufferMinutes;
+    const moveStart = pickupLoadFinish;
+    const arrivalAtDestination = moveStart + routeMinutes;
+    const unloadDropStart = arrivalAtDestination;
+    const unloadDropFinish = unloadDropStart + destinationBufferMinutes;
+    const rigUpStart = unloadDropFinish;
+    const rigUpFinish = rigUpStart + rigUpDuration;
+    const returnStart = rigUpFinish;
+    const returnToSource = returnStart + routeMinutes;
+
+    trips.push({
+      truckId,
+      truckType,
+      journeyId: `${loadCode}-journey`,
+      loadId,
+      loadCode,
+      description,
+      sourceLabel: startLabel,
+      destinationLabel: endLabel,
+      dispatchStart: rigDownStart,
+      pickupRouteMinutes: 0,
+      pickupRouteGeometry: [],
+      routeMinutes,
+      routeGeometry,
+      moveStart,
+      loadStart: rigDownStart,
+      rigDownStart,
+      rigDownFinish,
+      pickupLoadStart,
+      pickupLoadFinish,
+      arrivalAtDestination,
+      unloadDropStart,
+      unloadDropFinish,
+      rigUpStart,
+      rigUpFinish,
+      returnStart,
+      returnToSource,
+      sourceKind: "rig",
+    });
+
+    steps.push(
+      {
+        type: "rig-down-start",
+        minute: rigDownStart,
+        title: `${loadCode} rig down starts`,
+        description: `${description} begins rig down at ${startLabel}.`,
+      },
+      {
+        type: "move-start",
+        minute: moveStart,
+        title: `${truckType} departs with ${loadCode}`,
+        description: `${description} begins rig moving to ${endLabel}.`,
+      },
+      {
+        type: "rig-up-start",
+        minute: rigUpStart,
+        title: `${loadCode} rig up starts`,
+        description: `${description} begins rig up at ${endLabel}.`,
+      },
+    );
+
+    tasks.push(
+      {
+        id: `${loadCode} (RD)`,
+        loadId,
+        loadCode,
+        description,
+        phase: "rig_down",
+        activityCode: "RD",
+        activityLabel: "Rig Down",
+        sourceKind: "rig",
+        predecessorIds: [],
+        startMinute: rigDownStart,
+        endMinute: rigDownFinish,
+        earliestStart: rigDownStart,
+        earliestFinish: rigDownFinish,
+        latestStart: rigDownStart,
+        latestFinish: rigDownFinish,
+        slack: 0,
+        isCritical: true,
+      },
+      {
+        id: `${loadCode} (RM)`,
+        loadId,
+        loadCode,
+        description,
+        phase: "move",
+        activityCode: "RM",
+        activityLabel: "Rig Moving",
+        sourceKind: "rig",
+        predecessorIds: [`${loadCode} (RD)`],
+        startMinute: moveStart,
+        endMinute: arrivalAtDestination,
+        earliestStart: moveStart,
+        earliestFinish: arrivalAtDestination,
+        latestStart: moveStart,
+        latestFinish: arrivalAtDestination,
+        slack: 0,
+        isCritical: true,
+      },
+      {
+        id: `${loadCode} (RU)`,
+        loadId,
+        loadCode,
+        description,
+        phase: "rig_up",
+        activityCode: "RU",
+        activityLabel: "Rig Up",
+        sourceKind: "rig",
+        predecessorIds: [`${loadCode} (RM)`],
+        startMinute: rigUpStart,
+        endMinute: rigUpFinish,
+        earliestStart: rigUpStart,
+        earliestFinish: rigUpFinish,
+        latestStart: rigUpStart,
+        latestFinish: rigUpFinish,
+        slack: 0,
+        isCritical: true,
+      },
+    );
+
+    nextDispatchMinute = returnToSource + stagingGapMinutes;
+  });
+
+  const totalMinutes = Math.max(...trips.map((trip) => trip.rigUpFinish), 1);
+
+  return {
+    totalMinutes,
+    journeys: trips,
+    trips,
+    steps,
+    tasks,
+    planningAnalysis: {
+      projectFinish: totalMinutes,
+      criticalTaskIds: tasks.map((task) => task.id),
+    },
+    resourceUsage: [],
+  };
+}
 
 function readStoredLanguage() {
   try {
@@ -69,13 +309,13 @@ function yieldForUiPaint() {
 
 function normalizePlannerTruckType(type) {
   const normalized = String(type || "").trim().toLowerCase().replace(/[^a-z]/g, "");
-  if (normalized.includes("heavy")) {
+  if (normalized === "hh" || normalized.includes("heavy")) {
     return "Heavy Hauler";
   }
-  if (normalized.includes("flat")) {
+  if (normalized === "fb" || normalized.includes("flat")) {
     return "Flat-bed";
   }
-  if (normalized.includes("low") || normalized.includes("support")) {
+  if (normalized === "lb" || normalized.includes("low") || normalized.includes("support")) {
     return "Low-bed";
   }
   return "";
@@ -115,9 +355,21 @@ function isCoordinateLabel(label) {
 }
 
 function normalizeTruckTypeKey(type) {
-  return String(type || "")
+  const normalized = String(type || "")
     .toLowerCase()
     .replace(/[^a-z]/g, "");
+
+  if (normalized === "hh" || normalized.includes("heavy")) {
+    return "heavyhauler";
+  }
+  if (normalized === "fb" || normalized.includes("flat")) {
+    return "flatbed";
+  }
+  if (normalized === "lb" || normalized.includes("low") || normalized.includes("support")) {
+    return "lowbed";
+  }
+
+  return normalized;
 }
 
 function summarizeScenarioFailures(scenarioPlans) {
@@ -142,6 +394,50 @@ function summarizeScenarioFailures(scenarioPlans) {
     })
     .slice(0, 3)
     .join(" ");
+}
+
+function getLoadRequiredTruckTypes(load) {
+  const directType = String(load?.truck_type || "").trim();
+  const directNormalized = normalizePlannerTruckType(directType);
+  const optionTypes = (load?.truck_options || load?.truckTypes || load?.truck_types || [])
+    .map((type) => normalizePlannerTruckType(type))
+    .filter(Boolean);
+
+  if (directNormalized && !/[\/,|]/.test(directType)) {
+    return [directNormalized];
+  }
+
+  if (optionTypes.length) {
+    return [...new Set(optionTypes)];
+  }
+
+  return directNormalized ? [directNormalized] : [];
+}
+
+function getMissingTruckCoverage(loads, truckSetup) {
+  const availableTypeKeys = new Set(
+    (truckSetup || [])
+      .filter((truck) => Math.max(0, Number.parseInt(truck?.count, 10) || 0) > 0)
+      .map((truck) => normalizeTruckTypeKey(truck.type))
+      .filter(Boolean),
+  );
+
+  for (const load of loads || []) {
+    const requiredTypes = getLoadRequiredTruckTypes(load);
+    if (!requiredTypes.length) {
+      continue;
+    }
+
+    const isCovered = requiredTypes.some((type) => availableTypeKeys.has(normalizeTruckTypeKey(type)));
+    if (!isCovered) {
+      return {
+        loadCode: load.code || load.id || "Load",
+        requiredTypes,
+      };
+    }
+  }
+
+  return null;
 }
 
 function getActiveScenario(move) {
@@ -195,6 +491,100 @@ function getAssignmentStageLabel(stageState = {}) {
   return "completed";
 }
 
+function getDriverMoveState(assignment = {}) {
+  if (assignment?.taskType === "return") {
+    if (!assignment?.moveStartedAt) {
+      return "readyOutbound";
+    }
+    if (!assignment?.returnedToSourceAt) {
+      return "movingReturn";
+    }
+    return "returned";
+  }
+
+  if (!assignment?.moveStartedAt) {
+    return "readyOutbound";
+  }
+  if (!assignment?.outboundArrivedAt) {
+    return "movingOutbound";
+  }
+  if (!assignment?.returnMoveStartedAt) {
+    return "readyReturn";
+  }
+  if (!assignment?.returnedToSourceAt) {
+    return "movingReturn";
+  }
+  return "returned";
+}
+
+function getAssignmentSensorProgress(move, assignment) {
+  const executionProgress = move?.executionProgress || {};
+  if (executionProgress?.trackingMode !== "demoUltrasonic") {
+    return { enabled: false, progressPercent: null, readyToArrive: true };
+  }
+
+  const latestCm = executionProgress?.ultrasonicLatestCm == null
+    ? null
+    : Math.max(0, Number(executionProgress.ultrasonicLatestCm) || 0);
+  if (latestCm == null) {
+    return { enabled: true, progressPercent: null, readyToArrive: false };
+  }
+
+  const startCm = Math.max(0, Number(executionProgress?.ultrasonicStartCm) || 45);
+  const arrivalCm = Math.max(0, Number(executionProgress?.ultrasonicArrivalCm) || 8);
+  const endCm = Math.min(arrivalCm, startCm);
+  const totalWindow = Math.max(startCm - endCm, 0.001);
+  const outboundProgressPercent = Math.max(0, Math.min(100, Math.round(((startCm - latestCm) / totalWindow) * 100)));
+  const isReturnTrip = assignment?.taskType === "return" || getDriverMoveState(assignment) === "movingReturn";
+  const progressPercent = isReturnTrip
+    ? Math.max(0, Math.min(100, 100 - outboundProgressPercent))
+    : outboundProgressPercent;
+
+  return {
+    enabled: true,
+    progressPercent,
+    readyToArrive: progressPercent >= 100,
+  };
+}
+
+function createReturnAssignmentFromLoad(assignment, timestamp) {
+  return {
+    ...assignment,
+    id: `${assignment.id}-return`,
+    taskType: "return",
+    returnForAssignmentId: assignment.id,
+    linkedAssignmentId: assignment.id,
+    tripLabel: `Return to ${assignment.startLabel || "Source"}`,
+    simpleLoadLabel: "Return Trip",
+    startLabel: assignment.endLabel || assignment.startLabel || "",
+    endLabel: assignment.startLabel || assignment.endLabel || "",
+    loadId: null,
+    loadCode: "",
+    currentStage: "rigMove",
+    status: "active",
+    moveStartedAt: null,
+    outboundArrivedAt: null,
+    returnMoveStartedAt: null,
+    returnedToSourceAt: null,
+    stageStatus: {
+      rigDownCompleted: true,
+      rigMoveCompleted: false,
+      rigUpCompleted: true,
+    },
+    stageCompletedAt: {
+      rigDown: assignment.stageCompletedAt?.rigDown || timestamp,
+      rigMove: null,
+      rigUp: assignment.stageCompletedAt?.rigMove || timestamp,
+    },
+    stageDelayNotes: {
+      rigDown: null,
+      rigMove: null,
+      rigUp: null,
+    },
+    updatedAt: timestamp,
+  };
+}
+
 function getStageDelayMinutes({ assignment, stage, completedAt = new Date().toISOString() }) {
   const plannedFinishMinute = assignment?.stagePlan?.[stage]?.finishMinute;
   const executionStartedAt = assignment?.executionStartedAt || assignment?.assignedAt;
@@ -204,7 +594,7 @@ function getStageDelayMinutes({ assignment, stage, completedAt = new Date().toIS
 
   const actualElapsedMinutes =
     Math.max(0, new Date(completedAt).getTime() - new Date(executionStartedAt).getTime()) / 60000;
-  return Math.max(0, Math.round(actualElapsedMinutes - Number(plannedFinishMinute)));
+  return Math.max(0, actualElapsedMinutes - Number(plannedFinishMinute));
 }
 
 function getMovePlayback(move) {
@@ -235,7 +625,15 @@ function pruneTaskAssignments(taskAssignments = [], moves = []) {
       return false;
     }
 
-    if (!assignment.driverId || !assignment.loadId) {
+    if (!assignment.driverId) {
+      return false;
+    }
+
+    if (assignment.taskType === "return") {
+      return Boolean(assignment.linkedAssignmentId || assignment.returnForAssignmentId);
+    }
+
+    if (!assignment.loadId) {
       return false;
     }
 
@@ -254,7 +652,7 @@ function buildDriverAssignmentsForMove({ move, managerResources }) {
     .filter((trip) => trip?.loadId != null)
     .sort((left, right) => (left.loadStart ?? 0) - (right.loadStart ?? 0) || (left.loadId ?? 0) - (right.loadId ?? 0));
   const primaryPool = (freeDrivers.length ? freeDrivers : drivers).filter(Boolean);
-  if (!primaryPool.length || !trips.length) {
+  if (!trips.length) {
     return [];
   }
   const tripsByPlannedTruck = new Map();
@@ -280,7 +678,7 @@ function buildDriverAssignmentsForMove({ move, managerResources }) {
     );
 
   const usedDriverIds = new Set();
-  function pickDriverForLane(type) {
+  function pickDriverForLane(type, lane) {
     const typeKey = String(type || "").trim().toLowerCase();
     const exactPrimary = primaryPool.find(
       (driver) => !usedDriverIds.has(driver.id) && String(driver.truckType || "").trim().toLowerCase() === typeKey,
@@ -310,17 +708,67 @@ function buildDriverAssignmentsForMove({ move, managerResources }) {
       return fallbackAny;
     }
 
-    return null;
+    return {
+      id: `synthetic-${move.id}-${(lane?.plannedTruckId ?? lane?.plannedTruckKey ?? typeKey) || "truck"}`,
+      name: `${String(type || lane?.truckType || "Truck").trim() || "Truck"} crew`,
+      truckId: lane?.plannedTruckId == null ? "" : String(lane.plannedTruckId),
+      truckType: lane?.truckType || type || "Truck",
+    };
   }
 
-  const assignmentQueues = new Map();
+  const laneDriverByKey = new Map();
   plannedTruckLanes.forEach((lane) => {
-    const driver = pickDriverForLane(lane.truckType);
+    const driver = pickDriverForLane(lane.truckType, lane);
     if (!driver) {
       return;
     }
+    laneDriverByKey.set(lane.plannedTruckKey, {
+      driver,
+      lane,
+    });
+  });
 
-    const driverAssignments = lane.trips.map((trip, index) => ({
+  const orderedTrips = plannedTruckLanes
+    .flatMap((lane) =>
+      lane.trips.map((trip) => ({
+        trip,
+        lane,
+        laneDriver: laneDriverByKey.get(lane.plannedTruckKey) || null,
+      })),
+    )
+    .filter((entry) => entry.laneDriver?.driver)
+    .sort(
+      (left, right) => (left.trip.loadStart ?? 0) - (right.trip.loadStart ?? 0) ||
+        (left.trip.loadId ?? 0) - (right.trip.loadId ?? 0) ||
+        String(left.lane.plannedTruckKey).localeCompare(String(right.lane.plannedTruckKey)),
+    );
+
+  let sequenceCursor = 0;
+
+  return orderedTrips.map(({ trip, lane, laneDriver }, index) => {
+    const driver = laneDriver.driver;
+    const simpleLoadLabel = `Load ${index + 1}`;
+    const rigDownDuration = Math.max(
+      1,
+      Math.round((trip.rigDownFinish ?? trip.loadStart ?? 0) - (trip.rigDownStart ?? trip.loadStart ?? 0)) || 1,
+    );
+    const rigMoveDuration = Math.max(
+      1,
+      Math.round((trip.arrivalAtDestination ?? trip.moveFinish ?? 0) - (trip.moveStart ?? trip.pickupLoadFinish ?? trip.rigDownFinish ?? 0)) || 1,
+    );
+    const rigUpDuration = Math.max(
+      1,
+      Math.round((trip.rigUpFinish ?? trip.returnToSource ?? trip.arrivalAtDestination ?? 0) - (trip.rigUpStart ?? trip.unloadDropFinish ?? trip.arrivalAtDestination ?? 0)) || 1,
+    );
+    const rigDownStartMinute = sequenceCursor;
+    const rigDownFinishMinute = rigDownStartMinute + rigDownDuration;
+    const rigMoveStartMinute = rigDownFinishMinute;
+    const rigMoveFinishMinute = rigMoveStartMinute + rigMoveDuration;
+    const rigUpStartMinute = rigMoveFinishMinute;
+    const rigUpFinishMinute = rigUpStartMinute + rigUpDuration;
+    sequenceCursor = rigUpFinishMinute;
+
+    return {
       id: `assignment-${move.id}-${driver.id}-${trip.loadId}-${index + 1}`,
       moveId: move.id,
       moveName: move.name,
@@ -334,24 +782,25 @@ function buildDriverAssignmentsForMove({ move, managerResources }) {
       endLabel: move.endLabel || "",
       loadId: trip.loadId,
       loadCode: trip.loadCode || "",
-      tripLabel: trip.description || `Load ${trip.loadCode || trip.loadId}`,
+      simpleLoadLabel,
+      tripLabel: simpleLoadLabel,
       tripNumber: index + 1,
-      plannedTripCount: lane.trips.length,
+      plannedTripCount: orderedTrips.length,
       sequence: index + 1,
-      plannedStartMinute: trip.loadStart ?? trip.dispatchStart ?? 0,
-      plannedFinishMinute: trip.rigUpFinish ?? trip.returnToSource ?? trip.arrivalAtDestination ?? 0,
+      plannedStartMinute: rigDownStartMinute,
+      plannedFinishMinute: rigUpFinishMinute,
       stagePlan: {
         rigDown: {
-          startMinute: trip.rigDownStart ?? trip.loadStart ?? 0,
-          finishMinute: trip.rigDownFinish ?? trip.loadStart ?? 0,
+          startMinute: rigDownStartMinute,
+          finishMinute: rigDownFinishMinute,
         },
         rigMove: {
-          startMinute: trip.moveStart ?? trip.pickupLoadFinish ?? trip.rigDownFinish ?? 0,
-          finishMinute: trip.arrivalAtDestination ?? trip.moveFinish ?? trip.returnToSource ?? 0,
+          startMinute: rigMoveStartMinute,
+          finishMinute: rigMoveFinishMinute,
         },
         rigUp: {
-          startMinute: trip.rigUpStart ?? trip.unloadDropFinish ?? trip.arrivalAtDestination ?? 0,
-          finishMinute: trip.rigUpFinish ?? trip.returnToSource ?? trip.arrivalAtDestination ?? 0,
+          startMinute: rigUpStartMinute,
+          finishMinute: rigUpFinishMinute,
         },
       },
       stageDelayNotes: {
@@ -360,6 +809,10 @@ function buildDriverAssignmentsForMove({ move, managerResources }) {
         rigUp: null,
       },
       journeyId: trip.journeyId || null,
+      moveStartedAt: null,
+      outboundArrivedAt: null,
+      returnMoveStartedAt: null,
+      returnedToSourceAt: null,
       stageStatus: {
         rigDownCompleted: false,
         rigMoveCompleted: false,
@@ -371,16 +824,17 @@ function buildDriverAssignmentsForMove({ move, managerResources }) {
         rigUp: null,
       },
       currentStage: "rigDown",
-      status: index === 0 ? "active" : "queued",
+      status: index === 0 ? "foreman" : "queued",
+      taskType: "load",
+      linkedAssignmentId: null,
+      returnForAssignmentId: null,
       assignedAt,
       executionStartedAt: assignedAt,
       updatedAt: assignedAt,
-    }));
-
-    assignmentQueues.set(driver.id, driverAssignments);
+      delayThresholdMinutes: move?.createdBy?.isDemo ? (20 / 60) : 20,
+      isDemoMove: Boolean(move?.createdBy?.isDemo),
+    };
   });
-
-  return [...assignmentQueues.values()].flat();
 }
 
 function getLatestMoveByState(moves, predicate) {
@@ -389,16 +843,26 @@ function getLatestMoveByState(moves, predicate) {
     .sort((a, b) => new Date(b.updatedAt || b.createdAt || 0) - new Date(a.updatedAt || a.createdAt || 0))[0] || null;
 }
 
+function isUsableRigMove(move) {
+  if (!move?.id) {
+    return false;
+  }
+
+  const hasStart = Boolean(move.startPoint || String(move.startLabel || "").trim());
+  const hasEnd = Boolean(move.endPoint || String(move.endLabel || "").trim());
+  return hasStart && hasEnd;
+}
+
 function buildForemanRigContext({ session, visibleMoves, managerScopedMoves, logicalLoads, startupRequirements = [], rigInventoryRevision = 0 }) {
   const assignedRig = session?.assignedRig || null;
   const stableRigId = assignedRig?.id || `rig-${session?.id || "home"}`;
   const latestDrillingMove = getLatestMoveByState(
     visibleMoves,
-    (move) => move?.operatingState === "drilling" || move?.executionState === "completed",
+    (move) => isUsableRigMove(move) && (move?.operatingState === "drilling" || move?.executionState === "completed"),
   );
   const activeMove = getLatestMoveByState(
     visibleMoves,
-    (move) => move?.operatingState !== "drilling" && move?.executionState !== "completed",
+    (move) => isUsableRigMove(move) && move?.operatingState !== "drilling" && move?.executionState !== "completed",
   );
   const currentPoint = latestDrillingMove?.endPoint || assignedRig?.startPoint || null;
   const currentLabel = latestDrillingMove?.endLabel || assignedRig?.startLabel || formatCoordinate(currentPoint);
@@ -457,6 +921,7 @@ function App() {
   const [moves, setMoves] = useState([]);
   const [rigInventoryRevision, setRigInventoryRevision] = useState(0);
   const [areMovesHydrated, setAreMovesHydrated] = useState(false);
+  const [areManagerResourcesHydrated, setAreManagerResourcesHydrated] = useState(false);
   const [isActiveMoveHydrated, setIsActiveMoveHydrated] = useState(false);
   const [createError, setCreateError] = useState("");
   const [isCreatingMove, setIsCreatingMove] = useState(false);
@@ -474,7 +939,7 @@ function App() {
   );
   const [moveSimulationError, setMoveSimulationError] = useState("");
   const [currentMinute, setCurrentMinute] = useState(0);
-  const [playbackSpeed, setPlaybackSpeed] = useState(15000);
+  const [playbackSpeed, setPlaybackSpeed] = useState(DEFAULT_PLAYBACK_SPEED);
   const [isPlaybackRunning, setIsPlaybackRunning] = useState(false);
   const [isPlaybackPaused, setIsPlaybackPaused] = useState(false);
   const [sceneFocusResetKey, setSceneFocusResetKey] = useState(0);
@@ -482,7 +947,7 @@ function App() {
   const [isScenePlaybackReady, setIsScenePlaybackReady] = useState(false);
   const animationFrameRef = useRef(null);
   const animationStartedAtRef = useRef(null);
-  const lastPersistedMinuteRef = useRef(0);
+  const lastPersistedMinuteRef = useRef(null);
   const lastPlaybackUiUpdateRef = useRef(0);
   const lastSavedMoveSessionRef = useRef("");
   const [routeMoveFallback, setRouteMoveFallback] = useState(null);
@@ -529,6 +994,15 @@ function App() {
       setLoadsError("");
 
       try {
+        if (isDemoSession(session)) {
+          if (!cancelled) {
+            setLoads(DEMO_RIG_LOADS);
+            setStartupRequirements([]);
+            setTruckSpecs(DEMO_TRUCK_SPECS);
+          }
+          return;
+        }
+
         const dataset = await fetchLoads();
         if (!cancelled) {
           setLoads(dataset.rigLoads || []);
@@ -551,7 +1025,7 @@ function App() {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [session?.email, session?.isDemo]);
 
   useEffect(() => {
     const animatedNodes = [];
@@ -694,6 +1168,10 @@ function App() {
           null
         )
       : null;
+  const activeMoveRef = useRef(activeMove);
+  useEffect(() => {
+    activeMoveRef.current = activeMove;
+  }, [activeMove]);
   const activeScenario = getActiveScenario(activeMove);
   const activeTotalMinutes = activeScenario?.bestVariant?.totalMinutes || 0;
   const activeExecutionState = activeMove?.executionState || "planning";
@@ -744,11 +1222,13 @@ function App() {
       setManagerResources({ fleet: [], trucks: [], drivers: [], taskAssignments: [] });
       setManagedForemen([]);
       setManagerFleet([]);
+      setAreManagerResourcesHydrated(true);
       setAreMovesHydrated(true);
       return undefined;
     }
 
     setAreMovesHydrated(false);
+    setAreManagerResourcesHydrated(false);
 
     void hydrateMoves(managerId, { summary: true })
       .then((hydratedMoves) => {
@@ -756,6 +1236,16 @@ function App() {
         setAreMovesHydrated(true);
       })
       .catch(() => {});
+
+    void hydrateManagerResources(managerId)
+      .then((hydratedResources) => {
+        setManagerResources(hydratedResources);
+        setManagerFleet(hydratedResources.fleet || readManagerFleet(managerId));
+        setAreManagerResourcesHydrated(true);
+      })
+      .catch(() => {
+        setAreManagerResourcesHydrated(true);
+      });
 
     const unsubscribeMoves = subscribeManagerMoves(managerId, (remoteMoves) => {
       const normalizedMoves = mergeMovesCache(remoteMoves);
@@ -767,7 +1257,7 @@ function App() {
       const normalizedResources = setManagerResourcesCache(managerId, remoteResources || readManagerResources(managerId));
       setManagerResources(normalizedResources);
       setManagerFleet(normalizedResources.fleet || readManagerFleet(managerId));
-      setAreMovesHydrated(true);
+      setAreManagerResourcesHydrated(true);
     });
 
     return () => {
@@ -788,11 +1278,11 @@ function App() {
   }, [managerId]);
 
   useEffect(() => {
-    if (!managerId || !activeMove || activeMove.executionState !== "active") {
+    if (!managerId || !areManagerResourcesHydrated || !activeMove || activeMove.executionState !== "active") {
       return;
     }
 
-    if (moveExecutionAssignments.length || !(managerResources?.drivers || []).length) {
+    if (moveExecutionAssignments.length) {
       return;
     }
 
@@ -812,7 +1302,7 @@ function App() {
         ...recoveredAssignments,
       ],
     });
-  }, [managerId, activeMove?.id, activeMove?.executionState, moveExecutionAssignments.length, managerResources]);
+  }, [managerId, areManagerResourcesHydrated, activeMove?.id, activeMove?.executionState, moveExecutionAssignments.length, managerResources]);
 
   useEffect(() => {
     if (!managerId || !areMovesHydrated) {
@@ -877,6 +1367,97 @@ function App() {
   }, [route.page, route.moveId, activeMove?.id, activeMove?.updatedAt]);
 
   useEffect(() => {
+    if (
+      route.page !== "move" ||
+      !route.moveId ||
+      !activeMoveRef.current ||
+      activeMoveRef.current.executionProgress?.trackingMode !== "demoUltrasonic"
+    ) {
+      return undefined;
+    }
+
+    let cancelled = false;
+
+    const syncDemoMove = async () => {
+      try {
+        const latestMove = await fetchMove(route.moveId);
+        if (!latestMove || cancelled) {
+          return;
+        }
+
+        const currentMove = activeMoveRef.current;
+        const currentLatestCm = currentMove?.executionProgress?.ultrasonicLatestCm;
+        const nextLatestCm = latestMove?.executionProgress?.ultrasonicLatestCm;
+        const currentUpdatedAt = currentMove?.updatedAt || "";
+        const nextUpdatedAt = latestMove?.updatedAt || "";
+
+        if (
+          currentUpdatedAt === nextUpdatedAt &&
+          Number(currentLatestCm) === Number(nextLatestCm)
+        ) {
+          return;
+        }
+
+        const onlyUltrasonicChanged =
+          currentUpdatedAt !== nextUpdatedAt &&
+          currentMove?.simulation &&
+          JSON.stringify(currentMove.simulation) === JSON.stringify(latestMove.simulation) &&
+          JSON.stringify(currentMove.executionAssignments || []) === JSON.stringify(latestMove.executionAssignments || []) &&
+          JSON.stringify(currentMove.stageStatus || {}) === JSON.stringify(latestMove.stageStatus || {}) &&
+          JSON.stringify(currentMove.createdBy || {}) === JSON.stringify(latestMove.createdBy || {}) &&
+          JSON.stringify(currentMove.startPoint || {}) === JSON.stringify(latestMove.startPoint || {}) &&
+          JSON.stringify(currentMove.endPoint || {}) === JSON.stringify(latestMove.endPoint || {}) &&
+          JSON.stringify({
+            trackingMode: currentMove?.executionProgress?.trackingMode,
+            ultrasonicStartCm: currentMove?.executionProgress?.ultrasonicStartCm,
+            ultrasonicArrivalCm: currentMove?.executionProgress?.ultrasonicArrivalCm,
+            executionState: currentMove?.executionState,
+          }) === JSON.stringify({
+            trackingMode: latestMove?.executionProgress?.trackingMode,
+            ultrasonicStartCm: latestMove?.executionProgress?.ultrasonicStartCm,
+            ultrasonicArrivalCm: latestMove?.executionProgress?.ultrasonicArrivalCm,
+            executionState: latestMove?.executionState,
+          });
+
+        if (onlyUltrasonicChanged) {
+          setRouteMoveFallback((current) => (
+            current && String(current.id) === String(latestMove.id)
+              ? {
+                  ...current,
+                  updatedAt: latestMove.updatedAt,
+                  completionPercentage: latestMove.completionPercentage,
+                  executionProgress: latestMove.executionProgress,
+                }
+              : latestMove
+          ));
+          return;
+        }
+
+        setRouteMoveFallback(latestMove);
+        setMoves((current) => {
+          const remaining = current.filter((move) => move.id !== latestMove.id);
+          return [latestMove, ...remaining];
+        });
+      } catch {
+        // Keep the current move state if the fast demo sync misses.
+      }
+    };
+
+    const intervalId = window.setInterval(syncDemoMove, DEMO_SENSOR_SYNC_INTERVAL_MS);
+    void syncDemoMove();
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(intervalId);
+    };
+  }, [
+    route.page,
+    route.moveId,
+    activeMove?.id,
+    activeMove?.executionProgress?.trackingMode,
+  ]);
+
+  useEffect(() => {
     if (route.page !== "move" || !route.moveId || !activeMove) {
       return;
     }
@@ -920,7 +1501,9 @@ function App() {
     }
 
     const restoredMinute = Math.min(activeMove.progressMinute || 0, activeTotalMinutes || activeMove.progressMinute || 0);
-    const restoredSpeed = Number(activeMove.playbackSpeed) || 15000;
+    const restoredSpeed =
+      Number(activeMove.playbackSpeed) ||
+      (activeMove?.createdBy?.isDemo ? NORMAL_PLAYBACK_SPEED : DEFAULT_PLAYBACK_SPEED);
 
     setCurrentMinute(restoredMinute);
     lastPersistedMinuteRef.current = restoredMinute;
@@ -936,8 +1519,9 @@ function App() {
     }
 
     const flushMoveSession = (minuteOverride = lastPersistedMinuteRef.current) => {
-      const nextMinute = Math.max(0, Math.min(Math.round(minuteOverride || 0), activeTotalMinutes || Math.round(minuteOverride || 0)));
-      const nextSpeed = Number(playbackSpeed) || 15000;
+      const resolvedMinute = Number.isFinite(Number(minuteOverride)) ? Number(minuteOverride) : 0;
+      const nextMinute = Math.max(0, Math.min(Math.round(resolvedMinute), activeTotalMinutes || Math.round(resolvedMinute)));
+      const nextSpeed = Number(playbackSpeed) || (activeMove?.createdBy?.isDemo ? NORMAL_PLAYBACK_SPEED : DEFAULT_PLAYBACK_SPEED);
       const nextCompletion = activeTotalMinutes > 0 ? Math.min(100, Math.max(0, (nextMinute / activeTotalMinutes) * 100)) : 0;
       const nextSnapshot = `${activeMove.id}:${nextMinute}:${nextSpeed}`;
 
@@ -986,12 +1570,21 @@ function App() {
     let cancelled = false;
 
     async function ensureMovePlans() {
+      const isDemoMove =
+        Boolean(activeMove?.createdBy?.isDemo) ||
+        activeMove?.executionProgress?.trackingMode === "demoUltrasonic";
       const needsRouteRefresh =
         activeMove?.routeMode !== "live" ||
         (activeMove?.simulation?.routeGeometry?.length || 0) < 3;
       const needsPlanRefresh = activeMove ? !hasMultiTruckPlans(activeMove) : false;
 
-      if (route.page !== "move" || !activeMove || !logicalLoads.length || (!needsPlanRefresh && !needsRouteRefresh)) {
+      if (
+        route.page !== "move" ||
+        !activeMove ||
+        !logicalLoads.length ||
+        isDemoMove ||
+        (!needsPlanRefresh && !needsRouteRefresh)
+      ) {
         return;
       }
 
@@ -1044,10 +1637,10 @@ function App() {
       return undefined;
     }
 
-    const startingMinute = Math.min(
-      lastPersistedMinuteRef.current || activeMove.progressMinute || 0,
-      activeTotalMinutes,
-    );
+    const persistedMinute = Number.isFinite(Number(lastPersistedMinuteRef.current))
+      ? Number(lastPersistedMinuteRef.current)
+      : Number(activeMove.progressMinute) || 0;
+    const startingMinute = Math.min(Math.max(0, persistedMinute), activeTotalMinutes);
 
     setCurrentMinute(startingMinute);
     lastPersistedMinuteRef.current = startingMinute;
@@ -1069,7 +1662,7 @@ function App() {
       lastPersistedMinuteRef.current = nextMinute;
       if (
         lastPlaybackUiUpdateRef.current === 0 ||
-        (timestamp - lastPlaybackUiUpdateRef.current) >= 80 ||
+        (timestamp - lastPlaybackUiUpdateRef.current) >= 33 ||
         nextMinute >= activeTotalMinutes
       ) {
         lastPlaybackUiUpdateRef.current = timestamp;
@@ -1081,7 +1674,9 @@ function App() {
       } else {
         animationFrameRef.current = null;
         animationStartedAtRef.current = null;
+        lastPersistedMinuteRef.current = 0;
         lastPlaybackUiUpdateRef.current = 0;
+        setCurrentMinute(activeTotalMinutes);
         setIsPlaybackRunning(false);
         setIsPlaybackPaused(false);
       }
@@ -1121,31 +1716,13 @@ function App() {
       return;
     }
 
-    const availableTruckSetup = DEFAULT_TRUCK_SETUP.map((defaultTruck) => {
-      const matched = availableFleet.find(
-        (truck) => normalizeTruckTypeKey(truck.type) === normalizeTruckTypeKey(defaultTruck.type),
-      );
-      if (!matched?.available) {
-        return null;
-      }
-
-      return {
-        id: matched.id,
-        type: matched.type,
-        count: Math.min(matched.available, Math.max(1, Number.parseInt(defaultTruck.count, 10) || 1)),
-      };
-    }).filter(Boolean);
-
-    if (!sumTruckCounts(availableTruckSetup) && availableFleet.some((truck) => truck.available > 0)) {
-      const firstAvailableTruck = availableFleet.find((truck) => truck.available > 0);
-      if (firstAvailableTruck) {
-        availableTruckSetup.push({
-          id: firstAvailableTruck.id,
-          type: firstAvailableTruck.type,
-          count: 1,
-        });
-      }
-    }
+    const availableTruckSetup = (availableFleet || [])
+      .map((truck) => ({
+        id: truck.id,
+        type: truck.type,
+        count: Math.max(0, Number.parseInt(truck.available, 10) || 0),
+      }))
+      .filter((truck) => truck.type && truck.count > 0);
 
     if (!sumTruckCounts(availableTruckSetup)) {
       setCreateError("No trucks are currently available in the manager fleet for a new rig move.");
@@ -1202,7 +1779,7 @@ function App() {
       setIsScenePlaybackReady(false);
       const nextMoves = await upsertMove(move);
       setMoves(nextMoves);
-      setPlaybackSpeed(15000);
+      setPlaybackSpeed(move?.createdBy?.isDemo ? NORMAL_PLAYBACK_SPEED : DEFAULT_PLAYBACK_SPEED);
       setIsPlaybackRunning(false);
       setIsPlaybackPaused(false);
       setSimulationProgress(
@@ -1227,7 +1804,179 @@ function App() {
     }
   }
 
+  async function buildDemoMoveWithSimpleSchedule({
+    name,
+    startPoint,
+    endPoint,
+    startLabel: providedStartLabel,
+    endLabel: providedEndLabel,
+    logicalLoads,
+    truckSetup,
+    previousMove,
+  }) {
+    const routeData = (() => fallbackRouteData(startPoint, endPoint))();
+    let resolvedRouteData = routeData;
+    let routeMode = "estimated";
+    let startLabel = providedStartLabel || previousMove?.startLabel || formatCoordinate(startPoint);
+    let endLabel = providedEndLabel || previousMove?.endLabel || formatCoordinate(endPoint);
+
+    try {
+      resolvedRouteData = await fetchRouteData(startPoint, endPoint);
+      routeMode = "live";
+    } catch {
+      resolvedRouteData = routeData;
+    }
+
+    const shouldResolveStartLabel = !startLabel || isCoordinateLabel(startLabel);
+    const shouldResolveEndLabel = !endLabel || isCoordinateLabel(endLabel);
+    if (shouldResolveStartLabel || shouldResolveEndLabel) {
+      try {
+        const [nextStartLabel, nextEndLabel] = await Promise.all([
+          shouldResolveStartLabel ? fetchLocationLabel(startPoint) : Promise.resolve(null),
+          shouldResolveEndLabel ? fetchLocationLabel(endPoint) : Promise.resolve(null),
+        ]);
+        startLabel = nextStartLabel || startLabel;
+        endLabel = nextEndLabel || endLabel;
+      } catch {
+        // Keep coordinate fallback labels when reverse geocoding is unavailable.
+      }
+    }
+
+    const normalizedTruckSetup = (truckSetup || [])
+      .map((item) => ({
+        ...item,
+        type: normalizePlannerTruckType(item.type),
+        count: Math.max(0, Number.parseInt(item.count, 10) || 0),
+        hourlyCost: Math.max(0, Number(item.hourlyCost) || 0),
+      }))
+      .filter((item) => item.type && item.count > 0);
+    const lowBedTruck =
+      normalizedTruckSetup.find((truck) => normalizePlannerTruckType(truck.type) === "Low-bed") ||
+      normalizedTruckSetup[0] ||
+      { id: "demo-low-bed", type: "Low-bed", count: 1, hourlyCost: 95 };
+    const demoLoads = (logicalLoads || DEMO_RIG_LOADS).slice(0, 2);
+    const playback = buildSimpleDemoPlayback({
+      loads: demoLoads,
+      routeGeometry: resolvedRouteData.geometry || [],
+      startLabel,
+      endLabel,
+      truckType: lowBedTruck.type || "Low-bed",
+      truckId: `${lowBedTruck.id || "demo-low-bed"}-1`,
+    });
+    const bestPlan = {
+      name: "Demo schedule",
+      routeMinutes: 4,
+      processingMinutes: Math.max(0, playback.totalMinutes - 4),
+      totalMinutes: playback.totalMinutes,
+      playback,
+    };
+    const bestScenario = {
+      name: "Demo schedule",
+      truckCount: 1,
+      capacity: 1,
+      routeDistanceKm: resolvedRouteData.distanceKm,
+      routeMinutes: 4,
+      routeSource: resolvedRouteData.source,
+      routeGeometry: resolvedRouteData.geometry || [],
+      totalMinutes: playback.totalMinutes,
+      truckSetup: [lowBedTruck],
+      allocatedTruckSetup: [lowBedTruck],
+      usedTruckSetup: [{ id: lowBedTruck.id, type: lowBedTruck.type, count: 1, hourlyCost: lowBedTruck.hourlyCost || 95 }],
+      allocatedTruckCount: 1,
+      utilization: 100,
+      truckUtilization: 100,
+      idleMinutes: 0,
+      costEstimate: Math.round(((lowBedTruck.hourlyCost || 95) * playback.totalMinutes) / 60),
+      bestVariant: bestPlan,
+    };
+    const simulation = {
+      startPoint,
+      endPoint,
+      truckCount: 1,
+      truckSetup: [lowBedTruck],
+      routeDistanceKm: resolvedRouteData.distanceKm,
+      routeMinutes: 4,
+      routeSource: resolvedRouteData.source,
+      routeGeometry: resolvedRouteData.geometry || [],
+      supportRoutes: [],
+      preferredScenarioName: bestScenario.name,
+      scenarioPlans: [bestScenario],
+      bestScenario,
+      bestPlan,
+    };
+
+    if (!previousMove) {
+      return createMoveRecord({
+        name,
+        startPoint,
+        endPoint,
+        startLabel,
+        endLabel,
+        routeMode,
+        loadCount: demoLoads.length,
+        simulation,
+        createdBy: session
+          ? {
+              id: session.id,
+              name: session.name,
+              role: session.role,
+              managerId: session.managerId || null,
+              isDemo: Boolean(session.isDemo),
+            }
+          : null,
+      });
+    }
+
+    return {
+      ...previousMove,
+      name,
+      updatedAt: new Date().toISOString(),
+      routeMode,
+      loadCount: demoLoads.length,
+      startLabel,
+      endLabel,
+      truckSetup: [lowBedTruck],
+      routeKm: resolvedRouteData.distanceKm,
+      eta: formatMinutes(bestPlan.totalMinutes),
+      routeTime: formatMinutes(4),
+      progressMinute: previousMove.progressMinute || 0,
+      completionPercentage: previousMove.completionPercentage || 0,
+      playbackSpeed: previousMove.playbackSpeed || NORMAL_PLAYBACK_SPEED,
+      planningStartDate: previousMove.planningStartDate || new Date().toISOString().slice(0, 10),
+      planningStartTime: previousMove.planningStartTime || "06:00",
+      simulation,
+    };
+  }
+
   async function buildMoveWithSimulation({ name, startPoint, endPoint, startLabel: providedStartLabel, endLabel: providedEndLabel, loadCount, logicalLoads, truckSetup, previousMove, availability = [], scenarioTruckSetup = null, enforceExactFleet = false, onProgress = null }) {
+    if (isDemoSession(session)) {
+      onProgress?.({
+        percent: 20,
+        message: "Preparing demo schedule",
+        detail: "Stage 1 of 2. Building the fixed two-load demo plan.",
+        completedStages: 1,
+        totalStages: 2,
+      });
+      const demoMove = await buildDemoMoveWithSimpleSchedule({
+        name,
+        startPoint,
+        endPoint,
+        startLabel: providedStartLabel,
+        endLabel: providedEndLabel,
+        logicalLoads,
+        truckSetup,
+        previousMove,
+      });
+      onProgress?.({
+        percent: 100,
+        message: "Demo schedule ready",
+        detail: "Stage 2 of 2. The demo move was created without the production planner.",
+        completedStages: 2,
+        totalStages: 2,
+      });
+      return demoMove;
+    }
+
     const availabilityByType = new Map(
       (availability || []).map((item) => [String(item.type || "").trim().toLowerCase(), item]),
     );
@@ -1316,6 +2065,7 @@ function App() {
               name: session.name,
               role: session.role,
               managerId: session.managerId || null,
+              isDemo: Boolean(session.isDemo),
             }
           : null,
       };
@@ -1399,6 +2149,14 @@ function App() {
         hourlyCost: Math.max(0, Number(item.hourlyCost) || 0),
       }))
       .filter((item) => item.type && item.count > 0);
+    const missingTruckCoverage = getMissingTruckCoverage(planningLoads, normalizedScenarioTruckSetup);
+    if (missingTruckCoverage) {
+      throw new Error(
+        `Selected truck setup cannot serve ${missingTruckCoverage.loadCode}. Required: ${missingTruckCoverage.requiredTypes.join(" / ")}. Current setup: ${
+          normalizedScenarioTruckSetup.map((truck) => `${truck.type} x${truck.count}`).join(", ") || "None"
+        }.`,
+      );
+    }
     const scenarioPlans = await buildScenarioPlans(planningLoads, routeData, planningCrewBaseline, truckCount, normalizedScenarioTruckSetup, truckSpecs, {
       dayShift: planningCrewBaseline,
       nightShift: planningCrewBaseline,
@@ -1457,6 +2215,7 @@ function App() {
               name: session.name,
               role: session.role,
               managerId: session.managerId || null,
+              isDemo: Boolean(session.isDemo),
             }
           : null,
       });
@@ -1476,7 +2235,7 @@ function App() {
       routeTime: formatMinutes(routeData.minutes),
       progressMinute: previousMove.progressMinute || 0,
       completionPercentage: previousMove.completionPercentage || 0,
-      playbackSpeed: previousMove.playbackSpeed || 15000,
+      playbackSpeed: previousMove.playbackSpeed || DEFAULT_PLAYBACK_SPEED,
       planningStartDate: previousMove.planningStartDate || new Date().toISOString().slice(0, 10),
       planningStartTime: previousMove.planningStartTime || "06:00",
       simulation,
@@ -1540,6 +2299,7 @@ function App() {
         truckSetup,
         previousMove: targetMove,
         availability: moveAvailability,
+        scenarioTruckSetup: moveAvailability,
         enforceExactFleet,
         onProgress: ({
           percent = 0,
@@ -1569,7 +2329,7 @@ function App() {
       setCurrentMinute(0);
       lastPersistedMinuteRef.current = 0;
       lastPlaybackUiUpdateRef.current = 0;
-      setPlaybackSpeed(15000);
+      setPlaybackSpeed(updatedMove?.createdBy?.isDemo ? NORMAL_PLAYBACK_SPEED : DEFAULT_PLAYBACK_SPEED);
       setIsPlaybackRunning(false);
       setIsPlaybackPaused(false);
       setSimulationProgress(
@@ -1644,6 +2404,13 @@ function App() {
     const targetMove = visibleMoves.find((move) => move.id === moveId);
     if (!targetMove) {
       return;
+    }
+
+    if (managerId) {
+      await handleSaveManagerResources({
+        ...(managerResources || {}),
+        taskAssignments: (managerResources?.taskAssignments || []).filter((assignment) => assignment.moveId !== moveId),
+      });
     }
 
     navigateTo("/dashboard");
@@ -1734,23 +2501,257 @@ function App() {
     return updatedMove;
   }
 
+  async function handleDriverMoveAction({ assignmentId, action }) {
+    if (!managerId || !session?.id || session.role !== "Driver") {
+      return;
+    }
+
+    const targetAssignment = (managerResources?.taskAssignments || []).find((assignment) => {
+      if (assignment.id !== assignmentId) {
+        return false;
+      }
+
+      const allowedDriverIds = new Set(
+        [
+          session.id,
+          ...(managerResources?.drivers || [])
+            .filter((driver) => String(driver.email || "").trim().toLowerCase() === String(session.email || "").trim().toLowerCase())
+            .map((driver) => driver.id),
+        ].filter(Boolean),
+      );
+      return allowedDriverIds.has(assignment.driverId);
+    });
+    if (!targetAssignment) {
+      return;
+    }
+
+    const driverMoveState = getDriverMoveState(targetAssignment);
+    const isReturnTask = targetAssignment.taskType === "return";
+    const targetMove = moves.find((move) => String(move?.id) === String(targetAssignment.moveId)) || null;
+    const sensorProgress = getAssignmentSensorProgress(targetMove, targetAssignment);
+    const startDistanceCm = Math.max(0, Number(targetMove?.executionProgress?.ultrasonicStartCm) || 45);
+    const arrivalDistanceCm = Math.min(startDistanceCm, Math.max(0, Number(targetMove?.executionProgress?.ultrasonicArrivalCm) || 8));
+    if (
+      targetAssignment.status !== "active" ||
+      driverMoveState === "returned" ||
+      (!isReturnTask && !targetAssignment.stageStatus?.rigDownCompleted)
+    ) {
+      return;
+    }
+
+    if (
+      action === "arrived" &&
+      sensorProgress.enabled &&
+      ((sensorProgress.progressPercent ?? -1) < 100)
+    ) {
+      return;
+    }
+
+    const timestamp = new Date().toISOString();
+    let shouldCreateReturnAssignment = false;
+    const nextTaskAssignments = (managerResources?.taskAssignments || []).map((assignment) => {
+      if (assignment.id !== assignmentId) {
+        return assignment;
+      }
+
+      const nextDriverMoveState = getDriverMoveState(assignment);
+
+      if (action === "startMove") {
+        if (nextDriverMoveState !== "readyOutbound") {
+          return assignment;
+        }
+        return {
+          ...assignment,
+          moveStartedAt: assignment.moveStartedAt || timestamp,
+          updatedAt: timestamp,
+        };
+      }
+
+      if (action === "startReturn") {
+        const canStartReturn =
+          (assignment.taskType === "return" && nextDriverMoveState === "readyOutbound") ||
+          (assignment.taskType !== "return" && nextDriverMoveState === "readyReturn");
+        if (!canStartReturn) {
+          return assignment;
+        }
+        return {
+          ...assignment,
+          ...(assignment.taskType === "return"
+            ? { moveStartedAt: assignment.moveStartedAt || timestamp }
+            : { returnMoveStartedAt: assignment.returnMoveStartedAt || timestamp }),
+          updatedAt: timestamp,
+        };
+      }
+
+      if (action === "arrived") {
+        if (nextDriverMoveState === "movingOutbound") {
+          if (assignment.taskType === "return") {
+            return {
+              ...assignment,
+              stageStatus: {
+                ...(assignment.stageStatus || {}),
+                rigMoveCompleted: true,
+              },
+              stageCompletedAt: {
+                rigDown: assignment.stageCompletedAt?.rigDown || null,
+                rigMove: assignment.stageCompletedAt?.rigMove || timestamp,
+                rigUp: assignment.stageCompletedAt?.rigUp || timestamp,
+              },
+              outboundArrivedAt: assignment.outboundArrivedAt || timestamp,
+              returnedToSourceAt: assignment.returnedToSourceAt || timestamp,
+              currentStage: "completed",
+              status: "completed",
+              updatedAt: timestamp,
+            };
+          }
+
+          if (assignment.taskType !== "return") {
+            shouldCreateReturnAssignment = true;
+          }
+          return {
+            ...assignment,
+            stageStatus: {
+              ...(assignment.stageStatus || {}),
+              rigMoveCompleted: true,
+            },
+            stageCompletedAt: {
+              rigDown: assignment.stageCompletedAt?.rigDown || null,
+              rigMove: assignment.stageCompletedAt?.rigMove || timestamp,
+              rigUp: assignment.stageCompletedAt?.rigUp || null,
+            },
+            outboundArrivedAt: assignment.outboundArrivedAt || timestamp,
+            currentStage: "rigUp",
+            status: "foreman",
+            updatedAt: timestamp,
+          };
+        }
+
+        if (nextDriverMoveState !== "movingReturn") {
+          return assignment;
+        }
+
+        return {
+          ...assignment,
+          stageStatus: {
+            ...(assignment.stageStatus || {}),
+            rigMoveCompleted: true,
+          },
+          stageCompletedAt: {
+            rigDown: assignment.stageCompletedAt?.rigDown || null,
+            rigMove: assignment.stageCompletedAt?.rigMove || timestamp,
+            rigUp: assignment.stageCompletedAt?.rigUp || null,
+          },
+          moveStartedAt: assignment.moveStartedAt || timestamp,
+          outboundArrivedAt: assignment.outboundArrivedAt || assignment.moveStartedAt || timestamp,
+          returnMoveStartedAt: assignment.returnMoveStartedAt || timestamp,
+          returnedToSourceAt: assignment.returnMoveStartedAt ? (assignment.returnedToSourceAt || timestamp) : timestamp,
+          currentStage: "completed",
+          status: "completed",
+          updatedAt: timestamp,
+        };
+      }
+
+      return assignment;
+    });
+
+    if (shouldCreateReturnAssignment) {
+      const hasExistingReturnTask = nextTaskAssignments.some((assignment) => assignment.returnForAssignmentId === assignmentId);
+      const originalAssignment = nextTaskAssignments.find((assignment) => assignment.id === assignmentId);
+      if (!hasExistingReturnTask && originalAssignment) {
+        nextTaskAssignments.push(createReturnAssignmentFromLoad(originalAssignment, timestamp));
+      }
+    }
+
+    if (action === "arrived") {
+      const completedAssignment = nextTaskAssignments.find((assignment) => assignment.id === assignmentId);
+      if (completedAssignment?.status === "completed" && completedAssignment?.taskType === "return") {
+        const nextQueuedAssignment = nextTaskAssignments
+          .filter(
+            (assignment) =>
+              assignment.taskType !== "return" &&
+              assignment.moveId === completedAssignment.moveId &&
+              assignment.status === "queued",
+          )
+          .sort((left, right) => left.sequence - right.sequence)[0];
+
+        if (nextQueuedAssignment) {
+          for (let index = 0; index < nextTaskAssignments.length; index += 1) {
+            if (nextTaskAssignments[index].id === nextQueuedAssignment.id) {
+              nextTaskAssignments[index] = {
+                ...nextQueuedAssignment,
+                status: "foreman",
+                updatedAt: new Date().toISOString(),
+              };
+              break;
+            }
+          }
+        }
+      }
+    }
+
+    await handleSaveManagerResources({
+      ...managerResources,
+      taskAssignments: nextTaskAssignments,
+    });
+
+    if (action === "startMove" || action === "startReturn") {
+      updateMoveExecutionProgress(targetAssignment.moveId, {
+        ultrasonicLatestCm: startDistanceCm,
+        ultrasonicLastUpdatedAt: timestamp,
+      });
+    }
+
+    if (action === "arrived") {
+      updateMoveExecutionProgress(targetAssignment.moveId, {
+        ultrasonicLatestCm: arrivalDistanceCm,
+        ultrasonicLastUpdatedAt: timestamp,
+      });
+    }
+
+    if (action === "arrived") {
+      const moveAssignments = nextTaskAssignments.filter((assignment) => assignment.moveId === targetAssignment.moveId && assignment.taskType !== "return");
+      const patch = {};
+      if (moveAssignments.length && moveAssignments.every((assignment) => assignment.stageStatus?.rigMoveCompleted)) {
+        patch.rigMoveCompleted = true;
+      }
+      if (Object.keys(patch).length) {
+        updateMoveExecutionProgress(targetAssignment.moveId, patch);
+      }
+    }
+  }
+
   async function handleDriverStageComplete({ assignmentId, stage, delayReason = "" }) {
     if (!managerId || !session?.id) {
       return;
     }
 
-    const allowedDriverIds = new Set(
-      [
-        session.id,
-        ...(managerResources?.drivers || [])
-          .filter((driver) => String(driver.email || "").trim().toLowerCase() === String(session.email || "").trim().toLowerCase())
-          .map((driver) => driver.id),
-      ].filter(Boolean),
-    );
-    const targetAssignment = (managerResources?.taskAssignments || []).find(
-      (assignment) => assignment.id === assignmentId && allowedDriverIds.has(assignment.driverId),
-    );
+    const targetAssignment = (managerResources?.taskAssignments || []).find((assignment) => {
+      if (assignment.id !== assignmentId) {
+        return false;
+      }
+
+      if (session.role !== "Driver") {
+        return true;
+      }
+
+      const allowedDriverIds = new Set(
+        [
+          session.id,
+          ...(managerResources?.drivers || [])
+            .filter((driver) => String(driver.email || "").trim().toLowerCase() === String(session.email || "").trim().toLowerCase())
+            .map((driver) => driver.id),
+        ].filter(Boolean),
+      );
+      return allowedDriverIds.has(assignment.driverId);
+    });
     if (!targetAssignment) {
+      return;
+    }
+
+    if (session.role === "Driver" && stage !== "rigMove") {
+      return;
+    }
+    if (session.role !== "Driver" && stage === "rigMove") {
       return;
     }
 
@@ -1763,7 +2764,8 @@ function App() {
       assignment: targetAssignment,
       stage,
     });
-    if (projectedLateMinutes > 20 && !String(delayReason || "").trim()) {
+    const delayThresholdMinutes = getAssignmentDelayThresholdMinutes(targetAssignment);
+    if (projectedLateMinutes > delayThresholdMinutes && !String(delayReason || "").trim()) {
       return;
     }
 
@@ -1797,7 +2799,7 @@ function App() {
         },
         stageDelayNotes: {
           ...(assignment.stageDelayNotes || {}),
-          ...(lateMinutes > 20
+          ...(lateMinutes > delayThresholdMinutes
             ? {
                 [stage]: {
                   reason: String(delayReason || "").trim(),
@@ -1813,15 +2815,15 @@ function App() {
       };
     });
 
-    const completedAssignment = nextTaskAssignments.find((assignment) => assignment.id === assignmentId);
-    if (completedAssignment?.status === "completed") {
-      const nextQueuedAssignment = nextTaskAssignments
-        .filter(
-          (assignment) =>
-            assignment.moveId === completedAssignment.moveId &&
-            assignment.driverId === completedAssignment.driverId &&
-            assignment.status === "queued",
-        )
+      const completedAssignment = nextTaskAssignments.find((assignment) => assignment.id === assignmentId);
+      if (completedAssignment?.status === "completed") {
+        const nextQueuedAssignment = nextTaskAssignments
+          .filter(
+            (assignment) =>
+              assignment.taskType !== "return" &&
+              assignment.moveId === completedAssignment.moveId &&
+              assignment.status === "queued",
+          )
         .sort((left, right) => left.sequence - right.sequence)[0];
 
       if (nextQueuedAssignment) {
@@ -1829,7 +2831,7 @@ function App() {
           if (nextTaskAssignments[index].id === nextQueuedAssignment.id) {
             nextTaskAssignments[index] = {
               ...nextQueuedAssignment,
-              status: "active",
+              status: "foreman",
               updatedAt: new Date().toISOString(),
             };
             break;
@@ -1935,9 +2937,17 @@ function App() {
   }
 
   function handleRunSelectedPlan() {
+    if (animationFrameRef.current !== null) {
+      window.cancelAnimationFrame(animationFrameRef.current);
+    }
+    animationFrameRef.current = null;
+    lastPersistedMinuteRef.current = 0;
+    lastPlaybackUiUpdateRef.current = 0;
+    setCurrentMinute(0);
     setIsPlaybackRunning(false);
     setIsPlaybackPaused(false);
     animationStartedAtRef.current = null;
+    setSceneFocusResetKey((value) => value + 1);
     window.requestAnimationFrame(() => {
       setIsPlaybackRunning(true);
     });
@@ -1953,8 +2963,16 @@ function App() {
       return;
     }
 
+    if (animationFrameRef.current !== null) {
+      window.cancelAnimationFrame(animationFrameRef.current);
+    }
+    animationFrameRef.current = null;
+    lastPersistedMinuteRef.current = 0;
+    lastPlaybackUiUpdateRef.current = 0;
+    setCurrentMinute(0);
     animationStartedAtRef.current = null;
     setIsPlaybackPaused(false);
+    setSceneFocusResetKey((value) => value + 1);
     window.requestAnimationFrame(() => {
       setIsPlaybackRunning(true);
     });
@@ -2102,9 +3120,11 @@ function App() {
     if (session.role === "Driver") {
       return h(DriverDashboardPage, {
         assignments: driverAssignments,
+        moves: visibleMoves,
         currentUser: session,
         currentDate: new Date(),
         onCompleteStage: handleDriverStageComplete,
+        onMoveAction: handleDriverMoveAction,
         onLogout: handleLogout,
         language,
         onToggleLanguage: handleToggleLanguage,
@@ -2156,9 +3176,11 @@ function App() {
     if (session.role === "Driver") {
       return h(DriverDashboardPage, {
         assignments: driverAssignments,
+        moves: visibleMoves,
         currentUser: session,
         currentDate: new Date(),
         onCompleteStage: handleDriverStageComplete,
+        onMoveAction: handleDriverMoveAction,
         onLogout: handleLogout,
         language,
         onToggleLanguage: handleToggleLanguage,
@@ -2220,6 +3242,7 @@ function App() {
       onEndPlayback: handleEndPlayback,
       onStartExecution: handleStartExecution,
       onUpdateExecutionProgress: updateMoveExecutionProgress,
+      onCompleteAssignmentStage: handleDriverStageComplete,
       onDeleteMove: handleDeleteMove,
       onBack: () => navigateTo("/dashboard"),
       onLogout: handleLogout,

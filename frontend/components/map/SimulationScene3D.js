@@ -2,7 +2,7 @@ import { React, h } from "../../lib/react.js";
 import * as THREE from "https://esm.sh/three@0.179.1";
 import { OrbitControls } from "https://esm.sh/three@0.179.1/examples/jsm/controls/OrbitControls.js";
 import { GLTFLoader } from "https://esm.sh/three@0.179.1/examples/jsm/loaders/GLTFLoader.js";
-import { getTruckStatus, haversineKilometers } from "../../features/rigMoves/simulation.js";
+import { getTruckDelayState, getTruckRoadHoldState, getTruckStatus, haversineKilometers } from "../../features/rigMoves/simulation.js";
 
 const { useEffect, useRef } = React;
 const assetLoader = new GLTFLoader();
@@ -210,6 +210,37 @@ function getTruckVariantRoadOffset(truckType) {
   return 4;
 }
 
+function formatSceneMinuteLabel(minutes, fallback = "--") {
+  if (!Number.isFinite(Number(minutes))) {
+    return fallback;
+  }
+
+  const totalSeconds = Math.max(0, Math.round(Number(minutes) * 60));
+  const wholeMinutes = Math.floor(totalSeconds / 60);
+  const remainingSeconds = totalSeconds % 60;
+  return `${wholeMinutes} min ${remainingSeconds} sec`;
+}
+
+function formatSceneDelayLabel(minutes, fallback = "On time") {
+  if (!Number.isFinite(Number(minutes))) {
+    return fallback;
+  }
+
+  const safeMinutes = Math.max(0, Number(minutes));
+  if (safeMinutes <= 0) {
+    return fallback;
+  }
+
+  const totalSeconds = Math.round(safeMinutes * 60);
+  if (safeMinutes < 1) {
+    return `${totalSeconds} sec`;
+  }
+
+  const wholeMinutes = Math.floor(totalSeconds / 60);
+  const remainingSeconds = totalSeconds % 60;
+  return remainingSeconds > 0 ? `${wholeMinutes} min ${remainingSeconds} sec` : `${wholeMinutes} min`;
+}
+
 function tintModel(root, color) {
   const tint = new THREE.Color(color);
   root.traverse((child) => {
@@ -273,6 +304,41 @@ function addAccentLines(root, color, opacity = 0.72) {
     edgeLines.userData = { accentLines: true };
     child.add(edgeLines);
   });
+}
+
+function addTruckDelayOverlayMeshes(root) {
+  const overlays = [];
+  const sourceMeshes = [];
+  root.traverse((child) => {
+    if (child.isMesh && child.geometry && !child.userData?.isDelayOverlay) {
+      sourceMeshes.push(child);
+    }
+  });
+
+  sourceMeshes.forEach((child) => {
+    const overlayMesh = new THREE.Mesh(
+      child.geometry,
+      new THREE.MeshBasicMaterial({
+        color: 0xff2a2a,
+        transparent: true,
+        opacity: 0.52,
+        depthWrite: false,
+        polygonOffset: true,
+        polygonOffsetFactor: -2,
+        polygonOffsetUnits: -2,
+        side: THREE.DoubleSide,
+      }),
+    );
+    overlayMesh.userData.isDelayOverlay = true;
+    overlayMesh.visible = false;
+    overlayMesh.renderOrder = 8;
+    overlayMesh.position.set(0, 0, 0);
+    overlayMesh.rotation.set(0, 0, 0);
+    overlayMesh.scale.setScalar(1.003);
+    child.add(overlayMesh);
+    overlays.push(overlayMesh);
+  });
+  root.userData.delayOverlays = overlays;
 }
 
 function applyTerrainVertexColors(mesh, baseColor, topShadow, topHighlight) {
@@ -716,14 +782,21 @@ function interpolateWorldPath(pathMetrics, ratio, y = 0) {
   return points[points.length - 1].clone().setY(y);
 }
 
+function getRoadLampEndClearance(totalLength = 0) {
+  return Math.min(Math.max(24, totalLength * 0.17), totalLength * 0.28);
+}
+
 function interpolateWorldPathWithEndpointOffset(pathMetrics, ratio, endpointOffset = 0, y = 0) {
   const totalLength = pathMetrics?.totalLength || 0;
   if (totalLength <= 0.0001) {
     return interpolateWorldPath(pathMetrics, ratio, y);
   }
 
-  const normalizedOffset = Math.max(0, Math.min(0.45, endpointOffset / totalLength));
-  const adjustedRatio = normalizedOffset + ((1 - (normalizedOffset * 2)) * Math.max(0, Math.min(1, ratio)));
+  // Keep a small lead-in for the truck body, but let 100% reach the real end of the lane.
+  const startOffset = Math.max(0, endpointOffset);
+  const endOffset = 0;
+  const usableLength = Math.max(totalLength - startOffset - endOffset, 0.0001);
+  const adjustedRatio = (startOffset + (usableLength * Math.max(0, Math.min(1, ratio)))) / totalLength;
   return interpolateWorldPath(pathMetrics, adjustedRatio, y);
 }
 
@@ -931,6 +1004,57 @@ function createTruckFallbackMesh(accentColor) {
   });
 
   return truck;
+}
+
+function createStatusLabelSprite(label, backgroundColor = "#ef4444") {
+  const canvas = document.createElement("canvas");
+  canvas.width = 256;
+  canvas.height = 96;
+  const context = canvas.getContext("2d");
+  if (!context) {
+    return null;
+  }
+
+  context.clearRect(0, 0, canvas.width, canvas.height);
+  context.fillStyle = backgroundColor;
+  context.strokeStyle = "rgba(255, 235, 235, 0.95)";
+  context.lineWidth = 4;
+
+  const radius = 22;
+  const x = 10;
+  const y = 10;
+  const width = canvas.width - 20;
+  const height = canvas.height - 20;
+  context.beginPath();
+  context.moveTo(x + radius, y);
+  context.lineTo(x + width - radius, y);
+  context.quadraticCurveTo(x + width, y, x + width, y + radius);
+  context.lineTo(x + width, y + height - radius);
+  context.quadraticCurveTo(x + width, y + height, x + width - radius, y + height);
+  context.lineTo(x + radius, y + height);
+  context.quadraticCurveTo(x, y + height, x, y + height - radius);
+  context.lineTo(x, y + radius);
+  context.quadraticCurveTo(x, y, x + radius, y);
+  context.closePath();
+  context.fill();
+  context.stroke();
+
+  context.fillStyle = "#fff7f7";
+  context.font = "700 30px Space Grotesk, sans-serif";
+  context.textAlign = "center";
+  context.textBaseline = "middle";
+  context.fillText(label, canvas.width / 2, canvas.height / 2 + 2);
+
+  const texture = new THREE.CanvasTexture(canvas);
+  texture.needsUpdate = true;
+  const material = new THREE.SpriteMaterial({
+    map: texture,
+    transparent: true,
+    depthWrite: false,
+  });
+  const sprite = new THREE.Sprite(material);
+  sprite.scale.set(8.8, 3.2, 1);
+  return sprite;
 }
 
 function createPadFallback(position, color, labelOffsetX) {
@@ -1181,7 +1305,7 @@ function addMedianLamps(parent, curvePoints, lampTemplate, lampCount = 4) {
     return;
   }
 
-  const endClearance = Math.min(Math.max(24, totalLength * 0.17), totalLength * 0.28);
+  const endClearance = getRoadLampEndClearance(totalLength);
   const usableLength = Math.max(totalLength - (endClearance * 2), 1);
   for (let lampIndex = 0; lampIndex < lampCount; lampIndex += 1) {
     const ratioAlongUsable = lampCount === 1 ? 0.5 : (lampIndex / (lampCount - 1));
@@ -1273,6 +1397,9 @@ export function SimulationScene3D({
   endLabel = "",
   simulation,
   currentMinute = 0,
+  delayMinute = 0,
+  executionAssignments = [],
+  activeTripAlert = null,
   sceneFocusResetKey = 0,
   heightClass = "map-frame",
   showOverlay = true,
@@ -1281,13 +1408,25 @@ export function SimulationScene3D({
   onTruckFocusChange = null,
   onFocusChange = null,
 }) {
+  const startPointKey = startPoint
+    ? `${Number(startPoint.lat || 0).toFixed(6)},${Number(startPoint.lng || 0).toFixed(6)}`
+    : "none";
+  const endPointKey = endPoint
+    ? `${Number(endPoint.lat || 0).toFixed(6)},${Number(endPoint.lng || 0).toFixed(6)}`
+    : "none";
+  const routeGeometryKey = (simulation?.routeGeometry || [])
+    .map((point) => `${Number(point?.[0] || 0).toFixed(6)},${Number(point?.[1] || 0).toFixed(6)}`)
+    .join("|");
   const hostRef = useRef(null);
   const overlayRef = useRef(null);
   const tooltipRef = useRef(null);
   const currentMinuteRef = useRef(currentMinute);
+  const delayMinuteRef = useRef(delayMinute);
+  const activeTripAlertRef = useRef(activeTripAlert);
   const sceneFocusResetKeyRef = useRef(sceneFocusResetKey);
   const handledSceneFocusResetKeyRef = useRef(sceneFocusResetKey);
   const simulationRef = useRef(simulation);
+  const executionAssignmentsRef = useRef(executionAssignments);
   const assetsReadyRef = useRef(false);
   const truckHeadingRef = useRef(new Map());
   const rigVisualStateRef = useRef({
@@ -1336,10 +1475,16 @@ export function SimulationScene3D({
 
     tooltip.dataset.visible = "true";
     tooltip.querySelector("[data-tooltip-title]").textContent = content.title;
-    tooltip.querySelector("[data-tooltip-line='state']").textContent = content.state;
-    tooltip.querySelector("[data-tooltip-line='assigned']").textContent = content.assigned;
-    tooltip.querySelector("[data-tooltip-line='progress']").textContent = content.progress;
-    tooltip.querySelector("[data-tooltip-line='moving']").textContent = content.moving;
+    ["state", "assigned", "delay", "arrival", "progress", "moving"].forEach((lineKey) => {
+      const lineNode = tooltip.querySelector(`[data-tooltip-line='${lineKey}']`);
+      if (!lineNode) {
+        return;
+      }
+
+      const lineValue = content[lineKey] || "";
+      lineNode.textContent = lineValue;
+      lineNode.style.display = lineValue ? "block" : "none";
+    });
 
     const padding = 16;
     const tooltipRect = tooltip.getBoundingClientRect();
@@ -1467,11 +1612,16 @@ export function SimulationScene3D({
     const routeDistanceKm = Number.isFinite(truckInfo.routeDistanceKm) ? truckInfo.routeDistanceKm : 0;
     const progress = routeDistanceKm > 0 ? Math.round((distanceKm / routeDistanceKm) * 100) : 0;
     const loadLabel = truckInfo.loadId ? `Load: #${truckInfo.loadId}` : "Load: Waiting";
+    const stateLabel = truckInfo.isDelayed
+      ? `${truckInfo.status || "Waiting"} • Delayed`
+      : (truckInfo.status || "Waiting");
 
     return {
       title: `Truck ${truckInfo.truckId}`,
-      state: `State: ${truckInfo.status || "Waiting"}`,
+      state: `State: ${stateLabel}`,
       assigned: loadLabel,
+      delay: `Delay: ${formatSceneDelayLabel(truckInfo.lateMinutes, "On time")}`,
+      arrival: `Planned arrival: ${formatSceneMinuteLabel(truckInfo.plannedArrivalMinute)}`,
       progress: `Route progress: ${progress}%`,
       moving: `Distance: ${distanceKm.toFixed(1)} / ${routeDistanceKm.toFixed(1)} km`,
     };
@@ -1518,6 +1668,18 @@ function buildRouteTooltip(routeInfo) {
   useEffect(() => {
     simulationRef.current = simulation;
   }, [simulation]);
+
+  useEffect(() => {
+    executionAssignmentsRef.current = executionAssignments;
+  }, [executionAssignments]);
+
+  useEffect(() => {
+    delayMinuteRef.current = delayMinute;
+  }, [delayMinute]);
+
+  useEffect(() => {
+    activeTripAlertRef.current = activeTripAlert;
+  }, [activeTripAlert]);
 
   useEffect(() => {
     const host = hostRef.current;
@@ -1574,8 +1736,8 @@ function buildRouteTooltip(routeInfo) {
     } else {
       routeDirectionWorld.normalize();
     }
-    const roadStartWorld = straightStartWorld.clone().add(routeDirectionWorld.clone().multiplyScalar(22));
-    const roadEndWorld = straightEndWorld.clone().add(routeDirectionWorld.clone().multiplyScalar(-22));
+    const roadStartWorld = straightStartWorld.clone();
+    const roadEndWorld = straightEndWorld.clone();
     const projectedRoute = [roadStartWorld, roadEndWorld];
     const projectedRouteMetrics = buildWorldPathMetrics(projectedRoute);
     const reversedProjectedRoute = [...projectedRoute].reverse();
@@ -1908,22 +2070,64 @@ function buildRouteTooltip(routeInfo) {
       return lightRoot;
     }
 
+    function addTruckDelayLight(truckRoot) {
+      const delayLight = new THREE.PointLight(0xff6464, 0, 16, 2.2);
+      delayLight.position.set(0, 5.8, 0);
+      delayLight.visible = false;
+      truckRoot.add(delayLight);
+      return delayLight;
+    }
+
     function createTruckInstance(truckId) {
       const truckRoot = new THREE.Group();
       const fallbackMesh = createTruckFallbackMesh(truckAccent);
+      addTruckDelayOverlayMeshes(fallbackMesh);
       truckRoot.add(fallbackMesh);
       const roadLight = addTruckRoadLight(truckRoot);
+      const delayLight = addTruckDelayLight(truckRoot);
       truckRoot.visible = false;
       truckRoot.userData = {
         truckId,
         status: "",
         roadLight,
+        delayLight,
         truckVariants: {
           fallback: fallbackMesh,
         },
         activeTruckVariantKey: "fallback",
       };
       return truckRoot;
+    }
+
+    function setTruckDelayVisualState(truckRoot, isDelayed, pulseStrength = 0) {
+      if (!truckRoot) {
+        return;
+      }
+
+      truckRoot.traverse((child) => {
+        if (!child.isMesh || !child.material || child.userData?.isDelayOverlay) {
+          return;
+        }
+
+        if (child.userData.delayOriginalMaterial) {
+          child.material = child.userData.delayOriginalMaterial;
+        }
+      });
+
+      const delayLight = truckRoot.userData?.delayLight;
+      if (delayLight) {
+        delayLight.visible = isDelayed;
+        delayLight.intensity = isDelayed ? (5.2 + (pulseStrength * 3.2)) : 0;
+      }
+
+      const variants = truckRoot.userData?.truckVariants || {};
+      Object.values(variants).forEach((variantRoot) => {
+        const overlays = variantRoot?.userData?.delayOverlays || [];
+        overlays.forEach((overlayMesh) => {
+          overlayMesh.visible = false;
+        });
+      });
+
     }
 
     async function buildAssets() {
@@ -2221,6 +2425,7 @@ function buildRouteTooltip(routeInfo) {
             lift: 0,
           });
           variantMesh.scale.x *= getTruckVariantWidthStretch(variantKey);
+          addTruckDelayOverlayMeshes(variantMesh);
           variantMesh.visible = false;
           truckRoot.add(variantMesh);
           truckVariants[variantKey] = variantMesh;
@@ -2245,6 +2450,7 @@ function buildRouteTooltip(routeInfo) {
           root: truckRoot,
           capturedMaterials: captureHighlightMaterials(truckRoot),
           color: 0xfbbf24,
+          delayedColor: 0xff4d4f,
           kind: "truck",
           intensityFactor: 1,
           baseScale: truckRoot.scale.clone(),
@@ -2558,11 +2764,17 @@ function buildRouteTooltip(routeInfo) {
           return;
         }
 
+        const getTripEndMinute = (trip) => trip?.returnToSource ?? trip?.returnStart ?? trip?.arrivalAtDestination;
         const activeTrip = truckTrips.find((trip) => {
-          const tripEnd = trip.returnToSource ?? trip.arrivalAtDestination;
-          return minute >= trip.loadStart && minute <= tripEnd;
+          const tripEnd = getTripEndMinute(trip);
+          const tripStart = trip.dispatchStart ?? trip.moveStart ?? trip.loadStart ?? 0;
+          return minute >= tripStart && minute <= tripEnd;
         });
-        const deliveredTrip = [...truckTrips].reverse().find((trip) => minute > trip.arrivalAtDestination);
+        const nextTrip = truckTrips.find((trip) => minute < (trip.dispatchStart ?? trip.moveStart ?? trip.loadStart ?? 0)) || null;
+        const completedTrip = [...truckTrips].reverse().find((trip) => {
+          const tripEnd = getTripEndMinute(trip);
+          return minute > tripEnd;
+        }) || null;
         const sourceSiteParking = getRigBoardParkingWorld(
           straightStartWorld.clone().setY(0),
           routeDirectionWorld,
@@ -2581,46 +2793,89 @@ function buildRouteTooltip(routeInfo) {
         let currentWorld = roadStartWorld;
         let nextWorld = roadStartWorld;
         let distanceKm = 0;
+        const tripStartMinute = activeTrip?.moveStart ?? activeTrip?.pickupLoadFinish ?? activeTrip?.rigDownFinish ?? 0;
+        const returnStartMinute = activeTrip?.returnStart ?? activeTrip?.rigUpFinish ?? activeTrip?.arrivalAtDestination ?? 0;
+        const activeTripHasReturnToSource = Number.isFinite(Number(activeTrip?.returnToSource));
+        const roadHoldState = getTruckRoadHoldState(playback, minute, truckId, executionAssignmentsRef.current);
+        const delayState = getTruckDelayState(playback, delayMinuteRef.current, truckId, executionAssignmentsRef.current);
+        const holdingAtDestinationOnRoad = roadHoldState.holdOutbound;
+        const holdingAtSourceOnRoad = roadHoldState.holdReturn;
+        const returnStartedConfirmed = roadHoldState.returnStartedConfirmed;
+        const hasCompletedReturnToSource = Boolean(
+          roadHoldState.returnArrivalConfirmed ||
+          (activeTrip && Number.isFinite(Number(activeTrip?.returnToSource)) && minute >= Number(activeTrip.returnToSource) && !holdingAtSourceOnRoad),
+        );
+        const parkedAtDestination =
+          !holdingAtDestinationOnRoad &&
+          roadHoldState.outboundArrivalConfirmed &&
+          !hasCompletedReturnToSource &&
+          (
+            (activeTrip && minute >= activeTrip.arrivalAtDestination && minute < returnStartMinute) ||
+            (!activeTrip && Boolean(completedTrip))
+          );
+        const parkedAtSource =
+          (!holdingAtSourceOnRoad && hasCompletedReturnToSource) ||
+          (!activeTrip && (!completedTrip || !roadHoldState.outboundArrivalConfirmed || roadHoldState.returnArrivalConfirmed)) ||
+          (activeTrip && minute < activeTrip.rigDownFinish) ||
+          (activeTrip && minute < tripStartMinute);
 
         if (!activeTrip) {
-          if (deliveredTrip && !deliveredTrip.returnToSource) {
+          if (parkedAtDestination) {
             currentWorld = destinationSiteParking.position.clone();
             nextWorld = currentWorld;
             distanceKm = routeDistanceKm;
-          } else {
+          } else if (holdingAtSourceOnRoad) {
+            const inboundLaneMetrics = getTravelLaneMetrics(truckId, "inbound", completedTrip);
+            currentWorld = interpolateWorldPathWithEndpointOffset(inboundLaneMetrics, 1, truckBodyOffset, roadTravelHeight);
+            nextWorld = currentWorld;
+            distanceKm = 0;
+          } else if (parkedAtSource) {
             currentWorld = sourceSiteParking.position.clone();
             nextWorld = currentWorld;
+            distanceKm = 0;
           }
-        } else if (minute < activeTrip.rigDownFinish) {
+        } else if (parkedAtSource) {
           currentWorld = sourceSiteParking.position.clone();
           nextWorld = currentWorld;
           distanceKm = 0;
         } else if (minute < activeTrip.arrivalAtDestination) {
-          const tripDuration = Math.max(activeTrip.arrivalAtDestination - activeTrip.rigDownFinish, 1);
-          const outboundRatio = (minute - activeTrip.rigDownFinish) / tripDuration;
+          const tripDuration = Math.max(activeTrip.arrivalAtDestination - tripStartMinute, 1);
+          const outboundRatio = Math.max(0, Math.min(1, (minute - tripStartMinute) / tripDuration));
           const forwardMinute = Math.min(minute + 0.6, activeTrip.arrivalAtDestination);
-          const nextOutboundRatio = (forwardMinute - activeTrip.rigDownFinish) / tripDuration;
+          const nextOutboundRatio = Math.max(0, Math.min(1, (forwardMinute - tripStartMinute) / tripDuration));
           const outboundLaneMetrics = getTravelLaneMetrics(truckId, "outbound", activeTrip);
           currentWorld = interpolateWorldPathWithEndpointOffset(outboundLaneMetrics, outboundRatio, truckBodyOffset, roadTravelHeight);
           nextWorld = interpolateWorldPathWithEndpointOffset(outboundLaneMetrics, nextOutboundRatio, truckBodyOffset, roadTravelHeight);
           distanceKm = routeDistanceKm * Math.max(0, Math.min(1, outboundRatio));
-        } else if (minute < activeTrip.rigUpFinish) {
+        } else if (holdingAtDestinationOnRoad) {
+          const outboundLaneMetrics = getTravelLaneMetrics(truckId, "outbound", activeTrip);
+          currentWorld = interpolateWorldPathWithEndpointOffset(outboundLaneMetrics, 1, truckBodyOffset, roadTravelHeight);
+          nextWorld = currentWorld;
+          distanceKm = routeDistanceKm;
+        } else if (!returnStartedConfirmed || minute < returnStartMinute) {
           currentWorld = destinationSiteParking.position.clone();
           nextWorld = currentWorld;
           distanceKm = routeDistanceKm;
-        } else if (activeTrip.returnToSource && minute < activeTrip.returnToSource) {
-          const tripDuration = Math.max(activeTrip.returnToSource - activeTrip.rigUpFinish, 1);
-          const inboundRatio = (minute - activeTrip.rigUpFinish) / tripDuration;
-          const forwardMinute = Math.min(minute + 0.6, activeTrip.returnToSource);
-          const nextInboundRatio = (forwardMinute - activeTrip.rigUpFinish) / tripDuration;
+        } else if (returnStartedConfirmed && activeTripHasReturnToSource && minute < Number(activeTrip.returnToSource)) {
+          const tripDuration = Math.max(Number(activeTrip.returnToSource) - returnStartMinute, 1);
+          const inboundRatio = (minute - returnStartMinute) / tripDuration;
+          const forwardMinute = Math.min(minute + 0.6, Number(activeTrip.returnToSource));
+          const nextInboundRatio = (forwardMinute - returnStartMinute) / tripDuration;
           const inboundLaneMetrics = getTravelLaneMetrics(truckId, "inbound", activeTrip);
           currentWorld = interpolateWorldPathWithEndpointOffset(inboundLaneMetrics, inboundRatio, truckBodyOffset, roadTravelHeight);
           nextWorld = interpolateWorldPathWithEndpointOffset(inboundLaneMetrics, nextInboundRatio, truckBodyOffset, roadTravelHeight);
           distanceKm = routeDistanceKm * Math.max(0, 1 - Math.min(1, inboundRatio));
-        } else {
-          currentWorld = destinationSiteParking.position.clone();
+        } else if (holdingAtSourceOnRoad) {
+          const inboundLaneMetrics = getTravelLaneMetrics(truckId, "inbound", activeTrip);
+          currentWorld = interpolateWorldPathWithEndpointOffset(inboundLaneMetrics, 1, truckBodyOffset, roadTravelHeight);
           nextWorld = currentWorld;
-          distanceKm = routeDistanceKm;
+          distanceKm = 0;
+        } else {
+          currentWorld = parkedAtDestination
+            ? destinationSiteParking.position.clone()
+            : sourceSiteParking.position.clone();
+          nextWorld = currentWorld;
+          distanceKm = parkedAtDestination ? routeDistanceKm : 0;
         }
 
         const deltaX = nextWorld.x - currentWorld.x;
@@ -2629,28 +2884,26 @@ function buildRouteTooltip(routeInfo) {
         const lastHeading = truckHeadingRef.current.get(truckId) ?? 0;
         const movingHeading = movementMagnitude > 0.02 ? Math.atan2(deltaX, deltaZ) : lastHeading;
         const isParked =
-          (!activeTrip && !deliveredTrip) ||
-          (!activeTrip && Boolean(deliveredTrip && !deliveredTrip.returnToSource)) ||
-          (activeTrip && minute < activeTrip.rigDownFinish) ||
-          (activeTrip && minute >= activeTrip.arrivalAtDestination && minute < activeTrip.rigUpFinish) ||
-          (activeTrip && !activeTrip.returnToSource && minute >= activeTrip.rigUpFinish);
+          parkedAtDestination ||
+          parkedAtSource ||
+          (activeTrip && returnStartedConfirmed && !activeTripHasReturnToSource && minute >= returnStartMinute);
         let heading = lastHeading;
         if (isParked) {
           heading = getContinuousAngle(
-            activeTrip && minute >= activeTrip.arrivalAtDestination
+            parkedAtDestination
               ? destinationSiteParking.heading
               : sourceSiteParking.heading,
             lastHeading,
           );
         } else if (activeTrip && minute < activeTrip.arrivalAtDestination) {
-          const tripDuration = Math.max(activeTrip.arrivalAtDestination - activeTrip.rigDownFinish, 1);
-          const outboundRatio = Math.max(0, Math.min(1, (minute - activeTrip.rigDownFinish) / tripDuration));
+          const tripDuration = Math.max(activeTrip.arrivalAtDestination - tripStartMinute, 1);
+          const outboundRatio = Math.max(0, Math.min(1, (minute - tripStartMinute) / tripDuration));
           heading = outboundRatio < 0
             ? getContinuousAngle(sourceSiteParking.heading, lastHeading)
             : getContinuousAngle(movingHeading, lastHeading);
-        } else if (activeTrip?.returnToSource && minute < activeTrip.returnToSource) {
-          const tripDuration = Math.max(activeTrip.returnToSource - activeTrip.rigUpFinish, 1);
-          const inboundRatio = Math.max(0, Math.min(1, (minute - activeTrip.rigUpFinish) / tripDuration));
+        } else if (returnStartedConfirmed && activeTripHasReturnToSource && minute < Number(activeTrip.returnToSource)) {
+          const tripDuration = Math.max(Number(activeTrip.returnToSource) - returnStartMinute, 1);
+          const inboundRatio = Math.max(0, Math.min(1, (minute - returnStartMinute) / tripDuration));
           heading = inboundRatio < 0
             ? getContinuousAngle(destinationSiteParking.heading, lastHeading)
             : getContinuousAngle(movingHeading, lastHeading);
@@ -2660,13 +2913,43 @@ function buildRouteTooltip(routeInfo) {
         mesh.visible = true;
         mesh.position.copy(currentWorld);
         mesh.rotation.y = heading;
+        const activeAlert = activeTripAlertRef.current;
+        const visibleLoadId = activeTrip?.loadId ?? completedTrip?.loadId ?? null;
+        const alertMatchesTruck = Boolean(
+          activeAlert && (
+            (activeAlert?.assignmentId && String(activeAlert.assignmentId) === String(delayState.assignment?.id || "")) ||
+            (activeAlert?.sourceAssignmentId && String(activeAlert.sourceAssignmentId) === String(delayState.assignment?.id || "")) ||
+            (activeAlert?.linkedAssignmentId && String(activeAlert.linkedAssignmentId) === String(delayState.assignment?.id || "")) ||
+            (activeAlert?.loadId != null && String(activeAlert.loadId) === String(visibleLoadId ?? ""))
+          ),
+        );
+        const alertDrivenDelayed = Boolean(
+          alertMatchesTruck && activeAlert?.tone === "red",
+        );
+        setTruckDelayVisualState(mesh, alertDrivenDelayed);
         const roadLight = mesh.userData?.roadLight;
         if (roadLight) {
           roadLight.visible = !isParked;
         }
         truckHeadingRef.current.set(truckId, heading);
-        mesh.userData.status = getTruckStatus(playback, minute, truckId);
-        mesh.userData.loadId = activeTrip?.loadId ?? deliveredTrip?.loadId ?? null;
+        mesh.userData.status = holdingAtDestinationOnRoad
+          ? "Awaiting arrival confirmation"
+          : holdingAtSourceOnRoad
+            ? "Awaiting source arrival confirmation"
+            : getTruckStatus(playback, minute, truckId);
+        mesh.userData.isDelayed = alertDrivenDelayed;
+        mesh.userData.lateMinutes = alertMatchesTruck
+          ? activeAlert?.lateMinutes ?? delayState.lateMinutes
+          : delayState.lateMinutes;
+        mesh.userData.plannedArrivalMinute =
+          (alertMatchesTruck
+            ? activeAlert?.plannedFinishMinute
+            : null) ??
+          delayState.assignment?.stagePlan?.rigMove?.finishMinute ??
+          activeTrip?.arrivalAtDestination ??
+          completedTrip?.arrivalAtDestination ??
+          null;
+        mesh.userData.loadId = activeTrip?.loadId ?? completedTrip?.loadId ?? null;
         mesh.userData.distanceKm = distanceKm;
         mesh.userData.routeDistanceKm = measuredRouteMetrics.totalKm;
       });
@@ -2690,7 +2973,9 @@ function buildRouteTooltip(routeInfo) {
 
       if (sceneFocusResetKeyRef.current !== handledSceneFocusResetKeyRef.current) {
         handledSceneFocusResetKeyRef.current = sceneFocusResetKeyRef.current;
-        resetFocus();
+        if ((currentMinuteRef.current || 0) <= 0.25) {
+          resetFocus();
+        }
       }
 
       if (cameraTransitioningRef.current) {
@@ -2717,13 +3002,6 @@ function buildRouteTooltip(routeInfo) {
 
       updateTrucks(elapsedSeconds);
       const playback = simulationRef.current?.bestPlan?.playback;
-      if (
-        focusedTruckIdRef.current != null &&
-        playback?.totalMinutes != null &&
-        currentMinuteRef.current >= playback.totalMinutes
-      ) {
-        resetFocus();
-      }
       if (focusedTruckIdRef.current != null) {
         const focusedTruck = truckMeshes.get(focusedTruckIdRef.current);
         if (focusedTruck?.visible) {
@@ -2756,10 +3034,35 @@ function buildRouteTooltip(routeInfo) {
         const highlightStrength = isActive
           ? (0.44 + ((Math.sin(elapsedSeconds * 5.8) + 1) * 0.14)) * (target.intensityFactor ?? 1)
           : 0;
+        const truckIsDelayed = target.kind === "truck" && Boolean(target.root?.userData?.isDelayed);
+        const delayedTruckStrength = truckIsDelayed
+          ? 0.34 + ((Math.sin(elapsedSeconds * 5.8) + 1) * 0.1)
+          : 0;
+        const effectiveStrength = Math.max(highlightStrength, delayedTruckStrength);
+        const highlightColor = target.kind === "truck" && target.root?.userData?.isDelayed
+          ? (target.delayedColor || target.color)
+          : target.color;
+        const highlightOptions = truckIsDelayed
+          ? {
+              ...target.highlightOptions,
+              hoverBaseColor: 0x301010,
+              maxLineMix: 0.68,
+              maxSurfaceMix: 0.6,
+              lineMixScale: 0.72,
+              surfaceMixScale: 0.74,
+              emissiveMixScale: 0.62,
+              baseMixScale: 0.24,
+            }
+          : target.highlightOptions;
         if (target.kind === "rig-component" && isActive) {
-          applyRigComponentHoverState(target.capturedMaterials, target.color, highlightStrength);
+          applyRigComponentHoverState(target.capturedMaterials, highlightColor, effectiveStrength);
         } else {
-          applyHighlightState(target.capturedMaterials, target.color, highlightStrength, target.highlightOptions);
+          applyHighlightState(target.capturedMaterials, highlightColor, effectiveStrength, highlightOptions);
+        }
+        if (truckIsDelayed) {
+          setTruckDelayVisualState(target.root, true, delayedTruckStrength);
+        } else if (target.kind === "truck") {
+          setTruckDelayVisualState(target.root, false, 0);
         }
         if (target.kind === "rig-component") {
           target.root.scale.copy(target.baseScale);
@@ -2812,7 +3115,7 @@ function buildRouteTooltip(routeInfo) {
       });
       host.innerHTML = "";
     };
-  }, [startPoint, endPoint, startLabel, endLabel]);
+  }, [startPointKey, endPointKey, startLabel, endLabel, routeGeometryKey]);
 
   return h(
     "div",
@@ -2824,6 +3127,8 @@ function buildRouteTooltip(routeInfo) {
       h("strong", { className: "scene-3d-tooltip-title", "data-tooltip-title": true }, ""),
       h("span", { className: "scene-3d-tooltip-line", "data-tooltip-line": "state" }, ""),
       h("span", { className: "scene-3d-tooltip-line", "data-tooltip-line": "assigned" }, ""),
+      h("span", { className: "scene-3d-tooltip-line", "data-tooltip-line": "delay" }, ""),
+      h("span", { className: "scene-3d-tooltip-line", "data-tooltip-line": "arrival" }, ""),
       h("span", { className: "scene-3d-tooltip-line", "data-tooltip-line": "progress" }, ""),
       h("span", { className: "scene-3d-tooltip-line", "data-tooltip-line": "moving" }, ""),
     ),

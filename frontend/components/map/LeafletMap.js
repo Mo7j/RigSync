@@ -1,13 +1,22 @@
 import { React, h } from "../../lib/react.js";
-import { DEFAULT_CENTER, fetchRouteData, fallbackRouteData, getTruckPosition, getTruckStatus } from "../../features/rigMoves/simulation.js";
+import { DEFAULT_CENTER, fetchRouteData, fallbackRouteData, getTruckDelayState, getTruckPosition, getTruckRoadHoldState, getTruckStatus } from "../../features/rigMoves/simulation.js";
 
 const { useEffect, useMemo, useRef, useState } = React;
 
-function createTruckIcon(truckId) {
+function createTruckIcon(truckId, { delayed = false } = {}) {
+  const badge = delayed
+    ? `
+      <div style="position:absolute;left:50%;top:-12px;transform:translateX(-50%);padding:2px 8px;border-radius:999px;background:rgba(255,82,82,0.92);border:1px solid rgba(255,190,190,0.85);box-shadow:0 0 14px rgba(255,68,68,0.45);color:#fff7f7;font:700 10px/1.1 'Space Grotesk',sans-serif;letter-spacing:0.04em;text-transform:uppercase;">
+        Delayed
+      </div>`
+    : "";
+  const glowStyle = delayed
+    ? "filter: drop-shadow(0 0 10px rgba(255,72,72,0.85)) drop-shadow(0 0 18px rgba(255,72,72,0.45));"
+    : "";
   const svg = `
     <svg width="54" height="54" viewBox="0 0 42 42" fill="none" xmlns="http://www.w3.org/2000/svg">
-      <path d="M11 23.5C11 20.4624 13.4624 18 16.5 18H23.5C26.5376 18 29 20.4624 29 23.5V27H11V23.5Z" fill="#E8F7C4"/>
-      <path d="M29 20H32.2C33.0233 20 33.7933 20.4021 34.2627 21.076L36.2 23.8571C36.7194 24.6027 37 25.4897 37 26.3983V27H29V20Z" fill="#C6FF00"/>
+      <path d="M11 23.5C11 20.4624 13.4624 18 16.5 18H23.5C26.5376 18 29 20.4624 29 23.5V27H11V23.5Z" fill="${delayed ? "#ffb0b0" : "#E8F7C4"}"/>
+      <path d="M29 20H32.2C33.0233 20 33.7933 20.4021 34.2627 21.076L36.2 23.8571C36.7194 24.6027 37 25.4897 37 26.3983V27H29V20Z" fill="${delayed ? "#ff5b5b" : "#C6FF00"}"/>
       <circle cx="16.5" cy="28.5" r="2.5" fill="#111013"/>
       <circle cx="30.5" cy="28.5" r="2.5" fill="#111013"/>
       <circle cx="31.5" cy="11" r="7" fill="#0f1216"/>
@@ -16,7 +25,7 @@ function createTruckIcon(truckId) {
 
   return window.L.divIcon({
     className: "truck-marker-icon",
-    html: `<div class="truck-marker-body">${svg}</div>`,
+    html: `<div class="truck-marker-body" style="position:relative;${glowStyle}">${badge}${svg}</div>`,
     iconSize: [54, 54],
     iconAnchor: [27, 27],
   });
@@ -152,7 +161,12 @@ function bindClampedTooltip(layer, content, options) {
 }
 
 function shouldShowTruckMarker(status) {
-  return status?.startsWith("In transit") || status?.startsWith("Heading to pickup") || status === "Returning";
+  return (
+    status?.startsWith("In transit") ||
+    status?.startsWith("Heading to pickup") ||
+    status?.startsWith("Delivered") ||
+    status === "Returning"
+  );
 }
 
 function focusMapOnPoint(map, point, zoom = 12) {
@@ -210,6 +224,8 @@ export function LeafletMap({
   endPoint,
   simulation,
   currentMinute = 0,
+  delayMinute = 0,
+  executionAssignments = [],
   supportRoutes = [],
   pickerTarget = null,
   onPickPoint,
@@ -593,7 +609,19 @@ export function LeafletMap({
 
     for (let truckId = 1; truckId <= simulation.truckCount; truckId += 1) {
       const status = getTruckStatus(simulation.bestPlan.playback, currentMinute, truckId);
-      if (!shouldShowTruckMarker(status)) {
+      const roadHoldState = getTruckRoadHoldState(
+        simulation.bestPlan.playback,
+        currentMinute,
+        truckId,
+        executionAssignments,
+      );
+      const delayState = getTruckDelayState(
+        simulation.bestPlan.playback,
+        delayMinute,
+        truckId,
+        executionAssignments,
+      );
+      if (!shouldShowTruckMarker(status) && !roadHoldState.holdOutbound && !roadHoldState.holdReturn) {
         const hiddenMarker = truckMarkersRef.current.get(truckId);
         if (hiddenMarker) {
           hiddenMarker.remove();
@@ -602,20 +630,34 @@ export function LeafletMap({
         continue;
       }
 
-      const position = getTruckPosition(simulation.bestPlan.playback, simulation.routeGeometry, currentMinute, truckId);
+      const position = getTruckPosition(
+        simulation.bestPlan.playback,
+        simulation.routeGeometry,
+        currentMinute,
+        truckId,
+        executionAssignments,
+      );
       if (!position) {
         continue;
       }
+
+      const statusLabel = roadHoldState.holdOutbound
+        ? "Awaiting arrival confirmation"
+        : roadHoldState.holdReturn
+          ? "Awaiting source arrival confirmation"
+          : status;
+      const tooltipStatusLabel = delayState.isDelayed ? `${statusLabel} • Delayed` : statusLabel;
 
       activeTruckIds.add(truckId);
       const existingMarker = truckMarkersRef.current.get(truckId);
 
       if (existingMarker) {
         existingMarker.setLatLng([position.lat, position.lng]);
-        bindClampedTooltip(existingMarker, `Truck ${truckId}: ${status}`, createSceneTooltipOptions({ offset: [0, -8] }));
+        existingMarker.setIcon(createTruckIcon(truckId, { delayed: delayState.isDelayed }));
+        bindClampedTooltip(existingMarker, `Truck ${truckId}: ${tooltipStatusLabel}`, createSceneTooltipOptions({ offset: [0, -8] }));
       } else {
         const marker = window.L.marker([position.lat, position.lng], {
-          icon: createTruckIcon(truckId),
+          icon: createTruckIcon(truckId, { delayed: delayState.isDelayed }),
         }).addTo(map);
         marker.on("click", () => {
           const currentPosition = marker.getLatLng();
@@ -624,7 +666,7 @@ export function LeafletMap({
           onFocusChange?.({ kind: "truck", truckId });
         });
 
-        bindClampedTooltip(marker, `Truck ${truckId}: ${status}`, createSceneTooltipOptions({ offset: [0, -8] }));
+        bindClampedTooltip(marker, `Truck ${truckId}: ${tooltipStatusLabel}`, createSceneTooltipOptions({ offset: [0, -8] }));
 
         truckMarkersRef.current.set(truckId, marker);
       }
@@ -636,7 +678,7 @@ export function LeafletMap({
         truckMarkersRef.current.delete(truckId);
       }
     });
-  }, [simulation, currentMinute, onRigFocusChange, onTruckFocusChange]);
+  }, [simulation, currentMinute, delayMinute, executionAssignments, onRigFocusChange, onTruckFocusChange]);
 
   function handleUseMyLocation(event) {
     event.stopPropagation();

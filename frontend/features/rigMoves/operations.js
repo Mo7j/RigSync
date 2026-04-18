@@ -1,15 +1,50 @@
 import { TEST_USERS } from "../auth/auth.js";
 import { readRigInventoryAdjustments } from "../rigInventory/storage.js";
+import { createId } from "../../lib/id.js";
 
-function normalizeTruckTypes(value) {
-  if (Array.isArray(value)) {
-    return value.map((item) => String(item || "").trim()).filter(Boolean);
+function normalizeTruckTypeKey(type) {
+  const normalized = String(type || "")
+    .toLowerCase()
+    .replace(/[^a-z]/g, "");
+
+  if (normalized === "fb" || normalized.includes("flatbed")) {
+    return "flatbed";
+  }
+  if (normalized === "lb" || normalized.includes("lowbed") || normalized.includes("support")) {
+    return "lowbed";
+  }
+  if (normalized === "hh" || normalized.includes("heavyhaul")) {
+    return "heavyhauler";
   }
 
-  return String(value || "")
-    .split("/")
-    .map((item) => item.trim())
-    .filter(Boolean);
+  return normalized;
+}
+
+function normalizeTruckTypeLabel(type) {
+  const normalized = normalizeTruckTypeKey(type);
+
+  if (normalized === "flatbed") {
+    return "Flat-bed";
+  }
+  if (normalized === "lowbed" || normalized === "support") {
+    return "Low-bed";
+  }
+  if (normalized === "heavyhauler") {
+    return "Heavy Hauler";
+  }
+
+  return String(type || "").trim();
+}
+
+function normalizeTruckTypes(value) {
+  const tokens = Array.isArray(value)
+    ? value.flatMap((item) => normalizeTruckTypes(item))
+    : String(value || "")
+      .split(/[\/,|]/)
+      .map((item) => item.trim())
+      .filter(Boolean);
+
+  return [...new Set(tokens.map((item) => normalizeTruckTypeLabel(item)).filter(Boolean))];
 }
 
 function parseDependencyCodes(value) {
@@ -153,12 +188,14 @@ export function buildStartupTransferSchedule(startupLoads = [], destinationLabel
     .filter((item) => item.quantity > 0);
 }
 
-function normalizeStartupRequirements(startupRequirements = []) {
-  const source = startupRequirements?.length ? startupRequirements : DEFAULT_STARTUP_REQUIREMENTS;
+function normalizeStartupRequirements(startupRequirements = undefined) {
+  const source = Array.isArray(startupRequirements)
+    ? startupRequirements
+    : DEFAULT_STARTUP_REQUIREMENTS;
   const grouped = new Map();
 
   source.forEach((load) => {
-    const id = String(load.id || load.code || "").trim() || crypto.randomUUID();
+    const id = String(load.id || load.code || "").trim() || createId();
     const baseId = id.replace(/-L\d+$/i, "");
     if (!grouped.has(baseId)) {
       grouped.set(baseId, {
@@ -195,7 +232,7 @@ function normalizeStartupRequirements(startupRequirements = []) {
   }));
 }
 
-export function buildOperatingSnapshot({ move, teamMoves = [], logicalLoads = [], startupRequirements = [] }) {
+export function buildOperatingSnapshot({ move, teamMoves = [], logicalLoads = [], startupRequirements = undefined }) {
   const reusableInventory = buildReusableLoadInventory(logicalLoads);
   const managerId = move?.createdBy?.managerId || null;
   const currentForemanId = move?.createdBy?.id || null;

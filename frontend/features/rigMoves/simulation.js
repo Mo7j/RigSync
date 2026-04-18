@@ -59,13 +59,13 @@ function normalizeTruckTypeKey(type) {
     .toLowerCase()
     .replace(/[^a-z]/g, "");
 
-  if (normalized.includes("flatbed")) {
+  if (normalized === "fb" || normalized.includes("flatbed")) {
     return "flatbed";
   }
-  if (normalized.includes("lowbed") || normalized.includes("support")) {
+  if (normalized === "lb" || normalized.includes("lowbed") || normalized.includes("support")) {
     return "lowbed";
   }
-  if (normalized.includes("heavyhaul")) {
+  if (normalized === "hh" || normalized.includes("heavyhaul")) {
     return "heavyhauler";
   }
 
@@ -86,15 +86,19 @@ function normalizeTruckTypeLabel(type) {
   return String(type || "").trim() || "Heavy Hauler";
 }
 
-function normalizeTruckOptions(value) {
+function tokenizeTruckTypes(value) {
   if (Array.isArray(value)) {
-    return value.map((item) => normalizeTruckTypeLabel(item)).filter(Boolean);
+    return value.flatMap((item) => tokenizeTruckTypes(item));
   }
 
   return String(value || "")
-    .split("/")
-    .map((item) => normalizeTruckTypeLabel(item))
+    .split(/[\/,|]/)
+    .map((item) => item.trim())
     .filter(Boolean);
+}
+
+function normalizeTruckOptions(value) {
+  return [...new Set(tokenizeTruckTypes(value).map((item) => normalizeTruckTypeLabel(item)).filter(Boolean))];
 }
 
 function buildLegacyLogicalLoads(rawLoads) {
@@ -2734,6 +2738,69 @@ function reverseGeometry(geometry) {
   return [...geometry].reverse();
 }
 
+function resolvePlaybackTruckId(playback, truckId) {
+  const requestedId = String(truckId ?? "").trim();
+  if (!requestedId) {
+    return null;
+  }
+
+  const playbackTruckIds = [...new Set((playback?.trips || []).map((trip) => String(trip?.truckId ?? "").trim()).filter(Boolean))];
+  if (!playbackTruckIds.length) {
+    return null;
+  }
+
+  if (playbackTruckIds.includes(requestedId)) {
+    return requestedId;
+  }
+
+  const ordinalIndex = Number.parseInt(requestedId, 10);
+  if (Number.isFinite(ordinalIndex) && ordinalIndex >= 1 && ordinalIndex <= playbackTruckIds.length) {
+    return playbackTruckIds[ordinalIndex - 1];
+  }
+
+  return requestedId;
+}
+
+function findActiveTruckTrip(playback, currentMinute, truckId) {
+  const resolvedTruckId = resolvePlaybackTruckId(playback, truckId);
+  const truckTrips = playback.trips.filter((trip) => String(trip.truckId ?? "").trim() === resolvedTruckId);
+  const activeTrip = truckTrips.find((trip) => {
+    const tripEnd = trip.returnToSource ?? trip.unloadDropFinish ?? trip.arrivalAtDestination;
+    const tripStart = trip.dispatchStart ?? trip.pickupLoadStart ?? trip.loadStart;
+    return currentMinute >= tripStart && currentMinute <= tripEnd;
+  }) || null;
+
+  return { truckTrips, activeTrip };
+}
+
+function resolveTripExecutionAssignments(executionAssignments = [], trip = null) {
+  if (!trip) {
+    return { sourceAssignment: null, returnAssignment: null };
+  }
+
+  const sourceAssignment = (executionAssignments || []).find(
+    (assignment) => assignment?.taskType !== "return" && String(assignment?.loadId) === String(trip?.loadId),
+  ) || null;
+  const returnAssignment = sourceAssignment
+    ? (executionAssignments || []).find(
+        (assignment) =>
+          assignment?.taskType === "return" && (
+            String(assignment?.linkedAssignmentId) === String(sourceAssignment?.id) ||
+            String(assignment?.returnForAssignmentId) === String(sourceAssignment?.id)
+          ),
+      ) || null
+    : null;
+
+  return { sourceAssignment, returnAssignment };
+}
+
+function getAssignmentDelayThresholdMinutes(assignment) {
+  if (Number.isFinite(Number(assignment?.delayThresholdMinutes))) {
+    return Math.max(0, Number(assignment.delayThresholdMinutes));
+  }
+  return 20;
+}
+
 function interpolatePath(geometry, progress) {
   if (!geometry?.length) {
     return null;
@@ -2782,12 +2849,7 @@ function interpolatePath(geometry, progress) {
 }
 
 export function getTruckStatus(playback, currentMinute, truckId) {
-  const truckTrips = playback.trips.filter((trip) => trip.truckId === truckId);
-  const activeTrip = truckTrips.find((trip) => {
-    const tripEnd = trip.returnToSource ?? trip.unloadDropFinish ?? trip.arrivalAtDestination;
-    const tripStart = trip.dispatchStart ?? trip.pickupLoadStart ?? trip.loadStart;
-    return currentMinute >= tripStart && currentMinute <= tripEnd;
-  });
+  const { truckTrips, activeTrip } = findActiveTruckTrip(playback, currentMinute, truckId);
 
   if (!activeTrip) {
     const deliveredTrip = [...truckTrips].reverse().find((trip) => currentMinute > trip.arrivalAtDestination);
@@ -2815,19 +2877,86 @@ export function getTruckStatus(playback, currentMinute, truckId) {
   return `Delivered #${activeTrip.loadId}`;
 }
 
-export function getTruckPosition(playback, geometry, currentMinute, truckId) {
-  const truckTrips = playback.trips.filter((trip) => trip.truckId === truckId);
-  const activeTrip = truckTrips.find((trip) => {
-    const tripEnd = trip.returnToSource ?? trip.unloadDropFinish ?? trip.arrivalAtDestination;
-    const tripStart = trip.dispatchStart ?? trip.pickupLoadStart ?? trip.loadStart;
-    return currentMinute >= tripStart && currentMinute <= tripEnd;
-  });
+export function getTruckRoadHoldState(playback, currentMinute, truckId, executionAssignments = []) {
+  const { truckTrips, activeTrip } = findActiveTruckTrip(playback, currentMinute, truckId);
+  const deliveredTrip = [...truckTrips].reverse().find((trip) => currentMinute > (trip.returnToSource ?? trip.arrivalAtDestination)) || null;
+  const referenceTrip = activeTrip || deliveredTrip;
+  const { sourceAssignment, returnAssignment } = resolveTripExecutionAssignments(executionAssignments, referenceTrip);
+  const outboundArrivalConfirmed = Boolean(sourceAssignment?.outboundArrivedAt);
+  const returnStartedConfirmed = Boolean(returnAssignment?.moveStartedAt || returnAssignment?.returnMoveStartedAt || sourceAssignment?.returnMoveStartedAt);
+  const returnArrivalConfirmed = Boolean(returnAssignment?.returnedToSourceAt);
+  const returnStartMinute = referenceTrip?.returnStart ?? referenceTrip?.unloadDropFinish ?? referenceTrip?.arrivalAtDestination ?? null;
+  const returnFinishMinute = referenceTrip?.returnToSource ?? null;
+
+  const holdOutbound = Boolean(
+    referenceTrip &&
+    !outboundArrivalConfirmed &&
+    currentMinute >= (referenceTrip.arrivalAtDestination ?? Infinity) &&
+    currentMinute < (returnStartMinute ?? Infinity),
+  );
+  const holdReturn = Boolean(
+    referenceTrip &&
+    returnFinishMinute != null &&
+    !returnArrivalConfirmed &&
+    currentMinute >= returnFinishMinute,
+  );
+
+  return {
+    activeTrip,
+    referenceTrip,
+    holdOutbound,
+    holdReturn,
+    outboundArrivalConfirmed,
+    returnStartedConfirmed,
+    returnArrivalConfirmed,
+  };
+}
+
+export function getTruckDelayState(playback, currentMinute, truckId, executionAssignments = []) {
+  const { truckTrips, activeTrip } = findActiveTruckTrip(playback, currentMinute, truckId);
+  const deliveredTrip = [...truckTrips].reverse().find((trip) => currentMinute > (trip.returnToSource ?? trip.arrivalAtDestination)) || null;
+  const referenceTrip = activeTrip || deliveredTrip;
+  const { sourceAssignment, returnAssignment } = resolveTripExecutionAssignments(executionAssignments, referenceTrip);
+  const roadHoldState = getTruckRoadHoldState(playback, currentMinute, truckId, executionAssignments);
+  const returnStartMinute = referenceTrip?.returnStart ?? referenceTrip?.unloadDropFinish ?? referenceTrip?.arrivalAtDestination ?? null;
+
+  let relevantAssignment = null;
+  if (roadHoldState.holdReturn) {
+    relevantAssignment = returnAssignment || sourceAssignment;
+  } else if (roadHoldState.holdOutbound) {
+    relevantAssignment = sourceAssignment;
+  } else if (activeTrip && returnStartMinute != null && currentMinute >= returnStartMinute) {
+    relevantAssignment = returnAssignment || sourceAssignment;
+  } else if (activeTrip) {
+    relevantAssignment = sourceAssignment;
+  }
+
+  const plannedFinishMinute = Number(relevantAssignment?.stagePlan?.rigMove?.finishMinute);
+  const lateMinutes = Number.isFinite(plannedFinishMinute)
+    ? Math.max(0, currentMinute - plannedFinishMinute)
+    : 0;
+  const delayThresholdMinutes = getAssignmentDelayThresholdMinutes(relevantAssignment);
+  const isDelayed = Boolean(relevantAssignment) && lateMinutes > delayThresholdMinutes;
+
+  return {
+    isDelayed,
+    lateMinutes,
+    delayThresholdMinutes,
+    assignment: relevantAssignment,
+    referenceTrip,
+  };
+}
+
+export function getTruckPosition(playback, geometry, currentMinute, truckId, executionAssignments = []) {
+  const { truckTrips, activeTrip } = findActiveTruckTrip(playback, currentMinute, truckId);
   const nextTrip = truckTrips.find((trip) => currentMinute < (trip.dispatchStart ?? trip.pickupLoadStart ?? trip.loadStart)) || null;
   const deliveredTrip = [...truckTrips].reverse().find((trip) => currentMinute > trip.arrivalAtDestination) || null;
   const activeGeometry = activeTrip?.routeGeometry?.length ? activeTrip.routeGeometry : geometry;
   const pickupGeometry = activeTrip?.pickupRouteGeometry?.length ? activeTrip.pickupRouteGeometry : null;
   const outbound = activeGeometry;
   const inbound = reverseGeometry(activeGeometry);
+  const roadHoldState = getTruckRoadHoldState(playback, currentMinute, truckId, executionAssignments);
+  const returnStartedConfirmed = roadHoldState.returnStartedConfirmed;
 
   if (!outbound?.length) {
     return null;
@@ -2841,10 +2970,19 @@ export function getTruckPosition(playback, geometry, currentMinute, truckId) {
           ? nextTrip.routeGeometry
           : geometry;
     const deliveredGeometry = deliveredTrip?.routeGeometry?.length ? deliveredTrip.routeGeometry : geometry;
-    const target = nextTrip
-      ? nextGeometry?.[0]
-      : deliveredTrip && !deliveredTrip.returnToSource
+    const { sourceAssignment, returnAssignment } = resolveTripExecutionAssignments(executionAssignments, deliveredTrip);
+    const shouldHoldDeliveredAtDestination = Boolean(
+      deliveredTrip &&
+      sourceAssignment?.outboundArrivedAt &&
+      !returnAssignment?.moveStartedAt &&
+      !returnAssignment?.returnedToSourceAt,
+    );
+    const target = deliveredTrip && !deliveredTrip.returnToSource
+      ? deliveredGeometry?.[deliveredGeometry.length - 1]
+      : shouldHoldDeliveredAtDestination
         ? deliveredGeometry?.[deliveredGeometry.length - 1]
+      : nextTrip
+        ? nextGeometry?.[0]
         : deliveredGeometry?.[0] || geometry?.[0];
     if (!target) {
       return null;
@@ -2871,15 +3009,20 @@ export function getTruckPosition(playback, geometry, currentMinute, truckId) {
       (currentMinute - (activeTrip.moveStart ?? activeTrip.pickupLoadFinish ?? activeTrip.rigDownFinish)) / (activeTrip.arrivalAtDestination - (activeTrip.moveStart ?? activeTrip.pickupLoadFinish ?? activeTrip.rigDownFinish) || 1),
     );
   }
-  if ((activeTrip.returnStart ?? activeTrip.unloadDropFinish ?? activeTrip.arrivalAtDestination) > currentMinute) {
+  if (roadHoldState.holdOutbound) {
     return { lat: outbound[outbound.length - 1][0], lng: outbound[outbound.length - 1][1] };
   }
-  if (activeTrip.returnToSource && currentMinute < activeTrip.returnToSource) {
+  if (!returnStartedConfirmed || (activeTrip.returnStart ?? activeTrip.unloadDropFinish ?? activeTrip.arrivalAtDestination) > currentMinute) {
+    return { lat: outbound[outbound.length - 1][0], lng: outbound[outbound.length - 1][1] };
+  }
+  if (returnStartedConfirmed && activeTrip.returnToSource && currentMinute < activeTrip.returnToSource) {
     return interpolatePath(
       inbound,
       (currentMinute - (activeTrip.returnStart ?? activeTrip.unloadDropFinish ?? activeTrip.arrivalAtDestination)) / (activeTrip.returnToSource - (activeTrip.returnStart ?? activeTrip.unloadDropFinish ?? activeTrip.arrivalAtDestination) || 1),
     );
   }
-
+  if (activeTrip.returnToSource) {
+    return { lat: outbound[0][0], lng: outbound[0][1] };
+  }
   return { lat: outbound[outbound.length - 1][0], lng: outbound[outbound.length - 1][1] };
 }

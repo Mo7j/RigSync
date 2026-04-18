@@ -1,4 +1,5 @@
 import { clampPercentage, formatCoordinate, formatMinutes, formatShortDate } from "../../lib/format.js";
+import { createId } from "../../lib/id.js";
 import { haversineKilometers } from "./simulation.js";
 import { deleteMoveDoc, fetchMoveDoc, saveMoveDoc } from "../../lib/firebaseOperations.js";
 import { deleteMoveRecord, fetchMoveRecord, fetchMoveRecords, saveMoveRecord } from "./api.js";
@@ -508,7 +509,11 @@ export async function upsertMove(move) {
 export async function removeMove(moveId) {
   await deleteMoveRecord(moveId);
   removeMoveBackup(moveId);
-  void deleteMoveDoc(moveId).catch(() => {});
+  try {
+    await deleteMoveDoc(moveId);
+  } catch {
+    // Keep the local removal even if Firestore cleanup fails.
+  }
   return setMovesCache(readMoves().filter((move) => move.id !== moveId));
 }
 
@@ -577,9 +582,10 @@ export function createMoveRecord({ name, startPoint, endPoint, startLabel, endLa
     simulation?.bestScenario?.routeDistanceKm ||
     Math.max(1, Math.round(haversineKilometers(startPoint, endPoint) * 10) / 10);
   const now = new Date();
+  const isDemoMove = Boolean(createdBy?.isDemo);
 
   return {
-    id: crypto.randomUUID(),
+    id: createId(),
     name,
     createdAt: now.toISOString(),
     updatedAt: now.toISOString(),
@@ -607,11 +613,11 @@ export function createMoveRecord({ name, startPoint, endPoint, startLabel, endLa
       rigDownCompleted: false,
       rigMoveCompleted: false,
       rigUpCompleted: false,
-      trackingMode: "driverApp",
+      trackingMode: isDemoMove ? "demoUltrasonic" : "driverApp",
       ultrasonicStartCm: 45,
       ultrasonicArrivalCm: 8,
-      ultrasonicLatestCm: null,
-      ultrasonicLastUpdatedAt: null,
+      ultrasonicLatestCm: isDemoMove ? 45 : null,
+      ultrasonicLastUpdatedAt: isDemoMove ? now.toISOString() : null,
     },
     truckSetup: simulation.truckSetup || [],
     simulation,

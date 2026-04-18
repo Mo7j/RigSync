@@ -198,11 +198,11 @@ def normalize_truck_type(value):
     if not text:
         return None
     key = re.sub(r"[^a-z]", "", text.lower())
-    if "flatbed" in key:
+    if key == "fb" or "flatbed" in key:
         key = "flatbed"
-    elif "lowbed" in key or "support" in key:
+    elif key == "lb" or "lowbed" in key or "support" in key:
         key = "lowbed"
-    elif "heavyhaul" in key:
+    elif key == "hh" or "heavyhaul" in key:
         key = "heavyhauler"
     return TRUCK_TYPE_ALIASES.get(key, text)
 

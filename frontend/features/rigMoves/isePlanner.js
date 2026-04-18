@@ -3,6 +3,9 @@ const OVERHEAD_SAR_PER_DAY = 5000;
 const MAX_CONCURRENT_ACTIVITIES = 3;
 const MAX_RIG_DOWN_WORKERS = 30;
 const MAX_RIG_UP_WORKERS = 30;
+const SCHEDULER_TIME_STEP_MINUTES = 15;
+const UTILIZED_LOOKAHEAD_STEPS = 48;
+const UTILIZATION_BUCKET_MINUTES = 60;
 
 const DEFAULT_TRUCK_SPECS = [
   {
@@ -55,13 +58,13 @@ function normalizeTruckTypeKey(type) {
     .toLowerCase()
     .replace(/[^a-z]/g, "");
 
-  if (normalized.includes("flatbed")) {
+  if (normalized === "fb" || normalized.includes("flatbed")) {
     return "flatbed";
   }
-  if (normalized.includes("lowbed") || normalized.includes("support")) {
+  if (normalized === "lb" || normalized.includes("lowbed") || normalized.includes("support")) {
     return "lowbed";
   }
-  if (normalized.includes("heavyhaul")) {
+  if (normalized === "hh" || normalized.includes("heavyhaul")) {
     return "heavyhauler";
   }
 
@@ -224,9 +227,58 @@ function getPhaseDurationMinutes(load, phaseCode, crewMode) {
   const assignedRoles = getScenarioRoleCounts(load, phaseKey, crewMode);
   const minimumWorkers = Math.max(1, countSiteWorkers(minimumRoles) || Number(load?.min_worker_count) || 1);
   const assignedWorkers = Math.max(minimumWorkers, countSiteWorkers(assignedRoles) || minimumWorkers);
-  const adjusted = baseDuration * Math.max(0.75, minimumWorkers / Math.max(assignedWorkers, 1));
+  const productivityExponent = crewMode === "optimal" ? 0.2 : crewMode === "midpoint" ? 0.45 : 1;
+  const lowerBound = crewMode === "optimal" ? 0.78 : crewMode === "midpoint" ? 0.88 : 1;
+  const durationRatio = Math.pow(minimumWorkers / Math.max(assignedWorkers, 1), productivityExponent);
+  const adjusted = baseDuration * Math.max(lowerBound, durationRatio);
 
   return Math.max(1, Math.round(adjusted));
+}
+
+function getShiftWindow(shiftType, minute, startClockMinutes = 360) {
+  const safeMinute = Math.max(0, Math.floor(minute || 0));
+  const cycleIndex = Math.floor(safeMinute / 1440);
+
+  for (let offset = -1; offset <= 2; offset += 1) {
+    const cycleStart = (cycleIndex + offset) * 1440;
+    const windowStart = cycleStart + startClockMinutes + (shiftType === "night" ? 720 : 0);
+    const windowEnd = windowStart + 720;
+
+    if (safeMinute >= windowStart && safeMinute < windowEnd) {
+      return { start: windowStart, end: windowEnd };
+    }
+
+    if (safeMinute < windowStart) {
+      return { start: windowStart, end: windowEnd };
+    }
+  }
+
+  const fallbackStart = cycleIndex * 1440 + startClockMinutes + (shiftType === "night" ? 720 : 0);
+  return {
+    start: fallbackStart,
+    end: fallbackStart + 720,
+  };
+}
+
+function fitMinuteToDayShift(minute, durationMinutes, startClockMinutes = 360) {
+  let candidate = Math.max(0, Math.round(minute || 0));
+  let guard = 0;
+
+  while (guard < 10000) {
+    guard += 1;
+    const dayWindow = getShiftWindow("day", candidate, startClockMinutes);
+    if (candidate < dayWindow.start) {
+      candidate = dayWindow.start;
+      continue;
+    }
+    if ((candidate + durationMinutes) > dayWindow.end) {
+      candidate = getShiftWindow("day", dayWindow.end + 1, startClockMinutes).start;
+      continue;
+    }
+    return candidate;
+  }
+
+  throw new Error("Could not fit transport into the day shift window.");
 }
 
 function getTaskLaborCost(task) {
@@ -261,12 +313,26 @@ function computeRmDurationMinutes(load, truckSpec, fallbackDistanceKm) {
   return Math.max(1, Math.round((distanceKm / loadedSpeed) * 60));
 }
 
+function getLoadRequiredTruckTypeKeys(load) {
+  const directType = String(load?.truck_type || "").trim();
+  const normalizedDirectType = normalizeTruckTypeKey(directType);
+  const optionTypes = (load?.truck_options || load?.truckTypes || load?.truck_types || [])
+    .map((type) => normalizeTruckTypeKey(type))
+    .filter(Boolean);
+
+  if (normalizedDirectType && !/[\/,|]/.test(directType)) {
+    return [normalizedDirectType];
+  }
+
+  if (optionTypes.length) {
+    return [...new Set(optionTypes)];
+  }
+
+  return normalizedDirectType ? [normalizedDirectType] : [];
+}
+
 function getEligibleTruckIds(load, fleet) {
-  const allowed = new Set(
-    (load?.truck_options || load?.truckTypes || load?.truck_types || [load?.truck_type || ""])
-      .map((type) => normalizeTruckTypeKey(type))
-      .filter(Boolean),
-  );
+  const allowed = new Set(getLoadRequiredTruckTypeKeys(load));
 
   return fleet
     .filter((truck) => !allowed.size || allowed.has(normalizeTruckTypeKey(truck.type)))
@@ -279,7 +345,7 @@ function getEligibleTruckIds(load, fleet) {
 }
 
 function buildTaskGraph(loads, routeData, fleet, truckSpecMap, crewMode) {
-  const allPrimaryRmIds = [];
+  const allPrimaryTaskIds = [];
   const loadUnitCodeById = new Map();
 
   loads.forEach((load) => {
@@ -312,6 +378,7 @@ function buildTaskGraph(loads, routeData, fleet, truckSpecMap, crewMode) {
         durationMinutes: getPhaseDurationMinutes(load, "RD", crewMode),
         roleCounts,
         siteWorkers: countSiteWorkers(roleCounts),
+        allowedShiftTypes: Boolean(load.is_critical) ? ["day"] : null,
         eligibleTruckIds: [],
         predecessorIds: [],
       });
@@ -327,6 +394,7 @@ function buildTaskGraph(loads, routeData, fleet, truckSpecMap, crewMode) {
       durationMinutes: 0,
       roleCounts: {},
       siteWorkers: 0,
+      allowedShiftTypes: ["day"],
       eligibleTruckIds,
       predecessorIds: sourceKind === "startup" ? [] : [`${loadCode} (RD)`],
     });
@@ -341,6 +409,7 @@ function buildTaskGraph(loads, routeData, fleet, truckSpecMap, crewMode) {
       durationMinutes: getPhaseDurationMinutes(load, "RU", crewMode),
       roleCounts: rigUpRoleCounts,
       siteWorkers: countSiteWorkers(rigUpRoleCounts),
+      allowedShiftTypes: Boolean(load.is_critical) ? ["day"] : null,
       eligibleTruckIds: [],
       predecessorIds: [`${loadCode} (RM)`],
     });
@@ -349,8 +418,8 @@ function buildTaskGraph(loads, routeData, fleet, truckSpecMap, crewMode) {
   }).flat();
 
   preliminary.forEach((task) => {
-    if (task.phaseCode === "RM" && task.sourceKind !== "startup") {
-      allPrimaryRmIds.push(task.id);
+    if (task.sourceKind !== "startup") {
+      allPrimaryTaskIds.push(task.id);
     }
   });
 
@@ -388,7 +457,7 @@ function buildTaskGraph(loads, routeData, fleet, truckSpecMap, crewMode) {
     });
 
     if (task.sourceKind === "startup" && task.phaseCode === "RM") {
-      task.predecessorIds.push(...allPrimaryRmIds);
+      task.predecessorIds.push(...allPrimaryTaskIds);
     }
 
     task.predecessorIds = [...new Set(task.predecessorIds)];
@@ -399,12 +468,15 @@ function buildTaskGraph(loads, routeData, fleet, truckSpecMap, crewMode) {
       return;
     }
 
-    const candidateTrucks = (task.eligibleTruckIds.length
-      ? task.eligibleTruckIds.map((truckId) => fleet.find((truck) => truck.id === truckId))
-      : fleet
-    ).filter(Boolean);
+    const candidateTrucks = task.eligibleTruckIds.map((truckId) => fleet.find((truck) => truck.id === truckId)).filter(Boolean);
     if (!candidateTrucks.length) {
-      throw new Error(`No compatible truck is available for ${task.loadCode}.`);
+      const requiredTypes = getLoadRequiredTruckTypeKeys(task.load)
+        .map((type) => normalizeTruckTypeLabel(type))
+        .join(" / ");
+      const availableTypes = [...new Set((fleet || []).map((truck) => truck.type).filter(Boolean))].join(" / ");
+      throw new Error(
+        `No compatible truck is available for ${task.loadCode}. Required: ${requiredTypes || "Any compatible type in dataset"}. Available in candidate fleet: ${availableTypes || "None"}.`,
+      );
     }
 
     task.truckOptions = candidateTrucks.map((truck) => ({
@@ -413,6 +485,7 @@ function buildTaskGraph(loads, routeData, fleet, truckSpecMap, crewMode) {
       hourlyCost: Math.max(0, Number(truck.spec?.hourlyCost) || 0),
       averageSpeedKmh: Math.max(0, Number(truck.spec?.average_speed_kmh) || 0),
       durationMinutes: computeRmDurationMinutes(task.load, truck.spec, routeData?.distanceKm),
+      returnDurationMinutes: computeRmDurationMinutes(task.load, truck.spec, routeData?.distanceKm),
     }));
     task.durationMinutes = Math.min(...task.truckOptions.map((option) => option.durationMinutes));
   });
@@ -443,74 +516,171 @@ function intervalLoad(intervals, startMinute, endMinute, filter = null, field = 
   }, 0);
 }
 
-function findEarliestStart(task, earliestStartMinute, scheduledIntervals, truckSchedules) {
-  return findEarliestStartWithConstraints(
-    task,
-    earliestStartMinute,
-    scheduledIntervals,
-    truckSchedules,
-    {
-      maxConcurrentActivities: MAX_CONCURRENT_ACTIVITIES,
-      maxRigDownWorkers: MAX_RIG_DOWN_WORKERS,
-      maxRigUpWorkers: MAX_RIG_UP_WORKERS,
-    },
-  );
+function getIntervalsOverlapping(intervals, startMinute, endMinute, filter = null) {
+  return intervals.filter((interval) => (!filter || filter(interval)) && overlaps(startMinute, endMinute, interval.startMinute, interval.endMinute));
 }
 
-function findEarliestStartWithConstraints(task, earliestStartMinute, scheduledIntervals, truckSchedules, constraints) {
+function collectBlockingTaskIds(intervals = []) {
+  return [...new Set(
+    intervals
+      .flatMap((interval) => interval.taskIds || (interval.taskId ? [interval.taskId] : []))
+      .filter(Boolean),
+  )];
+}
+
+function scoreUtilizedCandidate(task, startMinute, endMinute, scheduledIntervals, constraints) {
+  const maxConcurrentActivities = Math.max(1, Number(constraints?.maxConcurrentActivities) || MAX_CONCURRENT_ACTIVITIES);
+  const workerCap = task.phaseCode === "RD"
+    ? Math.max(1, Number(constraints?.maxRigDownWorkers) || MAX_RIG_DOWN_WORKERS)
+    : task.phaseCode === "RU"
+      ? Math.max(1, Number(constraints?.maxRigUpWorkers) || MAX_RIG_UP_WORKERS)
+      : 0;
+  const bucketStart = Math.floor(startMinute / UTILIZATION_BUCKET_MINUTES) * UTILIZATION_BUCKET_MINUTES;
+  const bucketEnd = Math.max(endMinute, bucketStart + UTILIZATION_BUCKET_MINUTES);
+  let peakActivities = 0;
+  let peakWorkers = 0;
+  let sampledActivities = 0;
+  let sampledWorkers = 0;
+  let samples = 0;
+
+  for (let minute = bucketStart; minute < bucketEnd; minute += SCHEDULER_TIME_STEP_MINUTES) {
+    const sampleEnd = minute + SCHEDULER_TIME_STEP_MINUTES;
+    const activeIntervals = getIntervalsOverlapping(scheduledIntervals, minute, sampleEnd);
+    const activityLoad = activeIntervals.reduce((sum, interval) => sum + (interval.activityLoad || 0), 0);
+    const workerLoad = task.phaseCode === "RM"
+      ? 0
+      : activeIntervals
+        .filter((interval) => interval.phaseCode === task.phaseCode)
+        .reduce((sum, interval) => sum + (interval.load || 0), 0);
+    const candidateActive = overlaps(startMinute, endMinute, minute, sampleEnd) ? 1 : 0;
+    const candidateWorkers = candidateActive && task.phaseCode !== "RM" ? task.siteWorkers : 0;
+    const totalActivities = activityLoad + candidateActive;
+    const totalWorkers = workerLoad + candidateWorkers;
+
+    peakActivities = Math.max(peakActivities, totalActivities);
+    peakWorkers = Math.max(peakWorkers, totalWorkers);
+    sampledActivities += totalActivities;
+    sampledWorkers += totalWorkers;
+    samples += 1;
+  }
+
+  const avgActivities = sampledActivities / Math.max(samples, 1);
+  const avgWorkers = sampledWorkers / Math.max(samples, 1);
+  const activityPenalty = (peakActivities / maxConcurrentActivities) * 1000;
+  const workerPenalty = workerCap > 0 ? (peakWorkers / workerCap) * 1000 : 0;
+  const smoothingPenalty = ((peakActivities - avgActivities) * 220) + ((peakWorkers - avgWorkers) * 80);
+
+  return activityPenalty + workerPenalty + smoothingPenalty + (startMinute * 0.01);
+}
+
+function findEarliestStartWithConstraints(task, earliestStartMinute, scheduledIntervals, truckSchedules, constraints, options = {}) {
   let minute = Math.max(0, Math.round(earliestStartMinute));
   let guard = 0;
-  const maxConcurrentActivities = Math.max(1, Number(constraints?.maxConcurrentActivities) || MAX_CONCURRENT_ACTIVITIES);
+  const rawMaxConcurrentActivities = Number(constraints?.maxConcurrentActivities);
+  const maxConcurrentActivities = Number.isFinite(rawMaxConcurrentActivities) && rawMaxConcurrentActivities > 0
+    ? Math.max(1, Math.round(rawMaxConcurrentActivities))
+    : null;
   const maxRigDownWorkers = Math.max(1, Number(constraints?.maxRigDownWorkers) || MAX_RIG_DOWN_WORKERS);
   const maxRigUpWorkers = Math.max(1, Number(constraints?.maxRigUpWorkers) || MAX_RIG_UP_WORKERS);
+  const startClockMinutes =
+    ((Number.parseInt(constraints?.startHour, 10) || 6) * 60) +
+    (Number.parseInt(constraints?.startMinute, 10) || 0);
+  const objective = options?.objective || "fastest";
+  const candidateStarts = [];
+  let lastBlockingTaskIds = [];
 
   while (guard < 200000) {
     guard += 1;
+    if (task.allowedShiftTypes?.length === 1 && task.allowedShiftTypes[0] === "day") {
+      const fittedMinute = fitMinuteToDayShift(minute, task.durationMinutes, startClockMinutes);
+      if (fittedMinute !== minute) {
+        minute = fittedMinute;
+        continue;
+      }
+    }
+
     const endMinute = minute + task.durationMinutes;
-    const activeCount = intervalLoad(scheduledIntervals, minute, endMinute, null, "activityLoad");
-    if (activeCount >= maxConcurrentActivities) {
-      minute += 15;
-      continue;
+    if (maxConcurrentActivities != null) {
+      const activeIntervals = getIntervalsOverlapping(scheduledIntervals, minute, endMinute);
+      const activeCount = activeIntervals.reduce((sum, interval) => sum + (interval.activityLoad || 0), 0);
+      if (activeCount >= maxConcurrentActivities) {
+        lastBlockingTaskIds = collectBlockingTaskIds(activeIntervals);
+        minute += SCHEDULER_TIME_STEP_MINUTES;
+        continue;
+      }
     }
 
     if (task.phaseCode === "RD") {
-      const rdWorkers = intervalLoad(
+      const blockingIntervals = getIntervalsOverlapping(
         scheduledIntervals,
         minute,
         endMinute,
         (interval) => interval.phaseCode === "RD",
       );
+      const rdWorkers = blockingIntervals.reduce((sum, interval) => sum + (interval.load || 0), 0);
       if (rdWorkers + task.siteWorkers > maxRigDownWorkers) {
-        minute += 15;
+        lastBlockingTaskIds = collectBlockingTaskIds(blockingIntervals);
+        minute += SCHEDULER_TIME_STEP_MINUTES;
         continue;
       }
     }
 
     if (task.phaseCode === "RU") {
-      const ruWorkers = intervalLoad(
+      const blockingIntervals = getIntervalsOverlapping(
         scheduledIntervals,
         minute,
         endMinute,
         (interval) => interval.phaseCode === "RU",
       );
+      const ruWorkers = blockingIntervals.reduce((sum, interval) => sum + (interval.load || 0), 0);
       if (ruWorkers + task.siteWorkers > maxRigUpWorkers) {
-        minute += 15;
+        lastBlockingTaskIds = collectBlockingTaskIds(blockingIntervals);
+        minute += SCHEDULER_TIME_STEP_MINUTES;
         continue;
       }
     }
 
     if (task.phaseCode === "RM" && task.assignedTruckId) {
       const truckId = task.assignedTruckId;
-      const truckBusy = (truckSchedules.get(truckId) || []).some((interval) =>
+      const blockingIntervals = (truckSchedules.get(truckId) || []).filter((interval) =>
         overlaps(minute, endMinute, interval.startMinute, interval.endMinute),
       );
-      if (truckBusy) {
-        minute += 15;
+      if (blockingIntervals.length) {
+        lastBlockingTaskIds = collectBlockingTaskIds(blockingIntervals);
+        minute += SCHEDULER_TIME_STEP_MINUTES;
         continue;
       }
     }
 
-    return minute;
+    const blockingTaskIds = [...new Set(lastBlockingTaskIds.filter((taskId) => !task.predecessorIds.includes(taskId)))];
+    if (objective === "utilized") {
+      candidateStarts.push({
+        startMinute: minute,
+        blockingTaskIds,
+        score: scoreUtilizedCandidate(task, minute, endMinute, scheduledIntervals, constraints),
+      });
+      if (candidateStarts.length >= UTILIZED_LOOKAHEAD_STEPS) {
+        break;
+      }
+      minute += SCHEDULER_TIME_STEP_MINUTES;
+      continue;
+    }
+
+    return {
+      startMinute: minute,
+      blockingTaskIds,
+    };
+  }
+
+  if (objective === "utilized" && candidateStarts.length) {
+    candidateStarts.sort((left, right) =>
+      (left.score - right.score) ||
+      (left.startMinute - right.startMinute),
+    );
+    return {
+      startMinute: candidateStarts[0].startMinute,
+      blockingTaskIds: candidateStarts[0].blockingTaskIds,
+    };
   }
 
   throw new Error(`Could not find a feasible start time for ${task.id}.`);
@@ -521,6 +691,9 @@ function chooseTruckAssignment(task, earliestStartMinute, scheduledIntervals, tr
   if (!truckOptions.length) {
     throw new Error(`No truck options are available for ${task.id}.`);
   }
+  const startClockMinutes =
+    ((Number.parseInt(constraints?.startHour, 10) || 6) * 60) +
+    (Number.parseInt(constraints?.startMinute, 10) || 0);
 
   const rankedAssignments = truckOptions.map((option) => {
     const candidateTask = {
@@ -529,17 +702,28 @@ function chooseTruckAssignment(task, earliestStartMinute, scheduledIntervals, tr
       assignedTruckType: option.truckType,
       durationMinutes: option.durationMinutes,
     };
-    const startMinute = findEarliestStartWithConstraints(
+    const startCandidate = findEarliestStartWithConstraints(
       candidateTask,
       earliestStartMinute,
       scheduledIntervals,
       truckSchedules,
       constraints,
+      { objective },
     );
+    const startMinute = startCandidate.startMinute;
+    const transportStartMinute = task.allowedShiftTypes?.includes("day")
+      ? fitMinuteToDayShift(startMinute, option.durationMinutes, startClockMinutes)
+      : startMinute;
+    const transportEndMinute = transportStartMinute + option.durationMinutes;
+    const releaseMinute = task.allowedShiftTypes?.includes("day")
+      ? fitMinuteToDayShift(transportEndMinute, option.returnDurationMinutes || 0, startClockMinutes) + (option.returnDurationMinutes || 0)
+      : transportEndMinute + (option.returnDurationMinutes || 0);
     return {
       ...option,
-      startMinute,
-      endMinute: startMinute + option.durationMinutes,
+      startMinute: transportStartMinute,
+      endMinute: transportEndMinute,
+      releaseMinute,
+      blockingTaskIds: startCandidate.blockingTaskIds || [],
     };
   });
 
@@ -607,21 +791,35 @@ function scheduleTasks(taskGraph, fleet, constraints = null, objective = "fastes
         assignedTruckId: assignment.truckId,
         assignedTruckType: assignment.truckType,
         durationMinutes: assignment.durationMinutes,
+        returnDurationMinutes: assignment.returnDurationMinutes || 0,
+        truckReleaseMinute: assignment.releaseMinute || assignment.endMinute,
         startMinute: assignment.startMinute,
         endMinute: assignment.endMinute,
+        resourceBlockingTaskIds: [...new Set((assignment.blockingTaskIds || []).filter((taskId) => !task.predecessorIds.includes(taskId)))],
       };
     } else {
-      const startMinute = findEarliestStartWithConstraints(task, earliestStartMinute, scheduledIntervals, truckSchedules, constraints);
+      const startCandidate = findEarliestStartWithConstraints(
+        task,
+        earliestStartMinute,
+        scheduledIntervals,
+        truckSchedules,
+        constraints,
+        { objective },
+      );
+      const startMinute = startCandidate.startMinute;
       const endMinute = startMinute + task.durationMinutes;
       scheduledTask = {
         ...task,
         startMinute,
         endMinute,
+        resourceBlockingTaskIds: [...new Set((startCandidate.blockingTaskIds || []).filter((taskId) => !task.predecessorIds.includes(taskId)))],
       };
     }
 
     scheduled.set(task.id, scheduledTask);
     scheduledIntervals.push({
+      taskId: scheduledTask.id,
+      taskIds: [scheduledTask.id],
       startMinute: scheduledTask.startMinute,
       endMinute: scheduledTask.endMinute,
       load: task.phaseCode === "RM" ? 1 : task.siteWorkers,
@@ -630,8 +828,15 @@ function scheduleTasks(taskGraph, fleet, constraints = null, objective = "fastes
     });
 
     if (task.phaseCode === "RM") {
-      const intervals = truckSchedules.get(task.assignedTruckId) || [];
-      intervals.push({ startMinute: scheduledTask.startMinute, endMinute: scheduledTask.endMinute });
+      // RM tasks receive their truck assignment during scheduling, so use the
+      // resolved scheduled task id when reserving the truck timeline.
+      const intervals = truckSchedules.get(scheduledTask.assignedTruckId) || [];
+      intervals.push({
+        taskId: scheduledTask.id,
+        taskIds: [scheduledTask.id],
+        startMinute: scheduledTask.startMinute,
+        endMinute: scheduledTask.truckReleaseMinute || scheduledTask.endMinute,
+      });
       truckSchedules.set(scheduledTask.assignedTruckId, intervals);
     }
 
@@ -657,36 +862,30 @@ function scheduleTasks(taskGraph, fleet, constraints = null, objective = "fastes
 }
 
 function buildPlanningAnalysis(tasks) {
-  const taskById = new Map(tasks.map((task) => [task.id, task]));
-  const dependents = new Map(tasks.map((task) => [task.id, []]));
+  const topo = [...tasks].sort((left, right) => left.startMinute - right.startMinute || left.endMinute - right.endMinute || left.id.localeCompare(right.id));
+  const augmentedPredecessors = new Map(
+    topo.map((task) => [
+      task.id,
+      [...new Set([...(task.predecessorIds || []), ...(task.resourceBlockingTaskIds || [])])],
+    ]),
+  );
+  const dependents = new Map(topo.map((task) => [task.id, []]));
 
-  tasks.forEach((task) => {
-    task.predecessorIds.forEach((predecessorId) => {
-      if (dependents.has(predecessorId)) {
-        dependents.get(predecessorId).push(task.id);
-      }
-    });
-  });
-
-  const topo = [...tasks].sort((left, right) => left.startMinute - right.startMinute || left.endMinute - right.endMinute);
-  const earliest = new Map();
   topo.forEach((task) => {
-    const earliestStart = Math.max(
-      0,
-      ...task.predecessorIds.map((predecessorId) => earliest.get(predecessorId)?.finish || 0),
-    );
-    earliest.set(task.id, {
-      start: earliestStart,
-      finish: earliestStart + task.durationMinutes,
+    (augmentedPredecessors.get(task.id) || []).forEach((predecessorId) => {
+      if (!dependents.has(predecessorId)) {
+        dependents.set(predecessorId, []);
+      }
+      dependents.get(predecessorId).push(task.id);
     });
   });
 
-  const projectFinish = Math.max(...topo.map((task) => earliest.get(task.id)?.finish || 0), 0);
+  const projectFinish = Math.max(...topo.map((task) => task.endMinute || 0), 0);
   const latest = new Map();
   [...topo].reverse().forEach((task) => {
     const taskDependents = dependents.get(task.id) || [];
     const latestFinish = taskDependents.length
-      ? Math.min(...taskDependents.map((dependentId) => latest.get(dependentId)?.start || projectFinish))
+      ? Math.min(...taskDependents.map((dependentId) => latest.get(dependentId)?.start ?? projectFinish))
       : projectFinish;
     latest.set(task.id, {
       finish: latestFinish,
@@ -695,15 +894,16 @@ function buildPlanningAnalysis(tasks) {
   });
 
   const enrichedTasks = topo.map((task) => {
-    const earliestWindow = earliest.get(task.id);
     const latestWindow = latest.get(task.id);
-    const slack = Math.max(0, (latestWindow?.start || 0) - (earliestWindow?.start || 0));
+    const slack = Math.max(0, (latestWindow?.start ?? task.startMinute) - task.startMinute);
     return {
       ...task,
-      earliestStart: earliestWindow?.start || 0,
-      earliestFinish: earliestWindow?.finish || task.durationMinutes,
-      latestStart: latestWindow?.start || 0,
-      latestFinish: latestWindow?.finish || task.durationMinutes,
+      resourceBlockingTaskIds: [...(task.resourceBlockingTaskIds || [])],
+      criticalPredecessorIds: augmentedPredecessors.get(task.id) || [],
+      earliestStart: task.startMinute,
+      earliestFinish: task.endMinute,
+      latestStart: latestWindow?.start ?? task.startMinute,
+      latestFinish: latestWindow?.finish ?? task.endMinute,
       slack,
       isCritical: slack === 0,
     };
@@ -714,6 +914,100 @@ function buildPlanningAnalysis(tasks) {
     projectFinish,
     criticalTaskIds: enrichedTasks.filter((task) => task.isCritical).map((task) => task.id),
   };
+}
+
+function buildResourceUsageSeries(tasks = [], fleet = [], totalMinutes = 0, constraints = {}) {
+  const horizon = Math.max(totalMinutes, ...tasks.map((task) => task.endMinute || 0), 0);
+  const bucketCount = Math.max(1, Math.ceil(horizon / UTILIZATION_BUCKET_MINUTES));
+  const truckCapacity = Math.max(1, fleet.length || 1);
+  const crewCapacity = Math.max(
+    1,
+    Number(constraints?.maxRigDownWorkers) || 0,
+    Number(constraints?.maxRigUpWorkers) || 0,
+    MAX_RIG_DOWN_WORKERS,
+    MAX_RIG_UP_WORKERS,
+  );
+  const series = [];
+
+  for (let bucketIndex = 0; bucketIndex < bucketCount; bucketIndex += 1) {
+    const startMinute = bucketIndex * UTILIZATION_BUCKET_MINUTES;
+    const endMinute = startMinute + UTILIZATION_BUCKET_MINUTES;
+    const activeTasks = tasks.filter((task) => overlaps(startMinute, endMinute, task.startMinute, task.endMinute));
+    const activeTrucks = new Set(activeTasks.filter((task) => task.phaseCode === "RM").map((task) => task.assignedTruckId).filter(Boolean));
+    const rdWorkers = activeTasks
+      .filter((task) => task.phaseCode === "RD")
+      .reduce((sum, task) => sum + (task.siteWorkers || 0), 0);
+    const ruWorkers = activeTasks
+      .filter((task) => task.phaseCode === "RU")
+      .reduce((sum, task) => sum + (task.siteWorkers || 0), 0);
+    const totalWorkers = rdWorkers + ruWorkers;
+
+    series.push({
+      startMinute,
+      endMinute,
+      activeActivities: activeTasks.length,
+      activeTrucks: activeTrucks.size,
+      rdWorkers,
+      ruWorkers,
+      totalWorkers,
+      truckUtilizationPercent: Math.round((activeTrucks.size / truckCapacity) * 100),
+      crewUtilizationPercent: Math.round((totalWorkers / crewCapacity) * 100),
+    });
+  }
+
+  return series;
+}
+
+function validateScheduledTasks(tasks, constraints, fleet) {
+  const maxConcurrentActivities = Number(constraints?.maxConcurrentActivities) || MAX_CONCURRENT_ACTIVITIES;
+  const maxRigDownWorkers = Number(constraints?.maxRigDownWorkers) || MAX_RIG_DOWN_WORKERS;
+  const maxRigUpWorkers = Number(constraints?.maxRigUpWorkers) || MAX_RIG_UP_WORKERS;
+  const taskById = new Map(tasks.map((task) => [task.id, task]));
+
+  tasks.forEach((task) => {
+    (task.predecessorIds || []).forEach((predecessorId) => {
+      const predecessor = taskById.get(predecessorId);
+      if (predecessor && predecessor.endMinute > task.startMinute) {
+        throw new Error(`Precedence violation: ${predecessor.id} overlaps successor ${task.id}.`);
+      }
+    });
+  });
+
+  tasks.forEach((task) => {
+    const overlappingTasks = tasks.filter((otherTask) =>
+      overlaps(task.startMinute, task.endMinute, otherTask.startMinute, otherTask.endMinute));
+    const concurrentActivities = overlappingTasks.length;
+    const rdWorkers = overlappingTasks
+      .filter((otherTask) => otherTask.phaseCode === "RD")
+      .reduce((sum, otherTask) => sum + (otherTask.siteWorkers || 0), 0);
+    const ruWorkers = overlappingTasks
+      .filter((otherTask) => otherTask.phaseCode === "RU")
+      .reduce((sum, otherTask) => sum + (otherTask.siteWorkers || 0), 0);
+
+    if (concurrentActivities > maxConcurrentActivities) {
+      throw new Error(`Concurrent activity cap exceeded while scheduling ${task.id}.`);
+    }
+    if (rdWorkers > maxRigDownWorkers) {
+      throw new Error(`Rig-down worker cap exceeded while scheduling ${task.id}.`);
+    }
+    if (ruWorkers > maxRigUpWorkers) {
+      throw new Error(`Rig-up worker cap exceeded while scheduling ${task.id}.`);
+    }
+  });
+
+  (fleet || []).forEach((truck) => {
+    const truckTasks = tasks
+      .filter((task) => task.phaseCode === "RM" && task.assignedTruckId === truck.id)
+      .sort((left, right) => left.startMinute - right.startMinute || left.endMinute - right.endMinute);
+
+    for (let index = 1; index < truckTasks.length; index += 1) {
+      const previous = truckTasks[index - 1];
+      const current = truckTasks[index];
+      if (overlaps(previous.startMinute, previous.truckReleaseMinute || previous.endMinute, current.startMinute, current.endMinute)) {
+        throw new Error(`Truck assignment conflict on ${truck.id} between ${previous.id} and ${current.id}.`);
+      }
+    }
+  });
 }
 
 function buildPlayback(loads, scheduledTasks, planningAnalysis, routeData, fleet, truckSpecMap) {
@@ -764,8 +1058,8 @@ function buildPlayback(loads, scheduledTasks, planningAnalysis, routeData, fleet
       unloadDropFinish: moveTask.endMinute,
       rigUpStart: rigUpTask.startMinute,
       rigUpFinish: rigUpTask.endMinute,
-      returnStart: null,
-      returnToSource: null,
+      returnStart: moveTask.endMinute,
+      returnToSource: moveTask.truckReleaseMinute ?? moveTask.endMinute,
       rigDownWorkerCount: rigDownTask?.siteWorkers || 0,
       pickupLoadWorkerCount: 0,
       unloadDropWorkerCount: 0,
@@ -783,8 +1077,8 @@ function buildPlayback(loads, scheduledTasks, planningAnalysis, routeData, fleet
       dispatchStart: trip.dispatchStart,
       moveStart: trip.moveStart,
       arrivalAtDestination: trip.arrivalAtDestination,
-      returnStart: null,
-      returnToSource: null,
+      returnStart: trip.returnStart,
+      returnToSource: trip.returnToSource,
       routeMinutes,
       routeDistanceKm,
       routeGeometry: geometry,
@@ -840,12 +1134,14 @@ function buildPlayback(loads, scheduledTasks, planningAnalysis, routeData, fleet
       loadCode: task.loadCode,
       description: task.description,
       phase: task.phase,
+      phaseCode: task.phaseCode,
       activityCode: task.phaseCode,
       activityLabel: task.activityLabel,
       sourceKind: task.sourceKind,
       predecessorIds: [...task.predecessorIds],
       startMinute: task.startMinute,
       endMinute: task.endMinute,
+      truckReleaseMinute: task.truckReleaseMinute,
       earliestStart: task.earliestStart,
       earliestFinish: task.earliestFinish,
       latestStart: task.latestStart,
@@ -855,6 +1151,10 @@ function buildPlayback(loads, scheduledTasks, planningAnalysis, routeData, fleet
       siteWorkers: task.siteWorkers,
       slack: task.slack,
       isCritical: task.isCritical,
+      resourceBlockingTaskIds: [...(task.resourceBlockingTaskIds || [])],
+      criticalPredecessorIds: [...(task.criticalPredecessorIds || task.predecessorIds || [])],
+      assignedTruckId: task.assignedTruckId || null,
+      assignedTruckType: task.assignedTruckType || null,
     })),
     planningAnalysis: {
       projectFinish: planningAnalysis.projectFinish,
@@ -862,6 +1162,7 @@ function buildPlayback(loads, scheduledTasks, planningAnalysis, routeData, fleet
     },
     usedTruckSetup,
     workerAssignments: [],
+    resourceUsage: [],
   };
 }
 
@@ -871,18 +1172,83 @@ function summarizePlaybackMetrics(playback, scenarioName, truckSpecMap) {
   });
 }
 
-function summarizePlaybackMetricsWithConstraints(playback, scenarioName, truckSpecMap, constraints) {
+function buildPeakRoleCapacity(tasks = []) {
+  const eventsByRole = new Map();
+  const workerEvents = [];
+
+  (tasks || []).forEach((task) => {
+    if (task?.phaseCode === "RM") {
+      return;
+    }
+
+    let totalWorkersForTask = 0;
+    Object.entries(task?.roleCounts || {}).forEach(([roleId, count]) => {
+      if (roleId === "truck_driver") {
+        return;
+      }
+
+      const workerCount = Math.max(0, Number.parseInt(count, 10) || 0);
+      if (!workerCount) {
+        return;
+      }
+
+      totalWorkersForTask += workerCount;
+      const events = eventsByRole.get(roleId) || [];
+      events.push({ minute: Math.max(0, Number(task?.startMinute) || 0), change: workerCount });
+      events.push({ minute: Math.max(0, Number(task?.endMinute) || 0), change: -workerCount });
+      eventsByRole.set(roleId, events);
+    });
+
+    if (totalWorkersForTask > 0) {
+      workerEvents.push({ minute: Math.max(0, Number(task?.startMinute) || 0), change: totalWorkersForTask });
+      workerEvents.push({ minute: Math.max(0, Number(task?.endMinute) || 0), change: -totalWorkersForTask });
+    }
+  });
+
+  const peakByRole = new Map();
+
+  eventsByRole.forEach((events, roleId) => {
+    let current = 0;
+    let peak = 0;
+    events
+      .sort((left, right) => left.minute - right.minute || left.change - right.change)
+      .forEach((event) => {
+        current += event.change;
+        peak = Math.max(peak, current);
+      });
+    peakByRole.set(roleId, peak);
+  });
+
+  let concurrentWorkers = 0;
+  let totalPeakWorkers = 0;
+  workerEvents
+    .sort((left, right) => left.minute - right.minute || left.change - right.change)
+    .forEach((event) => {
+      concurrentWorkers += event.change;
+      totalPeakWorkers = Math.max(totalPeakWorkers, concurrentWorkers);
+    });
+
+  return {
+    peakByRole,
+    totalPeakWorkers: Math.max(1, totalPeakWorkers),
+  };
+}
+
+function summarizePlaybackMetricsWithConstraints(playback, scenarioName, truckSpecMap, constraints, fleet = []) {
   const totalMinutes = Math.max(1, playback.totalMinutes || 1);
-  const maxConcurrentActivities = Math.max(1, Number(constraints?.maxConcurrentActivities) || MAX_CONCURRENT_ACTIVITIES);
   const truckActiveMinutes = (playback.trips || []).reduce(
     (sum, trip) => sum + Math.max(0, (trip.arrivalAtDestination || 0) - (trip.moveStart || 0)),
     0,
   );
-  const workerActiveMinutes = (playback.trips || []).reduce(
-    (sum, trip) =>
+  const workerActiveMinutes = (playback.tasks || []).reduce(
+    (sum, task) =>
       sum +
-      (Math.max(0, (trip.rigDownFinish || 0) - (trip.rigDownStart || 0)) * Math.max(0, Number(trip.rigDownWorkerCount) || 0)) +
-      (Math.max(0, (trip.rigUpFinish || 0) - (trip.rigUpStart || 0)) * Math.max(0, Number(trip.rigUpWorkerCount) || 0)),
+      Object.entries(task?.roleCounts || {}).reduce((roleSum, [roleId, count]) => {
+        if (roleId === "truck_driver") {
+          return roleSum;
+        }
+        return roleSum + (Math.max(0, Number.parseInt(count, 10) || 0) * Math.max(0, Number(task?.durationMinutes) || 0));
+      }, 0),
     0,
   );
   const truckCost = (playback.trips || []).reduce((sum, trip) => {
@@ -891,21 +1257,292 @@ function summarizePlaybackMetricsWithConstraints(playback, scenarioName, truckSp
   }, 0);
   const laborCost = (playback.tasks || []).reduce((sum, task) => sum + getTaskLaborCost(task), 0);
   const overheadCost = Math.ceil(totalMinutes / (24 * 60)) * OVERHEAD_SAR_PER_DAY;
-  const usedTruckCount = new Set((playback.trips || []).map((trip) => trip.truckId).filter(Boolean)).size || 1;
-  const truckCapacityMinutes = usedTruckCount * totalMinutes;
+  const allocatedTruckCount = Math.max(1, fleet.length || new Set((playback.trips || []).map((trip) => trip.truckId).filter(Boolean)).size || 1);
+  const truckCapacityMinutes = allocatedTruckCount * totalMinutes;
+  const roleCapacity = buildPeakRoleCapacity(playback.tasks || []);
+  const workerCapacityMinutes = Math.max(
+    1,
+    ((Number(constraints?.maxRigDownWorkers) || MAX_RIG_DOWN_WORKERS) + (Number(constraints?.maxRigUpWorkers) || MAX_RIG_UP_WORKERS)) * totalMinutes,
+  );
+  const resourceUsageSeries = playback.resourceUsage || [];
+  const activitySamples = resourceUsageSeries.map((sample) => sample.activeActivities);
+  const workerSamples = resourceUsageSeries.map((sample) => sample.totalWorkers);
+  const meanActivity = activitySamples.length ? activitySamples.reduce((sum, value) => sum + value, 0) / activitySamples.length : 0;
+  const meanWorkers = workerSamples.length ? workerSamples.reduce((sum, value) => sum + value, 0) / workerSamples.length : 0;
+  const activityVariance = activitySamples.length
+    ? activitySamples.reduce((sum, value) => sum + ((value - meanActivity) ** 2), 0) / activitySamples.length
+    : 0;
+  const workerVariance = workerSamples.length
+    ? workerSamples.reduce((sum, value) => sum + ((value - meanWorkers) ** 2), 0) / workerSamples.length
+    : 0;
+  const utilizationEfficiency = Math.max(0, Math.round(100 - (Math.sqrt(activityVariance) * 10) - (Math.sqrt(workerVariance) * 2.5)));
+  const truckUtilization = Math.min(100, Math.round((truckActiveMinutes / Math.max(1, truckCapacityMinutes)) * 100));
+  const workerUtilization = Math.min(100, Math.round((workerActiveMinutes / workerCapacityMinutes) * 100));
 
   return {
     scenarioName,
-    truckUtilization: Math.min(100, Math.round((truckActiveMinutes / Math.max(1, truckCapacityMinutes)) * 100)),
-    workerUtilization: Math.min(100, Math.round((workerActiveMinutes / Math.max(1, maxConcurrentActivities * totalMinutes)) * 100)),
-    utilization: Math.min(100, Math.round(((truckActiveMinutes + workerActiveMinutes) / Math.max(1, truckCapacityMinutes + (maxConcurrentActivities * totalMinutes))) * 100)),
+    truckUtilization,
+    workerUtilization,
+    utilization: Math.min(100, Math.round(((truckUtilization + workerUtilization + utilizationEfficiency) / 3))),
+    utilizationEfficiency,
     idleMinutes: Math.max(0, truckCapacityMinutes - truckActiveMinutes),
-    workerIdleMinutes: Math.max(0, (maxConcurrentActivities * totalMinutes) - workerActiveMinutes),
+    workerIdleMinutes: Math.max(0, workerCapacityMinutes - workerActiveMinutes),
     costEstimate: Math.round(truckCost + laborCost + overheadCost),
     laborCost: Math.round(laborCost),
     transportCost: Math.round(truckCost),
     overheadCost: Math.round(overheadCost),
+    allocatedTruckCount,
+    requiredCrewCount: Math.max(1, roleCapacity.totalPeakWorkers || 0),
   };
+}
+
+function buildTruckSetupFromCountMap(baseTruckSetup = [], countMap = new Map()) {
+  return (baseTruckSetup || [])
+    .map((truck) => {
+      const type = normalizeTruckTypeLabel(truck.type);
+      const key = normalizeTruckTypeKey(type);
+      return {
+        ...truck,
+        type,
+        count: Math.max(0, Number(countMap.get(key)) || 0),
+      };
+    })
+    .filter((truck) => truck.count > 0);
+}
+
+function getCompatibleTruckTypeKeysForLoad(load, availableTruckSetup, truckSpecMap) {
+  const allowed = new Set(getLoadRequiredTruckTypeKeys(load));
+  const loadWeight = Math.max(0, Number(load?.weight_tons) || 0);
+
+  return (availableTruckSetup || [])
+    .map((truck) => normalizeTruckTypeKey(truck?.type))
+    .filter(Boolean)
+    .filter((key, index, values) => values.indexOf(key) === index)
+    .filter((key) => !allowed.size || allowed.has(key))
+    .filter((key) => {
+      const spec = truckSpecMap.get(key);
+      const maxWeight = Number(spec?.max_weight_tons) || 0;
+      return !maxWeight || !loadWeight || loadWeight <= maxWeight;
+    });
+}
+
+function buildInitialFleetSeed(loads, availableTruckSetup, truckSpecMap, objective = "fastest") {
+  const availableByType = new Map(
+    (availableTruckSetup || []).map((truck) => [
+      normalizeTruckTypeKey(truck.type),
+      Math.max(0, Number.parseInt(truck.count, 10) || 0),
+    ]),
+  );
+  const seed = new Map([...availableByType.keys()].map((key) => [key, 0]));
+  const uncoveredLoads = new Set((loads || []).map((load) => load.id));
+  const compatibility = new Map(
+    (loads || []).map((load) => [load.id, getCompatibleTruckTypeKeysForLoad(load, availableTruckSetup, truckSpecMap)]),
+  );
+
+  while (uncoveredLoads.size) {
+    let bestType = null;
+    let bestScore = Number.NEGATIVE_INFINITY;
+
+    availableByType.forEach((maxCount, typeKey) => {
+      if ((seed.get(typeKey) || 0) >= maxCount) {
+        return;
+      }
+
+      let covered = 0;
+      let weightedCoverage = 0;
+      uncoveredLoads.forEach((loadId) => {
+        const load = (loads || []).find((item) => item.id === loadId);
+        const compatible = compatibility.get(loadId) || [];
+        if (!compatible.includes(typeKey)) {
+          return;
+        }
+        covered += 1;
+        const spec = truckSpecMap.get(typeKey);
+        const speed = Math.max(1, Number(spec?.average_speed_kmh) || 1);
+        const cost = Math.max(1, Number(spec?.hourlyCost) || 1);
+        weightedCoverage += objective === "cheapest" ? (1000 / cost) : speed;
+        if (compatible.length === 1 && load) {
+          weightedCoverage += objective === "cheapest" ? 500 : 800;
+        }
+      });
+
+      if (!covered) {
+        return;
+      }
+
+      const score = weightedCoverage + (covered * 100);
+      if (score > bestScore) {
+        bestScore = score;
+        bestType = typeKey;
+      }
+    });
+
+    if (!bestType) {
+      throw new Error("No feasible truck mix can cover every load with the available fleet.");
+    }
+
+    seed.set(bestType, (seed.get(bestType) || 0) + 1);
+    uncoveredLoads.forEach((loadId) => {
+      const compatible = compatibility.get(loadId) || [];
+      if (compatible.includes(bestType)) {
+        uncoveredLoads.delete(loadId);
+      }
+    });
+  }
+
+  return seed;
+}
+
+function scoreScenarioResult(result, objective = "fastest", references = {}) {
+  if (!result) {
+    return Number.POSITIVE_INFINITY;
+  }
+
+  if (objective === "cheapest") {
+    return (result.costEstimate * 1e9) + (result.totalMinutes * 1e4) + (result.allocatedTruckCount * 10) - result.truckUtilization;
+  }
+
+  if (objective === "utilized") {
+    const fastestMinutes = Math.max(1, Number(references?.fastest?.totalMinutes) || result.totalMinutes || 1);
+    const cheapestCost = Math.max(1, Number(references?.cheapest?.costEstimate) || result.costEstimate || 1);
+    const timePenalty = Math.max(0, ((result.totalMinutes - (fastestMinutes * 1.15)) / fastestMinutes) * 1000);
+    const costPenalty = Math.max(0, ((result.costEstimate - (cheapestCost * 1.1)) / cheapestCost) * 1000);
+    return ((100 - (result.utilizationEfficiency || result.utilization || 0)) * 1e6) + (timePenalty * 1e5) + (costPenalty * 1e5) + (result.totalMinutes * 10) + result.costEstimate;
+  }
+
+  return (result.totalMinutes * 1e9) + (result.costEstimate * 1e4) + (result.allocatedTruckCount * 10) - result.truckUtilization;
+}
+
+function serializeTruckCountMap(countMap) {
+  return [...countMap.entries()]
+    .sort((left, right) => left[0].localeCompare(right[0]))
+    .map(([key, value]) => `${key}:${value}`)
+    .join("|");
+}
+
+function enumerateTruckCountMaps(maxCountByType = new Map()) {
+  const entries = [...maxCountByType.entries()].sort((left, right) => left[0].localeCompare(right[0]));
+  const combinations = [];
+
+  function visit(index, current) {
+    if (index >= entries.length) {
+      if ([...current.values()].some((value) => value > 0)) {
+        combinations.push(new Map(current));
+      }
+      return;
+    }
+
+    const [typeKey, maxCount] = entries[index];
+    for (let count = 0; count <= maxCount; count += 1) {
+      current.set(typeKey, count);
+      visit(index + 1, current);
+    }
+  }
+
+  visit(0, new Map());
+  return combinations;
+}
+
+function dominatesScenario(left, right) {
+  if (!left || !right) {
+    return false;
+  }
+
+  const noWorseOnTime = left.totalMinutes <= right.totalMinutes;
+  const noWorseOnCost = left.costEstimate <= right.costEstimate;
+  const noWorseOnUtilization = left.truckUtilization >= right.truckUtilization;
+  const strictlyBetter =
+    left.totalMinutes < right.totalMinutes ||
+    left.costEstimate < right.costEstimate ||
+    left.truckUtilization > right.truckUtilization;
+
+  return noWorseOnTime && noWorseOnCost && noWorseOnUtilization && strictlyBetter;
+}
+
+function buildParetoFrontier(candidates = []) {
+  return candidates.filter((candidate, index) =>
+    !candidates.some((other, otherIndex) => otherIndex !== index && dominatesScenario(other, candidate)),
+  );
+}
+
+function optimizeTruckMixForScenario(loads, routeData, availableTruckSetup, truckSpecs, scenarioDefinition, constraints = null, references = null) {
+  const truckSpecMap = buildTruckSpecMap(truckSpecs, availableTruckSetup);
+  const maxCountByType = new Map(
+    (availableTruckSetup || []).map((truck) => [
+      normalizeTruckTypeKey(truck.type),
+      Math.max(0, Number.parseInt(truck.count, 10) || 0),
+    ]),
+  );
+  const evaluationCache = new Map();
+  const evaluationErrors = [];
+
+  function evaluateCountMap(countMap) {
+    const serialized = serializeTruckCountMap(countMap);
+    if (evaluationCache.has(serialized)) {
+      return evaluationCache.get(serialized);
+    }
+
+    const candidateSetup = buildTruckSetupFromCountMap(availableTruckSetup, countMap);
+    if (!candidateSetup.length) {
+      evaluationCache.set(serialized, null);
+      return null;
+    }
+
+    try {
+      const scenario = buildScenario(loads, routeData, candidateSetup, truckSpecs, scenarioDefinition, constraints);
+      evaluationCache.set(serialized, scenario);
+      return scenario;
+    } catch (error) {
+      evaluationErrors.push({
+        truckSetup: candidateSetup,
+        message: error?.message || "Unknown scheduling error",
+      });
+      evaluationCache.set(serialized, null);
+      return null;
+    }
+  }
+
+  const countMaps = enumerateTruckCountMaps(maxCountByType);
+  const candidates = countMaps
+    .map((countMap) => evaluateCountMap(countMap))
+    .filter(Boolean);
+
+  if (!candidates.length) {
+    const firstFailure = evaluationErrors[0];
+    const setupSummary = (firstFailure?.truckSetup || [])
+      .map((truck) => `${truck.type} x${truck.count}`)
+      .join(", ");
+    const detail = firstFailure?.message ? ` ${firstFailure.message}` : "";
+    const setupText = setupSummary ? ` Tried: ${setupSummary}.` : "";
+    throw new Error(`Could not build a feasible ${scenarioDefinition.name} schedule with the available resources.${setupText}${detail}`.trim());
+  }
+
+  if (scenarioDefinition.objective === "utilized") {
+    const fastestMinutes = Math.max(1, Number(references?.fastest?.totalMinutes) || 0);
+    const cheapestCost = Math.max(1, Number(references?.cheapest?.costEstimate) || 0);
+    const boundedCandidates = candidates.filter((candidate) => {
+      const withinTimeBound = !fastestMinutes || candidate.totalMinutes <= fastestMinutes * 1.15;
+      const withinCostBound = !cheapestCost || candidate.costEstimate <= cheapestCost * 1.1;
+      return withinTimeBound && withinCostBound;
+    });
+    const optimizationPool = boundedCandidates.length ? boundedCandidates : candidates;
+    const frontier = buildParetoFrontier(optimizationPool);
+
+    frontier.sort((left, right) =>
+      ((right.utilizationEfficiency || right.utilization) - (left.utilizationEfficiency || left.utilization)) ||
+      (right.truckUtilization - left.truckUtilization) ||
+      (right.utilization - left.utilization) ||
+      (left.totalMinutes - right.totalMinutes) ||
+      (left.costEstimate - right.costEstimate) ||
+      (left.allocatedTruckCount - right.allocatedTruckCount)
+    );
+    return frontier[0];
+  }
+
+  candidates.sort((left, right) =>
+    scoreScenarioResult(left, scenarioDefinition.objective, references) - scoreScenarioResult(right, scenarioDefinition.objective, references),
+  );
+  return candidates[0];
 }
 
 function buildScenario(loads, routeData, truckSetup, truckSpecs, scenarioDefinition, constraints = null) {
@@ -916,11 +1553,15 @@ function buildScenario(loads, routeData, truckSetup, truckSpecs, scenarioDefinit
     maxConcurrentActivities: MAX_CONCURRENT_ACTIVITIES,
     maxRigDownWorkers: MAX_RIG_DOWN_WORKERS,
     maxRigUpWorkers: MAX_RIG_UP_WORKERS,
+    startHour: 6,
+    startMinute: 0,
   };
   const scheduledTasks = scheduleTasks(taskGraph, fleet, effectiveConstraints, scenarioDefinition.objective);
+  validateScheduledTasks(scheduledTasks, effectiveConstraints, fleet);
   const planningAnalysis = buildPlanningAnalysis(scheduledTasks);
   const playback = buildPlayback(loads, scheduledTasks, planningAnalysis, routeData, fleet, truckSpecMap);
-  const metrics = summarizePlaybackMetricsWithConstraints(playback, scenarioDefinition.name, truckSpecMap, effectiveConstraints);
+  playback.resourceUsage = buildResourceUsageSeries(scheduledTasks, fleet, playback.totalMinutes, effectiveConstraints);
+  const metrics = summarizePlaybackMetricsWithConstraints(playback, scenarioDefinition.name, truckSpecMap, effectiveConstraints, fleet);
   const bestVariant = {
     name: scenarioDefinition.name,
     routeMinutes: routeData.minutes,
@@ -932,10 +1573,11 @@ function buildScenario(loads, routeData, truckSetup, truckSpecs, scenarioDefinit
   return {
     name: scenarioDefinition.name,
     objective: scenarioDefinition.objective,
-    workerCount: MAX_CONCURRENT_ACTIVITIES,
+    crewMode: scenarioDefinition.crewMode,
+    workerCount: metrics.requiredCrewCount,
     workerShifts: {
-      dayShift: MAX_CONCURRENT_ACTIVITIES,
-      nightShift: MAX_CONCURRENT_ACTIVITIES,
+      dayShift: metrics.requiredCrewCount,
+      nightShift: metrics.requiredCrewCount,
     },
     truckCount: fleet.length,
     allocatedTruckCount: fleet.length,
@@ -959,6 +1601,7 @@ function buildScenario(loads, routeData, truckSetup, truckSpecs, scenarioDefinit
     utilization: metrics.utilization,
     truckUtilization: metrics.truckUtilization,
     workerUtilization: metrics.workerUtilization,
+    utilizationEfficiency: metrics.utilizationEfficiency,
     idleMinutes: metrics.idleMinutes,
     workerIdleMinutes: metrics.workerIdleMinutes,
     costEstimate: metrics.costEstimate,
@@ -1006,9 +1649,15 @@ export async function buildScenarioPlans(
 ) {
   void workerCount;
   void truckCount;
-  void workerShiftConfig;
 
   const onProgress = typeof progressOptions.onProgress === "function" ? progressOptions.onProgress : null;
+  const scenarioConstraints = {
+    maxConcurrentActivities: Math.max(1, Number(workerShiftConfig?.maxConcurrentActivities) || MAX_CONCURRENT_ACTIVITIES),
+    maxRigDownWorkers: Math.max(1, Number(workerShiftConfig?.maxRigDownWorkers) || MAX_RIG_DOWN_WORKERS),
+    maxRigUpWorkers: Math.max(1, Number(workerShiftConfig?.maxRigUpWorkers) || MAX_RIG_UP_WORKERS),
+    startHour: Number.parseInt(workerShiftConfig?.startHour, 10) || 6,
+    startMinute: Number.parseInt(workerShiftConfig?.startMinute, 10) || 0,
+  };
   const normalizedTruckSetup = (truckSetup || [])
     .map((truck) => ({
       ...truck,
@@ -1029,18 +1678,53 @@ export async function buildScenarioPlans(
   ];
 
   const results = [];
-  for (let index = 0; index < scenarios.length; index += 1) {
-    const scenario = scenarios[index];
-    onProgress?.({
-      stage: "scenario",
-      percent: 40 + Math.round(((index + 1) / scenarios.length) * 50),
-      message: `Scheduling ${scenario.name} scenario`,
-      detail: `Stage 7 of 8. Building the ${scenario.name} plan with ISE activity and resource rules.`,
-      completedStages: 7,
-      totalStages: 8,
-    });
-    results.push(buildScenario(loads, routeData, normalizedTruckSetup, truckSpecs, scenario));
-  }
+  const fastestDefinition = scenarios[0];
+  const cheapestDefinition = scenarios[1];
+  const utilizedDefinition = scenarios[2];
+
+  onProgress?.({
+    stage: "scenario",
+    percent: 56,
+    message: `Scheduling ${fastestDefinition.name} scenario`,
+    detail: `Stage 7 of 8. Optimizing the ${fastestDefinition.name} truck mix and schedule.`,
+    completedStages: 7,
+    totalStages: 8,
+  });
+  const fastestScenario = optimizeTruckMixForScenario(loads, routeData, normalizedTruckSetup, truckSpecs, fastestDefinition, scenarioConstraints);
+  results.push(fastestScenario);
+
+  onProgress?.({
+    stage: "scenario",
+    percent: 72,
+    message: `Scheduling ${cheapestDefinition.name} scenario`,
+    detail: `Stage 7 of 8. Optimizing the ${cheapestDefinition.name} truck mix and schedule.`,
+    completedStages: 7,
+    totalStages: 8,
+  });
+  const cheapestScenario = optimizeTruckMixForScenario(loads, routeData, normalizedTruckSetup, truckSpecs, cheapestDefinition, scenarioConstraints);
+  results.push(cheapestScenario);
+
+  onProgress?.({
+    stage: "scenario",
+    percent: 88,
+    message: `Scheduling ${utilizedDefinition.name} scenario`,
+    detail: `Stage 7 of 8. Optimizing the ${utilizedDefinition.name} truck mix and schedule.`,
+    completedStages: 7,
+    totalStages: 8,
+  });
+  const utilizedScenario = optimizeTruckMixForScenario(
+    loads,
+    routeData,
+    normalizedTruckSetup,
+    truckSpecs,
+    utilizedDefinition,
+    scenarioConstraints,
+    {
+      fastest: fastestScenario,
+      cheapest: cheapestScenario,
+    },
+  );
+  results.push(utilizedScenario);
 
   const baseline = buildManualBaselineScenario(loads, routeData, normalizedTruckSetup, truckSpecs);
   results.forEach((scenario) => {
