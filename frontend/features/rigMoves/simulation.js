@@ -2794,6 +2794,116 @@ function resolveTripExecutionAssignments(executionAssignments = [], trip = null)
   return { sourceAssignment, returnAssignment };
 }
 
+function getSourceAssignmentMoveState(sourceAssignment = null, returnAssignment = null) {
+  if (!sourceAssignment) {
+    return null;
+  }
+
+  const returnStarted = Boolean(
+    returnAssignment?.moveStartedAt ||
+    returnAssignment?.returnMoveStartedAt ||
+    sourceAssignment?.returnMoveStartedAt,
+  );
+  const returnFinished = Boolean(
+    returnAssignment?.returnedToSourceAt ||
+    sourceAssignment?.returnedToSourceAt,
+  );
+
+  if (!sourceAssignment?.moveStartedAt) {
+    return "readyOutbound";
+  }
+  if (!sourceAssignment?.outboundArrivedAt) {
+    return "movingOutbound";
+  }
+  if (!returnStarted) {
+    return "readyReturn";
+  }
+  if (!returnFinished) {
+    return "movingReturn";
+  }
+  return "returned";
+}
+
+export function getTruckExecutionState(playback, currentMinute, truckId, executionAssignments = []) {
+  const resolvedTruckId = resolvePlaybackTruckId(playback, truckId);
+  const truckTrips = (playback?.trips || [])
+    .filter((trip) => String(trip?.truckId ?? "").trim() === resolvedTruckId)
+    .sort(
+      (left, right) =>
+        (left.loadStart ?? left.moveStart ?? 0) - (right.loadStart ?? right.moveStart ?? 0) ||
+        (left.loadId ?? 0) - (right.loadId ?? 0),
+    );
+
+  if (!truckTrips.length) {
+    return {
+      phase: "parkedSource",
+      truckTrips: [],
+      trip: null,
+      completedTrip: null,
+      sourceAssignment: null,
+      returnAssignment: null,
+      outboundRatio: 0,
+      inboundRatio: 0,
+    };
+  }
+
+  let completedTrip = null;
+  for (const trip of truckTrips) {
+    const { sourceAssignment, returnAssignment } = resolveTripExecutionAssignments(executionAssignments, trip);
+    if (!sourceAssignment) {
+      continue;
+    }
+
+    const moveState = getSourceAssignmentMoveState(sourceAssignment, returnAssignment);
+    if (moveState === "returned") {
+      completedTrip = trip;
+      continue;
+    }
+
+    const moveStartMinute = trip.moveStart ?? trip.pickupLoadFinish ?? trip.rigDownFinish ?? 0;
+    const moveFinishMinute = trip.arrivalAtDestination ?? moveStartMinute;
+    const returnStartMinute = trip.returnStart ?? trip.unloadDropFinish ?? trip.arrivalAtDestination ?? moveFinishMinute;
+    const returnFinishMinute = trip.returnToSource ?? returnStartMinute;
+    const outboundRatio = Math.max(0, Math.min(1, (currentMinute - moveStartMinute) / Math.max(moveFinishMinute - moveStartMinute, 1)));
+    const inboundRatio = Math.max(0, Math.min(1, (currentMinute - returnStartMinute) / Math.max(returnFinishMinute - returnStartMinute, 1)));
+
+    let phase = "parkedSource";
+    if (moveState === "readyOutbound") {
+      phase = "parkedSource";
+    } else if (moveState === "movingOutbound") {
+      phase = currentMinute >= moveFinishMinute ? "holdOutbound" : "movingOutbound";
+    } else if (moveState === "readyReturn") {
+      phase = "parkedDestination";
+    } else if (moveState === "movingReturn") {
+      phase = currentMinute >= returnFinishMinute ? "holdReturn" : "movingReturn";
+    }
+
+    return {
+      phase,
+      truckTrips,
+      trip,
+      completedTrip,
+      sourceAssignment,
+      returnAssignment,
+      moveState,
+      outboundRatio,
+      inboundRatio,
+    };
+  }
+
+  return {
+    phase: "parkedSource",
+    truckTrips,
+    trip: null,
+    completedTrip: completedTrip || truckTrips[truckTrips.length - 1] || null,
+    sourceAssignment: null,
+    returnAssignment: null,
+    moveState: "returned",
+    outboundRatio: 1,
+    inboundRatio: 1,
+  };
+}
+
 function getAssignmentDelayThresholdMinutes(assignment) {
   if (Number.isFinite(Number(assignment?.delayThresholdMinutes))) {
     return Math.max(0, Number(assignment.delayThresholdMinutes));
@@ -2849,7 +2959,16 @@ function interpolatePath(geometry, progress) {
 }
 
 export function getTruckStatus(playback, currentMinute, truckId) {
-  const { truckTrips, activeTrip } = findActiveTruckTrip(playback, currentMinute, truckId);
+  const executionState = getTruckExecutionState(playback, currentMinute, truckId, []);
+  const activeTrip = executionState.trip;
+  const truckTrips = executionState.truckTrips;
+
+  if (executionState.phase === "parkedDestination" || executionState.phase === "holdOutbound") {
+    return activeTrip ? `Delivered #${activeTrip.loadId}` : "Delivered";
+  }
+  if (executionState.phase === "movingReturn" || executionState.phase === "holdReturn") {
+    return "Returning";
+  }
 
   if (!activeTrip) {
     const deliveredTrip = [...truckTrips].reverse().find((trip) => currentMinute > trip.arrivalAtDestination);
@@ -2878,31 +2997,23 @@ export function getTruckStatus(playback, currentMinute, truckId) {
 }
 
 export function getTruckRoadHoldState(playback, currentMinute, truckId, executionAssignments = []) {
-  const { truckTrips, activeTrip } = findActiveTruckTrip(playback, currentMinute, truckId);
-  const deliveredTrip = [...truckTrips].reverse().find((trip) => currentMinute > (trip.returnToSource ?? trip.arrivalAtDestination)) || null;
-  const referenceTrip = activeTrip || deliveredTrip;
-  const { sourceAssignment, returnAssignment } = resolveTripExecutionAssignments(executionAssignments, referenceTrip);
-  const outboundArrivalConfirmed = Boolean(sourceAssignment?.outboundArrivedAt);
-  const returnStartedConfirmed = Boolean(returnAssignment?.moveStartedAt || returnAssignment?.returnMoveStartedAt || sourceAssignment?.returnMoveStartedAt);
-  const returnArrivalConfirmed = Boolean(returnAssignment?.returnedToSourceAt);
-  const returnStartMinute = referenceTrip?.returnStart ?? referenceTrip?.unloadDropFinish ?? referenceTrip?.arrivalAtDestination ?? null;
-  const returnFinishMinute = referenceTrip?.returnToSource ?? null;
-
-  const holdOutbound = Boolean(
-    referenceTrip &&
-    !outboundArrivalConfirmed &&
-    currentMinute >= (referenceTrip.arrivalAtDestination ?? Infinity) &&
-    currentMinute < (returnStartMinute ?? Infinity),
+  const executionState = getTruckExecutionState(playback, currentMinute, truckId, executionAssignments);
+  const referenceTrip = executionState.trip || executionState.completedTrip || null;
+  const outboundArrivalConfirmed = Boolean(executionState.sourceAssignment?.outboundArrivedAt);
+  const returnStartedConfirmed = Boolean(
+    executionState.returnAssignment?.moveStartedAt ||
+    executionState.returnAssignment?.returnMoveStartedAt ||
+    executionState.sourceAssignment?.returnMoveStartedAt,
   );
-  const holdReturn = Boolean(
-    referenceTrip &&
-    returnFinishMinute != null &&
-    !returnArrivalConfirmed &&
-    currentMinute >= returnFinishMinute,
+  const returnArrivalConfirmed = Boolean(
+    executionState.returnAssignment?.returnedToSourceAt ||
+    executionState.sourceAssignment?.returnedToSourceAt,
   );
+  const holdOutbound = executionState.phase === "holdOutbound";
+  const holdReturn = executionState.phase === "holdReturn";
 
   return {
-    activeTrip,
+    activeTrip: executionState.trip,
     referenceTrip,
     holdOutbound,
     holdReturn,
@@ -2913,22 +3024,15 @@ export function getTruckRoadHoldState(playback, currentMinute, truckId, executio
 }
 
 export function getTruckDelayState(playback, currentMinute, truckId, executionAssignments = []) {
-  const { truckTrips, activeTrip } = findActiveTruckTrip(playback, currentMinute, truckId);
-  const deliveredTrip = [...truckTrips].reverse().find((trip) => currentMinute > (trip.returnToSource ?? trip.arrivalAtDestination)) || null;
-  const referenceTrip = activeTrip || deliveredTrip;
-  const { sourceAssignment, returnAssignment } = resolveTripExecutionAssignments(executionAssignments, referenceTrip);
+  const executionState = getTruckExecutionState(playback, currentMinute, truckId, executionAssignments);
   const roadHoldState = getTruckRoadHoldState(playback, currentMinute, truckId, executionAssignments);
-  const returnStartMinute = referenceTrip?.returnStart ?? referenceTrip?.unloadDropFinish ?? referenceTrip?.arrivalAtDestination ?? null;
+  const referenceTrip = executionState.trip || executionState.completedTrip || null;
 
   let relevantAssignment = null;
-  if (roadHoldState.holdReturn) {
-    relevantAssignment = returnAssignment || sourceAssignment;
-  } else if (roadHoldState.holdOutbound) {
-    relevantAssignment = sourceAssignment;
-  } else if (activeTrip && returnStartMinute != null && currentMinute >= returnStartMinute) {
-    relevantAssignment = returnAssignment || sourceAssignment;
-  } else if (activeTrip) {
-    relevantAssignment = sourceAssignment;
+  if (roadHoldState.holdReturn || executionState.phase === "movingReturn") {
+    relevantAssignment = executionState.returnAssignment || executionState.sourceAssignment;
+  } else if (roadHoldState.holdOutbound || executionState.phase === "movingOutbound" || executionState.phase === "parkedDestination") {
+    relevantAssignment = executionState.sourceAssignment;
   }
 
   const plannedFinishMinute = Number(relevantAssignment?.stagePlan?.rigMove?.finishMinute);
@@ -2948,15 +3052,14 @@ export function getTruckDelayState(playback, currentMinute, truckId, executionAs
 }
 
 export function getTruckPosition(playback, geometry, currentMinute, truckId, executionAssignments = []) {
-  const { truckTrips, activeTrip } = findActiveTruckTrip(playback, currentMinute, truckId);
-  const nextTrip = truckTrips.find((trip) => currentMinute < (trip.dispatchStart ?? trip.pickupLoadStart ?? trip.loadStart)) || null;
-  const deliveredTrip = [...truckTrips].reverse().find((trip) => currentMinute > trip.arrivalAtDestination) || null;
+  const executionState = getTruckExecutionState(playback, currentMinute, truckId, executionAssignments);
+  const activeTrip = executionState.trip;
+  const nextTrip = executionState.truckTrips.find((trip) => currentMinute < (trip.dispatchStart ?? trip.pickupLoadStart ?? trip.loadStart)) || null;
+  const deliveredTrip = executionState.completedTrip;
   const activeGeometry = activeTrip?.routeGeometry?.length ? activeTrip.routeGeometry : geometry;
   const pickupGeometry = activeTrip?.pickupRouteGeometry?.length ? activeTrip.pickupRouteGeometry : null;
   const outbound = activeGeometry;
   const inbound = reverseGeometry(activeGeometry);
-  const roadHoldState = getTruckRoadHoldState(playback, currentMinute, truckId, executionAssignments);
-  const returnStartedConfirmed = roadHoldState.returnStartedConfirmed;
 
   if (!outbound?.length) {
     return null;
@@ -2990,6 +3093,16 @@ export function getTruckPosition(playback, geometry, currentMinute, truckId, exe
     return { lat: target[0], lng: target[1] };
   }
 
+  if (executionState.phase === "parkedSource") {
+    return { lat: outbound[0][0], lng: outbound[0][1] };
+  }
+  if (executionState.phase === "parkedDestination" || executionState.phase === "holdOutbound") {
+    return { lat: outbound[outbound.length - 1][0], lng: outbound[outbound.length - 1][1] };
+  }
+  if (executionState.phase === "holdReturn") {
+    return { lat: outbound[0][0], lng: outbound[0][1] };
+  }
+
   if (currentMinute < (activeTrip.pickupLoadStart ?? activeTrip.loadStart)) {
     if (pickupGeometry?.length && currentMinute < (activeTrip.pickupLoadStart ?? activeTrip.loadStart)) {
       return interpolatePath(
@@ -3009,20 +3122,11 @@ export function getTruckPosition(playback, geometry, currentMinute, truckId, exe
       (currentMinute - (activeTrip.moveStart ?? activeTrip.pickupLoadFinish ?? activeTrip.rigDownFinish)) / (activeTrip.arrivalAtDestination - (activeTrip.moveStart ?? activeTrip.pickupLoadFinish ?? activeTrip.rigDownFinish) || 1),
     );
   }
-  if (roadHoldState.holdOutbound) {
-    return { lat: outbound[outbound.length - 1][0], lng: outbound[outbound.length - 1][1] };
-  }
-  if (!returnStartedConfirmed || (activeTrip.returnStart ?? activeTrip.unloadDropFinish ?? activeTrip.arrivalAtDestination) > currentMinute) {
-    return { lat: outbound[outbound.length - 1][0], lng: outbound[outbound.length - 1][1] };
-  }
-  if (returnStartedConfirmed && activeTrip.returnToSource && currentMinute < activeTrip.returnToSource) {
+  if (executionState.phase === "movingReturn") {
     return interpolatePath(
       inbound,
-      (currentMinute - (activeTrip.returnStart ?? activeTrip.unloadDropFinish ?? activeTrip.arrivalAtDestination)) / (activeTrip.returnToSource - (activeTrip.returnStart ?? activeTrip.unloadDropFinish ?? activeTrip.arrivalAtDestination) || 1),
+      executionState.inboundRatio,
     );
-  }
-  if (activeTrip.returnToSource) {
-    return { lat: outbound[0][0], lng: outbound[0][1] };
   }
   return { lat: outbound[outbound.length - 1][0], lng: outbound[outbound.length - 1][1] };
 }

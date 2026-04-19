@@ -209,7 +209,7 @@ function getPrimaryTransportAssignment(executionAssignments = []) {
         const linkedReturnState = getExecutionMoveState(linkedReturnAssignment);
         if (linkedReturnAssignment?.returnedToSourceAt || linkedReturnAssignment?.status === "completed") {
           transportState = "returned";
-        } else if (linkedReturnState === "readyOutbound" || linkedReturnState === "movingReturn") {
+        } else if (linkedReturnState === "movingReturn") {
           return null;
         }
       }
@@ -242,8 +242,74 @@ function getPrimaryTransportAssignment(executionAssignments = []) {
   return candidates[0] || null;
 }
 
+function getSensorTrackingAssignment(executionAssignments = []) {
+  const visibleAssignments = (executionAssignments || []).filter(
+    (assignment) => assignment?.status === "active" || assignment?.status === "foreman",
+  );
+  if (!visibleAssignments.length) {
+    return null;
+  }
+
+  const returnAssignmentsBySourceId = new Map(
+    (executionAssignments || [])
+      .filter((assignment) => assignment?.taskType === "return" && (assignment?.linkedAssignmentId || assignment?.returnForAssignmentId))
+      .map((assignment) => [String(assignment.linkedAssignmentId || assignment.returnForAssignmentId), assignment]),
+  );
+
+  for (const assignment of visibleAssignments) {
+    if (assignment?.taskType !== "return") {
+      const moveState = getExecutionMoveState(assignment);
+      if (moveState === "movingReturn") {
+        const linkedReturnAssignment = returnAssignmentsBySourceId.get(String(assignment.id)) || null;
+        return {
+          assignment: linkedReturnAssignment || assignment,
+          moveState: "movingReturn",
+        };
+      }
+
+      const linkedReturnAssignment = returnAssignmentsBySourceId.get(String(assignment.id)) || null;
+      const linkedReturnState = linkedReturnAssignment ? getExecutionMoveState(linkedReturnAssignment) : null;
+      if (linkedReturnState === "movingReturn") {
+        return {
+          assignment: linkedReturnAssignment,
+          moveState: "movingReturn",
+        };
+      }
+    }
+  }
+
+  for (const assignment of visibleAssignments) {
+    if (assignment?.taskType !== "return" && getExecutionMoveState(assignment) === "movingOutbound") {
+      return {
+        assignment,
+        moveState: "movingOutbound",
+      };
+    }
+  }
+
+  for (const assignment of visibleAssignments) {
+    if (assignment?.taskType !== "return" && getExecutionMoveState(assignment) === "readyReturn") {
+      return {
+        assignment,
+        moveState: "readyReturn",
+      };
+    }
+  }
+
+  for (const assignment of visibleAssignments) {
+    if (assignment?.taskType === "return" && getExecutionMoveState(assignment) === "readyOutbound") {
+      return {
+        assignment,
+        moveState: "readyOutbound",
+      };
+    }
+  }
+
+  return getPrimaryTransportAssignment(executionAssignments);
+}
+
 function getLiveTripDirection(executionAssignments = []) {
-  const activeTransport = getPrimaryTransportAssignment(executionAssignments);
+  const activeTransport = getSensorTrackingAssignment(executionAssignments);
   if (!activeTransport) {
     return "outbound";
   }
@@ -294,7 +360,7 @@ function getActiveSensorTripWindow(playback, executionAssignments = []) {
     return null;
   }
 
-  const activeTransport = getPrimaryTransportAssignment(executionAssignments);
+  const activeTransport = getSensorTrackingAssignment(executionAssignments);
   const candidateAssignment = activeTransport?.assignment || null;
   const moveState = activeTransport?.moveState || null;
 
@@ -376,7 +442,7 @@ function getActiveSensorTripWindow(playback, executionAssignments = []) {
 }
 
 function shouldUseDemoSensorTracking(executionAssignments = []) {
-  const activeTransport = getPrimaryTransportAssignment(executionAssignments);
+  const activeTransport = getSensorTrackingAssignment(executionAssignments);
   if (!activeTransport) {
     return false;
   }
@@ -5045,16 +5111,26 @@ export function RigMovePage({
   }, [safeMove.simulation, selectedScenario, effectiveTruckSetup, fallbackScenario, fallbackPlayback]);
   const activeBestPlan = displaySimulation.bestPlan || fallbackScenario.bestVariant;
   const activePlayback = activeBestPlan?.playback || fallbackPlayback;
+  const trackingExecutionMinute = move?.executionStartedAt
+    ? Math.max(
+        0,
+        ((move?.executionCompletedAt ? new Date(move.executionCompletedAt).getTime() : executionNow) - new Date(move.executionStartedAt).getTime()) / 60000,
+      )
+    : currentMinute;
+  const trackingExecutionAssignments = useMemo(
+    () => (executionState !== "planning" ? buildDisplayExecutionAssignments(executionAssignments, trackingExecutionMinute) : executionAssignments),
+    [executionAssignments, executionState, trackingExecutionMinute],
+  );
 
   const activeTrackingMode = executionProgress?.trackingMode === "demoUltrasonic" ? "demoUltrasonic" : "driverApp";
-  const ultrasonicDemo = getUltrasonicDemoSummary(executionProgress, executionAssignments);
+  const ultrasonicDemo = getUltrasonicDemoSummary(executionProgress, trackingExecutionAssignments);
   const totalMinutes = activeBestPlan?.totalMinutes || 0;
   const baseVisibleMinute = sceneAssetsReady ? Math.min(currentMinute, totalMinutes) : 0;
-  const hasStartedLiveMove = executionAssignments.some((assignment) => Boolean(assignment?.moveStartedAt));
-  const isOutboundSensorTracking = shouldUseDemoSensorTracking(executionAssignments);
+  const hasStartedLiveMove = trackingExecutionAssignments.some((assignment) => Boolean(assignment?.moveStartedAt));
+  const isOutboundSensorTracking = shouldUseDemoSensorTracking(trackingExecutionAssignments);
   const sensorTripWindow = useMemo(
-    () => getActiveSensorTripWindow(activePlayback, executionAssignments),
-    [activePlayback, executionAssignments],
+    () => getActiveSensorTripWindow(activePlayback, trackingExecutionAssignments),
+    [activePlayback, trackingExecutionAssignments],
   );
   const sensorTripKey = sensorTripWindow
     ? `${sensorTripWindow.direction}:${Number(sensorTripWindow.startMinute)}:${Number(sensorTripWindow.endMinute)}`
@@ -5289,10 +5365,7 @@ export function RigMovePage({
         ((move?.executionCompletedAt ? new Date(move.executionCompletedAt).getTime() : executionNow) - new Date(move.executionStartedAt).getTime()) / 60000,
       )
     : visibleMinute;
-  const displayExecutionAssignments = useMemo(
-    () => (executionState !== "planning" ? buildDisplayExecutionAssignments(executionAssignments, preliminaryExecutionMinute) : executionAssignments),
-    [executionAssignments, executionState, preliminaryExecutionMinute],
-  );
+  const displayExecutionAssignments = trackingExecutionAssignments;
   const timelinePlayback = useMemo(
     () => (executionState !== "planning" ? buildExecutionTimelinePlayback(activePlayback, displayExecutionAssignments, preliminaryExecutionMinute) : activePlayback),
     [activePlayback, displayExecutionAssignments, executionState, preliminaryExecutionMinute],

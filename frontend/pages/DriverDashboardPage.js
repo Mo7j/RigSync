@@ -165,6 +165,10 @@ function getStepTimerLines({
 }
 
 function buildPlannedReturnStep(assignment) {
+  if ((assignment?.sequence || 0) >= (assignment?.plannedTripCount || Number.MAX_SAFE_INTEGER)) {
+    return null;
+  }
+
   return {
     ...assignment,
     id: `${assignment.id}-return-preview`,
@@ -350,10 +354,10 @@ export function DriverDashboardPage({
     .filter((assignment) => assignment.taskType !== "return")
     .flatMap((assignment) => {
       const linkedReturnAssignment = returnAssignmentsByLoadId.get(String(assignment.id));
-      return [
-        assignment,
-        linkedReturnAssignment || buildPlannedReturnStep(assignment),
-      ];
+      const plannedReturnAssignment = linkedReturnAssignment || buildPlannedReturnStep(assignment);
+      return plannedReturnAssignment
+        ? [assignment, plannedReturnAssignment]
+        : [assignment];
     });
   const driverTimelineSteps = timelineAssignments.map((assignment, index) => {
     const stepMoveState = getDriverMoveState(assignment);

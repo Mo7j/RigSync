@@ -102,6 +102,31 @@ const DEMO_RIG_LOADS = [
     rig_down_dependency_codes: ["DM-01"],
     rig_move_dependency_codes: ["DM-01"],
   },
+  {
+    id: "demo-load-3",
+    code: "DM-03",
+    description: "Demo mud tank",
+    category: "Demo",
+    priority: 3,
+    truck_type: "Low-bed",
+    truck_types: ["Low-bed"],
+    load_count: 1,
+    weight_tons: 10,
+    avg_rig_down_minutes: 18,
+    avg_rig_up_minutes: 18,
+    optimal_rig_down_minutes: 12,
+    optimal_rig_up_minutes: 12,
+    minimum_crew_down_count: 1,
+    minimum_crew_up_count: 1,
+    optimal_crew_down_count: 1,
+    optimal_crew_up_count: 1,
+    minimum_crew_down_roles: { operator: 1 },
+    minimum_crew_up_roles: { operator: 1 },
+    optimal_crew_down_roles: { operator: 1 },
+    optimal_crew_up_roles: { operator: 1 },
+    rig_down_dependency_codes: ["DM-02"],
+    rig_move_dependency_codes: ["DM-02"],
+  },
 ];
 const DEMO_TRUCK_SPECS = [
   {
@@ -132,7 +157,7 @@ function buildSimpleDemoPlayback({
   truckType = "Low-bed",
   truckId = "demo-low-bed-1",
 }) {
-  const selectedLoads = (loads || []).slice(0, 2);
+  const selectedLoads = (loads || []).slice(0, 3);
   const pickupBufferMinutes = 0;
   const destinationBufferMinutes = 0;
   const stagingGapMinutes = 1;
@@ -142,6 +167,7 @@ function buildSimpleDemoPlayback({
   let nextDispatchMinute = 1;
 
   selectedLoads.forEach((load, index) => {
+    const isFinalLoad = index === selectedLoads.length - 1;
     const loadId = index + 1;
     const loadCode = `${load?.code || `DM-0${loadId}`}-L1`;
     const description = load?.description || `Demo load ${loadId}`;
@@ -158,8 +184,8 @@ function buildSimpleDemoPlayback({
     const unloadDropFinish = unloadDropStart + destinationBufferMinutes;
     const rigUpStart = unloadDropFinish;
     const rigUpFinish = rigUpStart + rigUpDuration;
-    const returnStart = rigUpFinish;
-    const returnToSource = returnStart + routeMinutes;
+    const returnStart = isFinalLoad ? null : rigUpFinish;
+    const returnToSource = isFinalLoad ? null : (returnStart + routeMinutes);
 
     trips.push({
       truckId,
@@ -272,7 +298,7 @@ function buildSimpleDemoPlayback({
       },
     );
 
-    nextDispatchMinute = returnToSource + stagingGapMinutes;
+    nextDispatchMinute = (returnToSource ?? rigUpFinish) + stagingGapMinutes;
   });
 
   const totalMinutes = Math.max(...trips.map((trip) => trip.rigUpFinish), 1);
@@ -548,6 +574,10 @@ function getAssignmentSensorProgress(move, assignment) {
 }
 
 function createReturnAssignmentFromLoad(assignment, timestamp) {
+  if ((assignment?.sequence || 0) >= (assignment?.plannedTripCount || Number.MAX_SAFE_INTEGER)) {
+    return null;
+  }
+
   return {
     ...assignment,
     id: `${assignment.id}-return`,
@@ -1854,7 +1884,7 @@ function App() {
       normalizedTruckSetup.find((truck) => normalizePlannerTruckType(truck.type) === "Low-bed") ||
       normalizedTruckSetup[0] ||
       { id: "demo-low-bed", type: "Low-bed", count: 1, hourlyCost: 95 };
-    const demoLoads = (logicalLoads || DEMO_RIG_LOADS).slice(0, 2);
+    const demoLoads = (logicalLoads || DEMO_RIG_LOADS).slice(0, 3);
     const playback = buildSimpleDemoPlayback({
       loads: demoLoads,
       routeGeometry: resolvedRouteData.geometry || [],
@@ -2658,7 +2688,10 @@ function App() {
       const hasExistingReturnTask = nextTaskAssignments.some((assignment) => assignment.returnForAssignmentId === assignmentId);
       const originalAssignment = nextTaskAssignments.find((assignment) => assignment.id === assignmentId);
       if (!hasExistingReturnTask && originalAssignment) {
-        nextTaskAssignments.push(createReturnAssignmentFromLoad(originalAssignment, timestamp));
+        const returnAssignment = createReturnAssignmentFromLoad(originalAssignment, timestamp);
+        if (returnAssignment) {
+          nextTaskAssignments.push(returnAssignment);
+        }
       }
     }
 

@@ -2,7 +2,7 @@ import { React, h } from "../../lib/react.js";
 import * as THREE from "https://esm.sh/three@0.179.1";
 import { OrbitControls } from "https://esm.sh/three@0.179.1/examples/jsm/controls/OrbitControls.js";
 import { GLTFLoader } from "https://esm.sh/three@0.179.1/examples/jsm/loaders/GLTFLoader.js";
-import { getTruckDelayState, getTruckRoadHoldState, getTruckStatus, haversineKilometers } from "../../features/rigMoves/simulation.js";
+import { getTruckDelayState, getTruckExecutionState, getTruckRoadHoldState, getTruckStatus, haversineKilometers } from "../../features/rigMoves/simulation.js";
 
 const { useEffect, useRef } = React;
 const assetLoader = new GLTFLoader();
@@ -2793,80 +2793,50 @@ function buildRouteTooltip(routeInfo) {
         let currentWorld = roadStartWorld;
         let nextWorld = roadStartWorld;
         let distanceKm = 0;
-        const tripStartMinute = activeTrip?.moveStart ?? activeTrip?.pickupLoadFinish ?? activeTrip?.rigDownFinish ?? 0;
-        const returnStartMinute = activeTrip?.returnStart ?? activeTrip?.rigUpFinish ?? activeTrip?.arrivalAtDestination ?? 0;
-        const activeTripHasReturnToSource = Number.isFinite(Number(activeTrip?.returnToSource));
+        const executionTruckState = getTruckExecutionState(playback, minute, truckId, executionAssignmentsRef.current);
+        const referenceTrip = executionTruckState.trip || executionTruckState.completedTrip || activeTrip || completedTrip;
+        const tripStartMinute = referenceTrip?.moveStart ?? referenceTrip?.pickupLoadFinish ?? referenceTrip?.rigDownFinish ?? 0;
+        const returnStartMinute = referenceTrip?.returnStart ?? referenceTrip?.rigUpFinish ?? referenceTrip?.arrivalAtDestination ?? 0;
+        const activeTripHasReturnToSource = Number.isFinite(Number(referenceTrip?.returnToSource));
         const roadHoldState = getTruckRoadHoldState(playback, minute, truckId, executionAssignmentsRef.current);
         const delayState = getTruckDelayState(playback, delayMinuteRef.current, truckId, executionAssignmentsRef.current);
         const holdingAtDestinationOnRoad = roadHoldState.holdOutbound;
         const holdingAtSourceOnRoad = roadHoldState.holdReturn;
         const returnStartedConfirmed = roadHoldState.returnStartedConfirmed;
-        const hasCompletedReturnToSource = Boolean(
-          roadHoldState.returnArrivalConfirmed ||
-          (activeTrip && Number.isFinite(Number(activeTrip?.returnToSource)) && minute >= Number(activeTrip.returnToSource) && !holdingAtSourceOnRoad),
-        );
-        const parkedAtDestination =
-          !holdingAtDestinationOnRoad &&
-          roadHoldState.outboundArrivalConfirmed &&
-          !hasCompletedReturnToSource &&
-          (
-            (activeTrip && minute >= activeTrip.arrivalAtDestination && minute < returnStartMinute) ||
-            (!activeTrip && Boolean(completedTrip))
-          );
-        const parkedAtSource =
-          (!holdingAtSourceOnRoad && hasCompletedReturnToSource) ||
-          (!activeTrip && (!completedTrip || !roadHoldState.outboundArrivalConfirmed || roadHoldState.returnArrivalConfirmed)) ||
-          (activeTrip && minute < activeTrip.rigDownFinish) ||
-          (activeTrip && minute < tripStartMinute);
+        const parkedAtDestination = executionTruckState.phase === "parkedDestination";
+        const parkedAtSource = executionTruckState.phase === "parkedSource";
+        const movingOutbound = executionTruckState.phase === "movingOutbound";
+        const movingReturn = executionTruckState.phase === "movingReturn";
 
-        if (!activeTrip) {
-          if (parkedAtDestination) {
-            currentWorld = destinationSiteParking.position.clone();
-            nextWorld = currentWorld;
-            distanceKm = routeDistanceKm;
-          } else if (holdingAtSourceOnRoad) {
-            const inboundLaneMetrics = getTravelLaneMetrics(truckId, "inbound", completedTrip);
-            currentWorld = interpolateWorldPathWithEndpointOffset(inboundLaneMetrics, 1, truckBodyOffset, roadTravelHeight);
-            nextWorld = currentWorld;
-            distanceKm = 0;
-          } else if (parkedAtSource) {
-            currentWorld = sourceSiteParking.position.clone();
-            nextWorld = currentWorld;
-            distanceKm = 0;
-          }
-        } else if (parkedAtSource) {
+        if (parkedAtSource) {
           currentWorld = sourceSiteParking.position.clone();
           nextWorld = currentWorld;
           distanceKm = 0;
-        } else if (minute < activeTrip.arrivalAtDestination) {
-          const tripDuration = Math.max(activeTrip.arrivalAtDestination - tripStartMinute, 1);
-          const outboundRatio = Math.max(0, Math.min(1, (minute - tripStartMinute) / tripDuration));
-          const forwardMinute = Math.min(minute + 0.6, activeTrip.arrivalAtDestination);
-          const nextOutboundRatio = Math.max(0, Math.min(1, (forwardMinute - tripStartMinute) / tripDuration));
-          const outboundLaneMetrics = getTravelLaneMetrics(truckId, "outbound", activeTrip);
+        } else if (movingOutbound) {
+          const outboundRatio = executionTruckState.outboundRatio;
+          const nextOutboundRatio = Math.max(0, Math.min(1, outboundRatio + 0.015));
+          const outboundLaneMetrics = getTravelLaneMetrics(truckId, "outbound", referenceTrip);
           currentWorld = interpolateWorldPathWithEndpointOffset(outboundLaneMetrics, outboundRatio, truckBodyOffset, roadTravelHeight);
           nextWorld = interpolateWorldPathWithEndpointOffset(outboundLaneMetrics, nextOutboundRatio, truckBodyOffset, roadTravelHeight);
           distanceKm = routeDistanceKm * Math.max(0, Math.min(1, outboundRatio));
         } else if (holdingAtDestinationOnRoad) {
-          const outboundLaneMetrics = getTravelLaneMetrics(truckId, "outbound", activeTrip);
+          const outboundLaneMetrics = getTravelLaneMetrics(truckId, "outbound", referenceTrip);
           currentWorld = interpolateWorldPathWithEndpointOffset(outboundLaneMetrics, 1, truckBodyOffset, roadTravelHeight);
           nextWorld = currentWorld;
           distanceKm = routeDistanceKm;
-        } else if (!returnStartedConfirmed || minute < returnStartMinute) {
+        } else if (parkedAtDestination || !returnStartedConfirmed || minute < returnStartMinute) {
           currentWorld = destinationSiteParking.position.clone();
           nextWorld = currentWorld;
           distanceKm = routeDistanceKm;
-        } else if (returnStartedConfirmed && activeTripHasReturnToSource && minute < Number(activeTrip.returnToSource)) {
-          const tripDuration = Math.max(Number(activeTrip.returnToSource) - returnStartMinute, 1);
-          const inboundRatio = (minute - returnStartMinute) / tripDuration;
-          const forwardMinute = Math.min(minute + 0.6, Number(activeTrip.returnToSource));
-          const nextInboundRatio = (forwardMinute - returnStartMinute) / tripDuration;
-          const inboundLaneMetrics = getTravelLaneMetrics(truckId, "inbound", activeTrip);
+        } else if (movingReturn) {
+          const inboundRatio = executionTruckState.inboundRatio;
+          const nextInboundRatio = Math.max(0, Math.min(1, inboundRatio + 0.015));
+          const inboundLaneMetrics = getTravelLaneMetrics(truckId, "inbound", referenceTrip);
           currentWorld = interpolateWorldPathWithEndpointOffset(inboundLaneMetrics, inboundRatio, truckBodyOffset, roadTravelHeight);
           nextWorld = interpolateWorldPathWithEndpointOffset(inboundLaneMetrics, nextInboundRatio, truckBodyOffset, roadTravelHeight);
           distanceKm = routeDistanceKm * Math.max(0, 1 - Math.min(1, inboundRatio));
         } else if (holdingAtSourceOnRoad) {
-          const inboundLaneMetrics = getTravelLaneMetrics(truckId, "inbound", activeTrip);
+          const inboundLaneMetrics = getTravelLaneMetrics(truckId, "inbound", referenceTrip);
           currentWorld = interpolateWorldPathWithEndpointOffset(inboundLaneMetrics, 1, truckBodyOffset, roadTravelHeight);
           nextWorld = currentWorld;
           distanceKm = 0;
@@ -2886,7 +2856,7 @@ function buildRouteTooltip(routeInfo) {
         const isParked =
           parkedAtDestination ||
           parkedAtSource ||
-          (activeTrip && returnStartedConfirmed && !activeTripHasReturnToSource && minute >= returnStartMinute);
+          false;
         let heading = lastHeading;
         if (isParked) {
           heading = getContinuousAngle(
@@ -2895,15 +2865,13 @@ function buildRouteTooltip(routeInfo) {
               : sourceSiteParking.heading,
             lastHeading,
           );
-        } else if (activeTrip && minute < activeTrip.arrivalAtDestination) {
-          const tripDuration = Math.max(activeTrip.arrivalAtDestination - tripStartMinute, 1);
-          const outboundRatio = Math.max(0, Math.min(1, (minute - tripStartMinute) / tripDuration));
+        } else if (movingOutbound) {
+          const outboundRatio = executionTruckState.outboundRatio;
           heading = outboundRatio < 0
             ? getContinuousAngle(sourceSiteParking.heading, lastHeading)
             : getContinuousAngle(movingHeading, lastHeading);
-        } else if (returnStartedConfirmed && activeTripHasReturnToSource && minute < Number(activeTrip.returnToSource)) {
-          const tripDuration = Math.max(Number(activeTrip.returnToSource) - returnStartMinute, 1);
-          const inboundRatio = Math.max(0, Math.min(1, (minute - returnStartMinute) / tripDuration));
+        } else if (movingReturn) {
+          const inboundRatio = executionTruckState.inboundRatio;
           heading = inboundRatio < 0
             ? getContinuousAngle(destinationSiteParking.heading, lastHeading)
             : getContinuousAngle(movingHeading, lastHeading);
@@ -2914,7 +2882,7 @@ function buildRouteTooltip(routeInfo) {
         mesh.position.copy(currentWorld);
         mesh.rotation.y = heading;
         const activeAlert = activeTripAlertRef.current;
-        const visibleLoadId = activeTrip?.loadId ?? completedTrip?.loadId ?? null;
+        const visibleLoadId = referenceTrip?.loadId ?? null;
         const alertMatchesTruck = Boolean(
           activeAlert && (
             (activeAlert?.assignmentId && String(activeAlert.assignmentId) === String(delayState.assignment?.id || "")) ||
