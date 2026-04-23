@@ -135,12 +135,20 @@ export const SAUDI_MAIN_CITIES = [
   { id: "madinah", name: "Madinah", lat: 24.5247, lng: 39.5692, tier: "metro" },
   { id: "dammam", name: "Dammam", lat: 26.4207, lng: 50.0888, tier: "metro" },
   { id: "khobar", name: "Khobar", lat: 26.2794, lng: 50.2083, tier: "city" },
+  { id: "jubail", name: "Jubail", lat: 27.0174, lng: 49.6225, tier: "city" },
   { id: "tabuk", name: "Tabuk", lat: 28.3838, lng: 36.5662, tier: "city" },
+  { id: "yanbu", name: "Yanbu", lat: 24.0891, lng: 38.0618, tier: "city" },
+  { id: "taif", name: "Taif", lat: 21.2703, lng: 40.4158, tier: "city" },
+  { id: "buraidah", name: "Buraidah", lat: 26.3592, lng: 43.9818, tier: "city" },
   { id: "abha", name: "Abha", lat: 18.2465, lng: 42.5117, tier: "city" },
+  { id: "al-baha", name: "Al Baha", lat: 20.0129, lng: 41.4677, tier: "city" },
   { id: "jazan", name: "Jazan", lat: 16.8892, lng: 42.5706, tier: "city" },
   { id: "hail", name: "Hail", lat: 27.5114, lng: 41.7208, tier: "city" },
+  { id: "sakaka", name: "Sakaka", lat: 29.9697, lng: 40.2064, tier: "city" },
+  { id: "arar", name: "Arar", lat: 30.9753, lng: 41.0381, tier: "city" },
   { id: "najran", name: "Najran", lat: 17.5650, lng: 44.2289, tier: "city" },
   { id: "hofuf", name: "Al Hofuf", lat: 25.3647, lng: 49.5876, tier: "city" },
+  { id: "khafji", name: "Khafji", lat: 28.4391, lng: 48.4913, tier: "city" },
 ];
 
 export const SAUDI_MAIN_CORRIDORS = [
@@ -157,6 +165,21 @@ export const SAUDI_MAIN_CORRIDORS = [
     ],
   },
   {
+    id: "red-sea-express",
+    kind: "coast",
+    points: [
+      [16.8892, 42.5706],
+      [18.2465, 42.5117],
+      [20.0129, 41.4677],
+      [21.2703, 40.4158],
+      [21.3891, 39.8579],
+      [21.5433, 39.1728],
+      [24.0891, 38.0618],
+      [24.5247, 39.5692],
+      [28.3838, 36.5662],
+    ],
+  },
+  {
     id: "east-corridor",
     kind: "arterial",
     points: [
@@ -168,12 +191,38 @@ export const SAUDI_MAIN_CORRIDORS = [
     ],
   },
   {
+    id: "gulf-spine",
+    kind: "arterial",
+    points: [
+      [28.4391, 48.4913],
+      [27.0174, 49.6225],
+      [26.4207, 50.0888],
+      [26.2794, 50.2083],
+      [25.3647, 49.5876],
+      [24.7466, 50.8078],
+    ],
+  },
+  {
     id: "riyadh-west",
     kind: "arterial",
     points: [
       [24.7136, 46.6753],
+      [23.8859, 45.0792],
+      [22.7751, 41.7382],
+      [21.2703, 40.4158],
       [21.3891, 39.8579],
       [21.5433, 39.1728],
+    ],
+  },
+  {
+    id: "riyadh-madinah-tabuk",
+    kind: "arterial",
+    points: [
+      [24.7136, 46.6753],
+      [26.3592, 43.9818],
+      [24.5247, 39.5692],
+      [24.0891, 38.0618],
+      [28.3838, 36.5662],
     ],
   },
   {
@@ -181,8 +230,22 @@ export const SAUDI_MAIN_CORRIDORS = [
     kind: "arterial",
     points: [
       [24.7136, 46.6753],
+      [26.3592, 43.9818],
       [27.5114, 41.7208],
+      [29.9697, 40.2064],
       [28.3838, 36.5662],
+    ],
+  },
+  {
+    id: "northern-arc",
+    kind: "regional",
+    points: [
+      [28.3838, 36.5662],
+      [29.9697, 40.2064],
+      [30.9753, 41.0381],
+      [27.5114, 41.7208],
+      [26.3592, 43.9818],
+      [24.7136, 46.6753],
     ],
   },
   {
@@ -190,8 +253,52 @@ export const SAUDI_MAIN_CORRIDORS = [
     kind: "regional",
     points: [
       [24.7136, 46.6753],
+      [21.2703, 40.4158],
+      [20.0129, 41.4677],
       [18.2465, 42.5117],
       [16.8892, 42.5706],
+    ],
+  },
+  {
+    id: "southern-energy-corridor",
+    kind: "arterial",
+    points: [
+      [24.7136, 46.6753],
+      [21.8120, 45.0400],
+      [19.5370, 45.5120],
+      [17.5650, 44.2289],
+    ],
+  },
+  {
+    id: "central-east-link",
+    kind: "regional",
+    points: [
+      [26.3592, 43.9818],
+      [24.7136, 46.6753],
+      [25.3647, 49.5876],
+      [26.4207, 50.0888],
+    ],
+  },
+  {
+    id: "western-highlands",
+    kind: "regional",
+    points: [
+      [24.5247, 39.5692],
+      [21.5433, 39.1728],
+      [21.2703, 40.4158],
+      [20.0129, 41.4677],
+      [18.2465, 42.5117],
+    ],
+  },
+  {
+    id: "eastern-desert-link",
+    kind: "regional",
+    points: [
+      [17.5650, 44.2289],
+      [19.2800, 46.7600],
+      [21.4100, 48.4200],
+      [25.3647, 49.5876],
+      [27.0174, 49.6225],
     ],
   },
 ];

@@ -10,9 +10,11 @@ import {
   authenticateUser,
   createDriverAccount,
   createForemanAccount,
+  deleteForemanAccount,
   createSession,
   getSession,
   refreshSession,
+  updateForemanAccount,
   clearSession,
 } from "./features/auth/auth.js";
 import {
@@ -36,7 +38,7 @@ import {
   getAvailabilityValidationError,
   sumTruckCounts,
 } from "./features/resources/storage.js";
-import { subscribeManagedForemen, subscribeManagerMoves, subscribeManagerResources, subscribeRigInventoryDoc } from "./lib/firebaseOperations.js";
+import { fetchAllUserProfiles, subscribeManagedForemen, subscribeManagerMoves, subscribeManagerResources, subscribeRigInventoryDoc } from "./lib/firebaseOperations.js";
 import { HomePage } from "./pages/HomePage.js";
 import { LoginPage } from "./pages/LoginPage.js";
 import { DashboardPage } from "./pages/DashboardPage.js";
@@ -962,6 +964,7 @@ function App() {
     taskAssignments: [],
   });
   const [managedForemen, setManagedForemen] = useState([]);
+  const [loginProfiles, setLoginProfiles] = useState([]);
   const [managerFleet, setManagerFleet] = useState([]);
   const [isSimulatingMove, setIsSimulatingMove] = useState(false);
   const [simulationProgress, setSimulationProgress] = useState(
@@ -1003,6 +1006,25 @@ function App() {
         setSession(nextSession);
       }
     }).catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    void fetchAllUserProfiles()
+      .then((profiles) => {
+        setLoginProfiles(
+          profiles
+            .filter((profile) => profile?.active !== false)
+            .map((profile) => ({
+              id: profile.id,
+              name: profile.name,
+              email: profile.email,
+              role: profile.role,
+            })),
+        );
+      })
+      .catch(() => {
+        setLoginProfiles([]);
+      });
   }, []);
 
   useEffect(() => {
@@ -1523,6 +1545,16 @@ function App() {
       setIsPlaybackPaused(false);
     }
   }, [route.page, activeMove?.id]);
+
+  useEffect(() => {
+    if (route.page !== "move" || !activeMove) {
+      return;
+    }
+
+    if (activeMove.executionState === "completed" || activeMove.operatingState === "drilling") {
+      navigateTo("/dashboard");
+    }
+  }, [route.page, activeMove?.id, activeMove?.executionState, activeMove?.operatingState]);
 
   useEffect(() => {
     if (route.page !== "move" || !activeMove) {
@@ -2437,15 +2469,25 @@ function App() {
     }
 
     if (managerId) {
-      await handleSaveManagerResources({
+      const nextResources = {
         ...(managerResources || {}),
         taskAssignments: (managerResources?.taskAssignments || []).filter((assignment) => assignment.moveId !== moveId),
-      });
+      };
+      setManagerResources(nextResources);
+      void handleSaveManagerResources(nextResources).catch(() => {});
     }
 
     navigateTo("/dashboard");
-    const nextMoves = await removeMove(moveId);
-    setMoves(nextMoves);
+    const previousMoves = moves;
+    setMoves((current) => current.filter((move) => move.id !== moveId));
+
+    try {
+      const nextMoves = await removeMove(moveId);
+      setMoves(nextMoves);
+    } catch (error) {
+      setMoves(previousMoves);
+      throw error;
+    }
   }
 
   function updateMoveExecutionState(moveId, executionState, extra = {}) {
@@ -2940,6 +2982,34 @@ function App() {
     return createdDriver;
   }
 
+  async function handleCreateManagerTruckResource(truckPayload) {
+    if (!managerId) {
+      return null;
+    }
+
+    const truck = truckPayload?.truck || null;
+    const driver = truckPayload?.driver || null;
+    if (!truck || !driver) {
+      return null;
+    }
+
+    const createdDriver = await createDriverAccount({
+      ...driver,
+      truckId: truck.id,
+      truckType: truck.type,
+      managerId,
+    });
+
+    const savedResources = await writeManagerResources(managerId, {
+      ...(managerResources || {}),
+      trucks: [...(managerResources?.trucks || []), truck],
+      drivers: [...(managerResources?.drivers || []), createdDriver],
+    });
+    setManagerResources(savedResources);
+    setManagerFleet(savedResources.fleet || []);
+    return { truck, driver: createdDriver };
+  }
+
   async function handleCreateManagerForemanAccount(foremanPayload) {
     if (!managerId) {
       return null;
@@ -2958,6 +3028,32 @@ function App() {
     });
 
     return createdForeman;
+  }
+
+  async function handleUpdateManagerForemanAccount(foremanPayload) {
+    if (!managerId) {
+      return null;
+    }
+
+    const updatedForeman = await updateForemanAccount({
+      ...foremanPayload,
+      managerId,
+    });
+
+    setManagedForemen((current) =>
+      current.map((foreman) => (foreman.id === updatedForeman.id ? { ...foreman, ...updatedForeman } : foreman)),
+    );
+
+    return updatedForeman;
+  }
+
+  async function handleDeleteManagerForemanAccount(foremanId) {
+    if (!managerId || !foremanId) {
+      return;
+    }
+
+    await deleteForemanAccount(foremanId);
+    setManagedForemen((current) => current.filter((foreman) => foreman.id !== foremanId));
   }
 
   async function handleSaveRigInventory(rigId, adjustments) {
@@ -3098,6 +3194,7 @@ function App() {
       onBackHome: () => navigateTo("/home"),
       language,
       onToggleLanguage: handleToggleLanguage,
+      loginProfiles,
     });
   }
 
@@ -3140,8 +3237,10 @@ function App() {
         currentUser: session,
         currentDate: new Date(),
         onOpenMove: handleOpenMove,
-        onCreateDriver: handleCreateManagerDriverAccount,
+        onCreateTruck: handleCreateManagerTruckResource,
         onCreateForeman: handleCreateManagerForemanAccount,
+        onUpdateForeman: handleUpdateManagerForemanAccount,
+        onDeleteForeman: handleDeleteManagerForemanAccount,
         onSaveResources: handleSaveManagerResources,
         onSaveFleet: handleSaveManagerFleet,
         onLogout: handleLogout,
@@ -3196,8 +3295,10 @@ function App() {
         currentUser: session,
         currentDate: new Date(),
         onOpenMove: handleOpenMove,
-        onCreateDriver: handleCreateManagerDriverAccount,
+        onCreateTruck: handleCreateManagerTruckResource,
         onCreateForeman: handleCreateManagerForemanAccount,
+        onUpdateForeman: handleUpdateManagerForemanAccount,
+        onDeleteForeman: handleDeleteManagerForemanAccount,
         onSaveResources: handleSaveManagerResources,
         onSaveFleet: handleSaveManagerFleet,
         onLogout: handleLogout,

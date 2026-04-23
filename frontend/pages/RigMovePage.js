@@ -1589,9 +1589,40 @@ function getRigLoadCounts(playback, currentMinute) {
   };
 }
 
-function buildTruckScheduleRows(playback) {
+function getCriticalLiftLoadIds(playback, logicalLoads = []) {
+  const criticalLoadIds = new Set();
+
+  (logicalLoads || []).forEach((load) => {
+    if (load?.is_critical) {
+      criticalLoadIds.add(load.id);
+    }
+  });
+
+  (playback?.trips || []).forEach((trip) => {
+    if (trip?.isCriticalLift || trip?.is_critical) {
+      criticalLoadIds.add(trip.loadId);
+    }
+  });
+
+  (playback?.journeys || []).forEach((journey) => {
+    if (journey?.isCriticalLift || journey?.is_critical) {
+      (journey.loadIds || []).forEach((loadId) => criticalLoadIds.add(loadId));
+    }
+  });
+
+  (playback?.tasks || []).forEach((task) => {
+    if (task?.isCriticalLift || task?.is_critical) {
+      criticalLoadIds.add(task.loadId);
+    }
+  });
+
+  return criticalLoadIds;
+}
+
+function buildTruckScheduleRows(playback, logicalLoads = []) {
   const journeys = playback?.journeys?.length ? playback.journeys : (playback?.trips || []);
   const totalMinutes = Math.max(playback?.totalMinutes || 1, 1);
+  const criticalLoadIds = getCriticalLiftLoadIds(playback, logicalLoads);
 
   function getTruckToneClass(truckType) {
     const normalized = String(truckType || "").trim().toLowerCase();
@@ -1626,6 +1657,7 @@ function buildTruckScheduleRows(playback) {
             width: (((trip.arrivalAtDestination - (trip.moveStart ?? trip.pickupLoadFinish ?? trip.rigDownFinish)) / totalMinutes) * 100),
             toneClass,
             label: trip.description || getLoadDisplayLabel(trip),
+            isCriticalLift: criticalLoadIds.has(trip.loadIds?.[0] ?? trip.loadId),
           });
         }
 
@@ -1690,15 +1722,17 @@ function buildTruckScheduleRows(playback) {
   });
 }
 
-function buildLoadScheduleRows(playback) {
+function buildLoadScheduleRows(playback, logicalLoads = []) {
   const trips = playback?.trips || [];
   const totalMinutes = Math.max(playback?.totalMinutes || 1, 1);
+  const criticalLoadIds = getCriticalLiftLoadIds(playback, logicalLoads);
 
   return trips
     .map((trip, index) => {
       const items = [];
       const sourceKind = trip.sourceKind || "rig";
       const loadLabel = getLoadDisplayLabel(trip) || `Load ${index + 1}`;
+      const isCriticalLift = criticalLoadIds.has(trip.loadId) || Boolean(trip.isCriticalLift || trip.is_critical);
 
       if ((trip.rigDownFinish ?? 0) > (trip.rigDownStart ?? trip.loadStart ?? 0)) {
         items.push({
@@ -1711,6 +1745,7 @@ function buildLoadScheduleRows(playback) {
           width: (((trip.rigDownFinish || 0) - (trip.rigDownStart ?? trip.loadStart ?? 0)) / totalMinutes) * 100,
           toneClass: "scene-timeline-segment-down",
           label: "RD",
+          isCriticalLift,
         });
       }
 
@@ -1725,6 +1760,7 @@ function buildLoadScheduleRows(playback) {
           width: (((trip.arrivalAtDestination || 0) - (trip.moveStart ?? trip.pickupLoadFinish ?? trip.rigDownFinish ?? 0)) / totalMinutes) * 100,
           toneClass: "scene-timeline-segment-move",
           label: "RM",
+          isCriticalLift,
         });
       }
 
@@ -1739,6 +1775,7 @@ function buildLoadScheduleRows(playback) {
           width: (((trip.rigUpFinish || 0) - (trip.rigUpStart ?? trip.arrivalAtDestination ?? 0)) / totalMinutes) * 100,
           toneClass: "scene-timeline-segment-up",
           label: "RU",
+          isCriticalLift,
         });
       }
 
@@ -2038,9 +2075,10 @@ function normalizeScenePlayback(playback) {
   };
 }
 
-function buildPhaseScheduleRows(playback) {
+function buildPhaseScheduleRows(playback, logicalLoads = []) {
   const trips = playback?.trips || [];
   const totalMinutes = Math.max(playback?.totalMinutes || 1, 1);
+  const criticalLoadIds = getCriticalLiftLoadIds(playback, logicalLoads);
   const phaseBuckets = new Map([
     ["rigDown", []],
     ["move", []],
@@ -2050,6 +2088,7 @@ function buildPhaseScheduleRows(playback) {
   trips.forEach((trip, index) => {
     const loadLabel = getLoadDisplayLabel(trip);
     const description = trip.description || `Load ${loadLabel}`;
+    const isCriticalLift = criticalLoadIds.has(trip.loadId) || Boolean(trip.isCriticalLift || trip.is_critical);
 
     if ((trip.rigDownFinish ?? 0) > (trip.rigDownStart ?? trip.loadStart ?? 0)) {
       phaseBuckets.get("rigDown").push({
@@ -2064,6 +2103,7 @@ function buildPhaseScheduleRows(playback) {
         label: loadLabel,
         typeCode: "RD",
         subLabel: description,
+        isCriticalLift,
       });
     }
 
@@ -2082,6 +2122,7 @@ function buildPhaseScheduleRows(playback) {
         truckId: trip.truckId,
         truckType: trip.truckType,
         subLabel: trip.truckType || "Truck",
+        isCriticalLift,
       });
     }
 
@@ -2098,6 +2139,7 @@ function buildPhaseScheduleRows(playback) {
         label: loadLabel,
         typeCode: "RU",
         subLabel: description,
+        isCriticalLift,
       });
     }
   });
@@ -2334,7 +2376,8 @@ function buildCriticalPathRows(playback) {
     .sort((left, right) => left.items[0].startMinute - right.items[0].startMinute || left.loadId - right.loadId);
 }
 
-function buildCpmScheduleRows(playback) {
+function buildCpmScheduleRows(playback, logicalLoads = []) {
+  const criticalLoadIds = getCriticalLiftLoadIds(playback, logicalLoads);
   const plannerTasks = getPlaybackTasks(playback)
     .filter((task) => task.phase !== "start" && task.phase !== "finish")
     .sort((left, right) =>
@@ -2365,6 +2408,7 @@ function buildCpmScheduleRows(playback) {
         floatMinutes: Math.max(0, Number(task.slack) || 0),
         sourceKind: task.sourceKind || "rig",
         critical: Boolean(task.isCritical),
+        isCriticalLift: criticalLoadIds.has(task.loadId) || Boolean(task.isCriticalLift || task.is_critical),
       },
     ],
   }));
@@ -2771,6 +2815,7 @@ function LoadScheduleTable({ playback, currentMinute }) {
 
 function FullScreenTimeline({
   playback,
+  logicalLoads = [],
   currentMinute,
   zoom = 1,
   gapMinutes = 8 * 60,
@@ -2815,12 +2860,12 @@ function FullScreenTimeline({
   const rows = useMemo(() => {
     const baseRows =
       rowType === "phase"
-        ? buildPhaseScheduleRows(playback)
+        ? buildPhaseScheduleRows(playback, logicalLoads)
         : rowType === "load"
-        ? buildLoadScheduleRows(playback)
+        ? buildLoadScheduleRows(playback, logicalLoads)
         : rowType === "truck"
-          ? buildTruckScheduleRows(playback)
-          : buildCpmScheduleRows(playback);
+          ? buildTruckScheduleRows(playback, logicalLoads)
+          : buildCpmScheduleRows(playback, logicalLoads);
     const filteredRows = baseRows
       .map((row) => {
         const visibleItems = (row.items || []).filter((trip) =>
@@ -2849,7 +2894,7 @@ function FullScreenTimeline({
         return true;
       });
     return filteredRows;
-  }, [playback, rowType, cpOnly, shouldShowTrip, visibleStartMinute, visibleEndMinute]);
+  }, [playback, logicalLoads, rowType, cpOnly, shouldShowTrip, visibleStartMinute, visibleEndMinute]);
   const tickStepMinutes = Math.max(60, tickMinutes || (visibleRangeMinutes <= 12 * 60 ? 2 * 60 : 4 * 60));
   const tickCount = Math.max(1, Math.ceil(visibleRangeMinutes / tickStepMinutes));
   const ticks = useMemo(
@@ -3136,7 +3181,7 @@ function FullScreenTimeline({
                   "div",
                   {
                     key: trip.key,
-                    className: `scene-timeline-trip${rowType === "phase" ? " is-phase" : rowType === "load" ? " is-phase" : rowType === "cpm" ? " is-phase" : " is-truck"}${tripSizeClass}`,
+                    className: `scene-timeline-trip${rowType === "phase" ? " is-phase" : rowType === "load" ? " is-phase" : rowType === "cpm" ? " is-phase" : " is-truck"}${tripSizeClass}${trip.isCriticalLift ? " is-critical-lift" : ""}`,
                     style: {
                       left: `${leftPercent}%`,
                       width: `${tripWidthPercent}%`,
@@ -3150,11 +3195,11 @@ function FullScreenTimeline({
                   },
                   h(
                     "div",
-                    { className: "scene-timeline-trip-shell" },
+                    { className: `scene-timeline-trip-shell${trip.isCriticalLift ? " is-critical-lift" : ""}` },
                     [
                       h("span", {
                         key: `${trip.key}-future`,
-                        className: `scene-timeline-segment scene-timeline-segment-future ${toneClass}`,
+                        className: `scene-timeline-segment scene-timeline-segment-future ${toneClass}${trip.isCriticalLift ? " is-critical-lift" : ""}`,
                         style: {
                           left: "0%",
                           width: "100%",
@@ -3162,7 +3207,7 @@ function FullScreenTimeline({
                       }),
                       h("span", {
                         key: `${trip.key}-active`,
-                        className: `scene-timeline-segment scene-timeline-segment-active${activeFillPercent >= 99.5 ? " is-complete" : ""} ${toneClass}`,
+                        className: `scene-timeline-segment scene-timeline-segment-active${activeFillPercent >= 99.5 ? " is-complete" : ""} ${toneClass}${trip.isCriticalLift ? " is-critical-lift" : ""}`,
                         style: {
                           left: "0%",
                           width: `${activeFillPercent}%`,
@@ -3779,6 +3824,7 @@ function buildPlannerActivityRows(playback) {
 
 function PlannerCanvas({
   playback,
+  logicalLoads = [],
   zoom = 1,
   criticalPathChain = [],
   criticalScheduleRows = [],
@@ -3924,6 +3970,13 @@ function PlannerCanvas({
             : h("span", { className: "muted-copy" }, "No critical chain available."),
         ),
       ),
+    ),
+    h(
+      Card,
+      { className: "scene-planner-canvas-card scene-planner-network-card" },
+      h("span", { className: "scene-panel-kicker" }, "CP Network"),
+      h("div", { className: "scene-planner-section-note" }, `${criticalPathChain.length} activities`),
+      h(CPMNetworkDiagram, { playback, zoom: 0.6 }),
     ),
     h(
       Card,
@@ -4134,6 +4187,7 @@ function PlannerCanvas({
       ),
       h(FullScreenTimeline, {
         playback,
+        logicalLoads,
         currentMinute,
         zoom,
         rowType: ganttView,
@@ -5371,12 +5425,12 @@ export function RigMovePage({
     [activePlayback, displayExecutionAssignments, executionState, preliminaryExecutionMinute],
   );
   const loadTimelineRows = useMemo(
-    () => (isTimelineMode && timelineRowType === "load" ? buildLoadScheduleRows(timelinePlayback) : []),
-    [isTimelineMode, timelineRowType, timelinePlayback],
+    () => (isTimelineMode && timelineRowType === "load" ? buildLoadScheduleRows(timelinePlayback, logicalLoads) : []),
+    [isTimelineMode, timelineRowType, timelinePlayback, logicalLoads],
   );
   const cpmTimelineRows = useMemo(
-    () => (isTimelineMode && timelineRowType === "cpm" ? buildCpmScheduleRows(timelinePlayback) : []),
-    [isTimelineMode, timelineRowType, timelinePlayback],
+    () => (isTimelineMode && timelineRowType === "cpm" ? buildCpmScheduleRows(timelinePlayback, logicalLoads) : []),
+    [isTimelineMode, timelineRowType, timelinePlayback, logicalLoads],
   );
   const timelineRowsCount = !isTimelineMode
     ? 0
@@ -6164,6 +6218,7 @@ export function RigMovePage({
               { className: "scene-timeline-layout" },
               h(PlannerCanvas, {
                 playback: activePlayback,
+                logicalLoads,
                 zoom: timelineZoom,
                 criticalPathChain,
                 criticalScheduleRows,
@@ -6227,6 +6282,7 @@ export function RigMovePage({
                 ))
             : h(FullScreenTimeline, {
                 playback: timelinePlayback,
+                logicalLoads,
                 currentMinute: executionState === "planning" ? visibleMinute : liveSceneMinute,
                 zoom: timelineZoom,
               }),

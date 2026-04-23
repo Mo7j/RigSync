@@ -5,13 +5,19 @@ import { Field, TextInput } from "../components/ui/Field.js";
 import { TEST_USERS, TEST_USER } from "../features/auth/auth.js";
 import { translate } from "../lib/language.js";
 
-const { useState } = React;
+const { useMemo, useState } = React;
 
-export function LoginPage({ isAuthenticated, onLogin, onBackHome, language = "en", onToggleLanguage }) {
+export function LoginPage({ isAuthenticated, onLogin, onBackHome, language = "en", onToggleLanguage, loginProfiles = [] }) {
   const [email, setEmail] = useState(TEST_USER.email);
   const [password, setPassword] = useState(TEST_USER.password);
   const [error, setError] = useState("");
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const selectableProfiles = useMemo(() => {
+    if (loginProfiles.length) {
+      return loginProfiles;
+    }
+    return TEST_USERS;
+  }, [loginProfiles]);
 
   async function handleSubmit(event) {
     event.preventDefault();
@@ -80,16 +86,18 @@ export function LoginPage({ isAuthenticated, onLogin, onBackHome, language = "en
         h(
           "div",
           { className: "auth-demo-accounts" },
-          TEST_USERS.map((user) =>
+          selectableProfiles.map((user) =>
             h(
               "button",
               {
-                key: user.id,
+                key: user.id || user.email,
                 type: "button",
                 className: "auth-demo-account",
                 onClick: () => {
                   setEmail(user.email);
-                  setPassword(user.password);
+                  if (user.password) {
+                    setPassword(user.password);
+                  }
                 },
               },
               h("strong", null, user.role),

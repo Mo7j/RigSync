@@ -7,54 +7,6 @@ import { translate } from "../lib/language.js";
 
 const { useEffect, useMemo, useRef, useState } = React;
 
-const FEATURE_ITEMS = [
-  {
-    icon: "NP",
-    title: "Network-Based Rig Planning",
-    copy: "See the company fleet as one connected operational network, choose the rig that needs to move, and plan in the context of all available rigs, routes, trucks, and field constraints.",
-  },
-  {
-    icon: "TO",
-    title: "Trade-Off Aware Optimization",
-    copy: "Compare the best move plan for speed, cost, or utilization. RigSync surfaces the operational trade-offs clearly so the selected plan matches the situation on the ground.",
-  },
-  {
-    icon: "DV",
-    title: "Digital Twin Execution View",
-    copy: "Move from planning into execution on the same operational twin. Follow route progress, move phases, active trucks, and site readiness without switching between disconnected tools.",
-  },
-  {
-    icon: "FO",
-    title: "Office-Level Fleet Oversight",
-    copy: "Oversee all rigs, active moves, drivers, trucks, and field resources from one control surface designed for management visibility across the full company network.",
-  },
-  {
-    icon: "RD",
-    title: "Resource And Driver Control",
-    copy: "Manage truck readiness, linked drivers, fleet availability, and operational assignments through one workspace that stays aligned with move execution.",
-  },
-  {
-    icon: "AI",
-    title: "AI Operational Assistant",
-    copy: "Use the assistant to retrieve move status, inspect plan trade-offs, support senior review, and answer operational questions quickly with the right context already in the system.",
-  },
-];
-
-const FAQ_ITEMS = [
-  {
-    question: "What is the difference between a digital twin and a simulation?",
-    answer: "A simulation tests one possible move scenario. A digital twin is broader: it represents the live operational system itself, including rigs, trucks, drivers, routes, resources, and move status. In RigSync, simulation is one capability inside the digital twin.",
-  },
-  {
-    question: "Why should I use RigSync instead of traditional planning tools?",
-    answer: "Traditional move planning is usually fragmented across spreadsheets, calls, static plans, and separate tracking tools. RigSync brings planning, comparison, execution visibility, office oversight, and operational intelligence into one connected platform.",
-  },
-  {
-    question: "How does RigSync help decisions during a move?",
-    answer: "RigSync helps teams choose the plan that best fits current priorities, whether that means moving faster, reducing cost, or improving truck utilization. During execution it keeps managers, foremen, and field teams aligned on one operational picture.",
-  },
-];
-
 function FeatureSymbol({ code }) {
   const commonProps = {
     viewBox: "0 0 24 24",
@@ -181,32 +133,86 @@ export function HomePage({
   onToggleLanguage,
 }) {
   const t = (key, fallback) => translate(language, key, fallback);
+  const featureItems = useMemo(
+    () => [
+      {
+        icon: "NP",
+        title: t("homeFeaturePlanningTitle", "Network-Based Rig Planning"),
+        copy: t("homeFeaturePlanningCopy", "See the company fleet as one connected operational network, choose the rig that needs to move, and plan in the context of all available rigs, routes, trucks, and field constraints."),
+      },
+      {
+        icon: "TO",
+        title: t("homeFeatureOptimizationTitle", "Trade-Off Aware Optimization"),
+        copy: t("homeFeatureOptimizationCopy", "Compare the best move plan for speed, cost, or utilization. RigSync surfaces the operational trade-offs clearly so the selected plan matches the situation on the ground."),
+      },
+      {
+        icon: "DV",
+        title: t("homeFeatureExecutionTitle", "Digital Twin Execution View"),
+        copy: t("homeFeatureExecutionCopy", "Move from planning into execution on the same operational twin. Follow route progress, move phases, active trucks, and site readiness without switching between disconnected tools."),
+      },
+      {
+        icon: "FO",
+        title: t("homeFeatureOversightTitle", "Office-Level Fleet Oversight"),
+        copy: t("homeFeatureOversightCopy", "Oversee all rigs, active moves, drivers, trucks, and field resources from one control surface designed for management visibility across the full company network."),
+      },
+      {
+        icon: "RD",
+        title: t("homeFeatureResourcesTitle", "Resource And Driver Control"),
+        copy: t("homeFeatureResourcesCopy", "Manage truck readiness, linked drivers, fleet availability, and operational assignments through one workspace that stays aligned with move execution."),
+      },
+      {
+        icon: "AI",
+        title: t("homeFeatureAssistantTitle", "AI Operational Assistant"),
+        copy: t("homeFeatureAssistantCopy", "Use the assistant to retrieve move status, inspect plan trade-offs, support senior review, and answer operational questions quickly with the right context already in the system."),
+      },
+    ],
+    [language],
+  );
+  const faqItems = useMemo(
+    () => [
+      {
+        question: t("homeFaq1Question", "What is the difference between a digital twin and a simulation?"),
+        answer: t("homeFaq1Answer", "A simulation tests one possible move scenario. A digital twin is broader: it represents the live operational system itself, including rigs, trucks, drivers, routes, resources, and move status. In RigSync, simulation is one capability inside the digital twin."),
+      },
+      {
+        question: t("homeFaq2Question", "Why should I use RigSync instead of traditional planning tools?"),
+        answer: t("homeFaq2Answer", "Traditional move planning is usually fragmented across spreadsheets, calls, static plans, and separate tracking tools. RigSync brings planning, comparison, execution visibility, office oversight, and operational intelligence into one connected platform."),
+      },
+      {
+        question: t("homeFaq3Question", "How does RigSync help decisions during a move?"),
+        answer: t("homeFaq3Answer", "RigSync helps teams choose the plan that best fits current priorities, whether that means moving faster, reducing cost, or improving truck utilization. During execution it keeps managers, foremen, and field teams aligned on one operational picture."),
+      },
+    ],
+    [language],
+  );
   const aboutSectionRef = useRef(null);
   const [isAboutVisible, setIsAboutVisible] = useState(false);
   const aboutMetrics = useMemo(
     () => [
       {
-        label: "Connected Rigs",
+        label: t("homeMetricConnectedRigsLabel", "Connected Rigs"),
         target: Math.max(18, Number(moveCount) || 0),
-        meta: "Across the company network",
+        meta: t("homeMetricConnectedRigsMeta", "Across the company network"),
       },
       {
-        label: "Move Scenarios",
+        label: t("homeMetricMoveScenariosLabel", "Move Scenarios"),
         target: Math.max(64, (Number(moveCount) || 0) * 8),
-        meta: "Speed, cost, and utilization trade-offs",
+        meta: t("homeMetricMoveScenariosMeta", "Speed, cost, and utilization trade-offs"),
       },
       {
-        label: "Tracked Resources",
+        label: t("homeMetricTrackedResourcesLabel", "Tracked Resources"),
         target: Math.max(240, Number(loadCount) || 0),
-        meta: isLoadingLoads ? "Loading live operational totals" : "Drivers, trucks, loads, and readiness signals",
+        meta: isLoadingLoads
+          ? t("homeMetricTrackedResourcesLoadingMeta", "Loading live operational totals")
+          : t("homeMetricTrackedResourcesMeta", "Drivers, trucks, loads, and readiness signals"),
       },
       {
-        label: "Execution Views",
+        label: t("homeMetricExecutionViewsLabel", "Execution Views"),
         target: 4,
-        meta: "Planning, move tracking, oversight, and AI assistance",
+        meta: t("homeMetricExecutionViewsMeta", "Planning, move tracking, oversight, and AI assistance"),
       },
     ],
-    [moveCount, loadCount, isLoadingLoads],
+    [language, moveCount, loadCount, isLoadingLoads],
   );
 
   useEffect(() => {
@@ -502,15 +508,15 @@ export function HomePage({
           h(
             "h1",
             { className: "hero-title" },
-            "Operational",
+            t("homeHeroTitleLine1", "Operational"),
             h("br"),
-            h("span", { className: "hero-title-accent" }, "Precision"),
-            " At Scale",
+            h("span", { className: "hero-title-accent" }, t("homeHeroTitleAccent", "Precision")),
+            ` ${t("homeHeroTitleLine2", "At Scale")}`,
           ),
           h(
             "p",
             { className: "hero-text hero-text-wide" },
-            "Plan and execute rig moves through one connected operational network. RigSync links rigs, routes, trucks, and field decisions in a live visual system that moves with the page like an interactive control surface.",
+            t("homeHeroBody", "Plan and execute rig moves through one connected operational network. RigSync links rigs, routes, trucks, and field decisions in a live visual system that moves with the page like an interactive control surface."),
           ),
           h(
             "div",
@@ -539,12 +545,12 @@ export function HomePage({
               h(
                 "div",
                 { className: "about-copy-block about-copy-block-full" },
-                h("p", { className: "hero-badge" }, "About RigSync"),
-                h("h2", { className: "section-title" }, "A Digital Twin Built For Real Rig Move Decisions"),
+                h("p", { className: "hero-badge" }, t("homeAboutBadge", "About RigSync")),
+                h("h2", { className: "section-title" }, t("homeAboutTitle", "A Digital Twin Built For Real Rig Move Decisions")),
                 h(
                   "p",
                   { className: "muted-copy section-copy" },
-                  "RigSync gives drilling organizations a digital twin of their move operations. Instead of coordinating rig moves through disconnected spreadsheets, phone calls, and isolated tracking tools, teams can model rigs, trucks, drivers, routes, resources, and site readiness in one operational system. The result is faster planning, clearer trade-offs, stronger execution visibility, and better control from the office to the field.",
+                  t("homeAboutBody", "RigSync gives drilling organizations a digital twin of their move operations. Instead of coordinating rig moves through disconnected spreadsheets, phone calls, and isolated tracking tools, teams can model rigs, trucks, drivers, routes, resources, and site readiness in one operational system. The result is faster planning, clearer trade-offs, stronger execution visibility, and better control from the office to the field."),
                 ),
               ),
               h(
@@ -562,7 +568,7 @@ export function HomePage({
                         label: metric.label,
                         target: metric.target,
                         isActive: isAboutVisible,
-                        suffix: metric.label === "Connected Rigs" ? "+" : "",
+                        suffix: metric.label === t("homeMetricConnectedRigsLabel", "Connected Rigs") ? "+" : "",
                         meta: metric.meta,
                         className: "metric-card-strip",
                       }),
@@ -586,18 +592,18 @@ export function HomePage({
             h(
               "div",
               { className: "feature-showcase-head" },
-              h("p", { className: "hero-badge" }, "Features"),
-              h("h2", { className: "section-title features-section-title" }, "From Move Planning To Fleet Oversight In One System"),
+              h("p", { className: "hero-badge" }, t("featuresTitle", "Features")),
+              h("h2", { className: "section-title features-section-title" }, t("homeFeaturesTitle", "From Move Planning To Fleet Oversight In One System")),
               h(
                 "p",
                 { className: "feature-showcase-lead-copy" },
-                "RigSync combines planning, execution, fleet visibility, and field readiness in one operational system built for live rig move control.",
+                t("homeFeaturesLead", "RigSync combines planning, execution, fleet visibility, and field readiness in one operational system built for live rig move control."),
               ),
             ),
             h(
               "div",
               { className: "feature-showcase-grid" },
-              FEATURE_ITEMS.slice(0, 5).map((item, index) =>
+              featureItems.slice(0, 5).map((item, index) =>
                 h(
                   Card,
                   {
@@ -627,12 +633,12 @@ export function HomePage({
         h(
           "div",
           { className: "home-scene-panel home-faq-scene-panel home-scene-panel-center" },
-          h("p", { className: "eyebrow" }, "FAQ"),
-          h("h2", { className: "home-faq-title" }, "Digital Twin Questions That Matter"),
+          h("p", { className: "eyebrow" }, t("brandNavFaq", "FAQ")),
+          h("h2", { className: "home-faq-title" }, t("homeFaqTitle", "Digital Twin Questions That Matter")),
           h(
             "div",
             { className: "faq-list faq-list-compact" },
-            FAQ_ITEMS.map((item) =>
+            faqItems.map((item) =>
               h(
                 "details",
                 { key: item.question, className: "faq-item-compact" },
@@ -662,7 +668,7 @@ export function HomePage({
             "div",
             { className: "marketing-footer-brand" },
             h("strong", { className: "footer-brand" }, "RigSync"),
-            h("p", { className: "muted-copy" }, "A digital twin platform for network-wide rig move planning, execution oversight, and operational intelligence."),
+            h("p", { className: "muted-copy" }, t("homeFooterBody", "A digital twin platform for network-wide rig move planning, execution oversight, and operational intelligence.")),
           ),
           h(
             "div",
@@ -698,7 +704,7 @@ export function HomePage({
                 className: "footer-link",
                 onClick: () => document.getElementById("about")?.scrollIntoView({ behavior: "smooth" }),
               },
-              "About RigSync",
+              t("homeAboutBadge", "About RigSync"),
             ),
             h(
               "button",
@@ -707,7 +713,7 @@ export function HomePage({
                 className: "footer-link",
                 onClick: () => document.getElementById("faq")?.scrollIntoView({ behavior: "smooth" }),
               },
-              "FAQ",
+              t("brandNavFaq", "FAQ"),
             ),
           ),
         ),
@@ -715,7 +721,7 @@ export function HomePage({
           "div",
           { className: "marketing-footer-bottom" },
           h("span", null, "© 2026 RigSync"),
-          h("span", null, "Built for digital twin rig move operations"),
+          h("span", null, t("homeFooterTagline", "Built for digital twin rig move operations")),
         ),
       ),
     ),

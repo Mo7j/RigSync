@@ -175,6 +175,11 @@ export async function getUserProfileByEmail(email) {
   return snapshot.docs.length ? normalizeDocSnapshot(snapshot.docs[0]) : null;
 }
 
+export async function fetchAllUserProfiles() {
+  const snapshot = await getDocs(collection(firebaseDb, FIRESTORE_COLLECTIONS.users));
+  return snapshot.docs.map(normalizeDocSnapshot).filter(Boolean);
+}
+
 export function subscribeManagedForemen(managerId, callback) {
   if (!managerId) {
     callback([]);
@@ -186,7 +191,7 @@ export function subscribeManagedForemen(managerId, callback) {
     callback(
       snapshot.docs
         .map(normalizeDocSnapshot)
-        .filter((user) => user && user.role === FIREBASE_USER_ROLES.foreman),
+        .filter((user) => user && user.role === FIREBASE_USER_ROLES.foreman && user.active !== false),
     );
   });
 }
@@ -200,6 +205,13 @@ export async function upsertUserProfile(user) {
 
   await setDoc(doc(firebaseDb, FIRESTORE_COLLECTIONS.users, user.id), payload, { merge: true });
   return payload;
+}
+
+export async function deleteUserProfile(userId) {
+  if (!userId) {
+    return;
+  }
+  await deleteDoc(doc(firebaseDb, FIRESTORE_COLLECTIONS.users, userId));
 }
 
 export async function signInFirebaseUser(email, password) {

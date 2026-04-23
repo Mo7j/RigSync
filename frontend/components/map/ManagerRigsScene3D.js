@@ -4,6 +4,8 @@ import { OrbitControls } from "https://esm.sh/three@0.179.1/examples/jsm/control
 import { GLTFLoader } from "https://esm.sh/three@0.179.1/examples/jsm/loaders/GLTFLoader.js";
 import {
   SAUDI_BORDER_POINTS,
+  SAUDI_MAIN_CITIES,
+  SAUDI_MAIN_CORRIDORS,
 } from "./saudiShape.js";
 
 const { useEffect, useRef } = React;
@@ -14,6 +16,32 @@ const TERRAIN_DEPTH = 7.5;
 const SURFACE_SEGMENTS = 18;
 const modelLoader = new GLTFLoader();
 let rigTemplatePromise = null;
+const SAUDI_REGION_DIVIDERS = [
+  [
+    { lat: 28.8, lng: 39.2 },
+    { lat: 27.6, lng: 41.5 },
+    { lat: 26.1, lng: 44.6 },
+    { lat: 24.8, lng: 47.0 },
+  ],
+  [
+    { lat: 24.7, lng: 39.5 },
+    { lat: 23.7, lng: 42.4 },
+    { lat: 22.4, lng: 45.0 },
+    { lat: 21.0, lng: 47.4 },
+  ],
+  [
+    { lat: 21.6, lng: 39.4 },
+    { lat: 20.4, lng: 41.8 },
+    { lat: 19.3, lng: 44.0 },
+    { lat: 18.2, lng: 46.1 },
+  ],
+  [
+    { lat: 27.0, lng: 47.6 },
+    { lat: 25.9, lng: 48.4 },
+    { lat: 24.4, lng: 49.1 },
+    { lat: 22.6, lng: 49.8 },
+  ],
+];
 
 function pointsMatch(a, b, epsilon = 0.0001) {
   return Math.abs((a?.x || 0) - (b?.x || 0)) <= epsilon && Math.abs((a?.y || 0) - (b?.y || 0)) <= epsilon;
@@ -175,9 +203,179 @@ function interpolateRoutePoint(routeGeometry, progressPercent) {
   return { lat: last[0], lng: last[1] };
 }
 
-function resolveRigCurrentPoint(rig) {
-  if (rig?.executionState === "active" && rig?.routeGeometry?.length > 1) {
-    return interpolateRoutePoint(rig.routeGeometry, rig.completionPercentage || 0);
+function createCoordKey(point) {
+  const lat = Array.isArray(point) ? point[0] : point?.lat;
+  const lng = Array.isArray(point) ? point[1] : point?.lng;
+  return `${Number(lat || 0).toFixed(4)}:${Number(lng || 0).toFixed(4)}`;
+}
+
+function measureCoordDistance(a, b) {
+  const deltaLat = Number(b?.lat || 0) - Number(a?.lat || 0);
+  const deltaLng = Number(b?.lng || 0) - Number(a?.lng || 0);
+  return Math.sqrt((deltaLat * deltaLat) + (deltaLng * deltaLng));
+}
+
+function interpolateLatLngPoint(start, end, ratio) {
+  return [
+    start[0] + ((end[0] - start[0]) * ratio),
+    start[1] + ((end[1] - start[1]) * ratio),
+  ];
+}
+
+function locatePointOnCorridor(point, corridorPoints) {
+  let best = null;
+
+  for (let index = 1; index < corridorPoints.length; index += 1) {
+    const start = corridorPoints[index - 1];
+    const end = corridorPoints[index];
+    const dx = end[1] - start[1];
+    const dy = end[0] - start[0];
+    const lengthSquared = (dx * dx) + (dy * dy);
+    const ratio = lengthSquared
+      ? Math.max(0, Math.min(1, (((point.lng - start[1]) * dx) + ((point.lat - start[0]) * dy)) / lengthSquared))
+      : 0;
+    const projected = interpolateLatLngPoint(start, end, ratio);
+    const distance = Math.sqrt(((point.lat - projected[0]) ** 2) + ((point.lng - projected[1]) ** 2));
+
+    if (!best || distance < best.distance) {
+      best = { index: index - 1, ratio, point: projected, distance };
+    }
+  }
+
+  return best;
+}
+
+function buildCorridorSubpath(corridorPoints, fromLocation, toLocation) {
+  if (!corridorPoints?.length || !fromLocation || !toLocation) {
+    return [];
+  }
+
+  const path = [];
+  const startKey = (fromLocation.index + fromLocation.ratio);
+  const endKey = (toLocation.index + toLocation.ratio);
+
+  if (startKey <= endKey) {
+    path.push(fromLocation.point);
+    for (let index = fromLocation.index + 1; index <= toLocation.index; index += 1) {
+      path.push(corridorPoints[index]);
+    }
+    path.push(toLocation.point);
+  } else {
+    path.push(fromLocation.point);
+    for (let index = fromLocation.index; index > toLocation.index; index -= 1) {
+      path.push(corridorPoints[index]);
+    }
+    path.push(toLocation.point);
+  }
+
+  return path.filter((point, index, list) => (
+    index === 0
+      || point[0] !== list[index - 1][0]
+      || point[1] !== list[index - 1][1]
+  ));
+}
+
+function joinRouteGeometry(parts) {
+  return (parts || [])
+    .flat()
+    .filter((point) => Array.isArray(point) && point.length >= 2)
+    .filter((point, index, list) => (
+      index === 0
+        || point[0] !== list[index - 1][0]
+        || point[1] !== list[index - 1][1]
+    ));
+}
+
+function buildCorridorFallbackRoute(startPoint, endPoint) {
+  if (!startPoint || !endPoint) {
+    return [];
+  }
+
+  const corridorMatches = SAUDI_MAIN_CORRIDORS.map((corridor) => {
+    const points = corridor.points || [];
+    const startLocation = locatePointOnCorridor(startPoint, points);
+    const endLocation = locatePointOnCorridor(endPoint, points);
+    return { corridor, points, startLocation, endLocation };
+  });
+
+  const sameCorridorMatch = corridorMatches
+    .filter((match) => match.startLocation && match.endLocation)
+    .map((match) => ({
+      score: (match.startLocation.distance * 0.9) + (match.endLocation.distance * 0.9),
+      geometry: joinRouteGeometry([
+        [[startPoint.lat, startPoint.lng]],
+        buildCorridorSubpath(match.points, match.startLocation, match.endLocation),
+        [[endPoint.lat, endPoint.lng]],
+      ]),
+    }))
+    .filter((match) => match.geometry.length > 2)
+    .sort((left, right) => left.score - right.score)[0];
+
+  if (sameCorridorMatch && sameCorridorMatch.score < 3.2) {
+    return sameCorridorMatch.geometry;
+  }
+
+  let bestPair = null;
+  for (let leftIndex = 0; leftIndex < corridorMatches.length; leftIndex += 1) {
+    for (let rightIndex = leftIndex + 1; rightIndex < corridorMatches.length; rightIndex += 1) {
+      const left = corridorMatches[leftIndex];
+      const right = corridorMatches[rightIndex];
+      if (!left.startLocation || !right.endLocation) {
+        continue;
+      }
+
+      const sharedKeys = new Set(left.points.map((point) => createCoordKey(point)));
+      const sharedPoint = right.points.find((point) => sharedKeys.has(createCoordKey(point)));
+      if (!sharedPoint) {
+        continue;
+      }
+
+      const sharedLeft = locatePointOnCorridor({ lat: sharedPoint[0], lng: sharedPoint[1] }, left.points);
+      const sharedRight = locatePointOnCorridor({ lat: sharedPoint[0], lng: sharedPoint[1] }, right.points);
+      const geometry = joinRouteGeometry([
+        [[startPoint.lat, startPoint.lng]],
+        buildCorridorSubpath(left.points, left.startLocation, sharedLeft),
+        buildCorridorSubpath(right.points, sharedRight, right.endLocation),
+        [[endPoint.lat, endPoint.lng]],
+      ]);
+      const score = left.startLocation.distance + right.endLocation.distance + (measureCoordDistance(startPoint, endPoint) * 0.08);
+
+      if (geometry.length > 3 && (!bestPair || score < bestPair.score)) {
+        bestPair = { score, geometry };
+      }
+    }
+  }
+
+  if (bestPair && bestPair.score < 3.8) {
+    return bestPair.geometry;
+  }
+
+  return [];
+}
+
+function buildRigDisplayRouteGeometry(rig) {
+  const explicitRoute = (rig?.routeGeometry || []).filter((point) => Array.isArray(point) && point.length >= 2);
+  if (explicitRoute.length > 1) {
+    return explicitRoute;
+  }
+  if (rig?.startPoint && rig?.endPoint) {
+    const corridorRoute = buildCorridorFallbackRoute(rig.startPoint, rig.endPoint);
+    if (corridorRoute.length > 1) {
+      return corridorRoute;
+    }
+  }
+  if (rig?.startPoint && rig?.endPoint) {
+    return [
+      [rig.startPoint.lat, rig.startPoint.lng],
+      [rig.endPoint.lat, rig.endPoint.lng],
+    ];
+  }
+  return [];
+}
+
+function resolveRigCurrentPoint(rig, displayRouteGeometry = rig?.routeGeometry) {
+  if (rig?.executionState === "active" && displayRouteGeometry?.length > 1) {
+    return interpolateRoutePoint(displayRouteGeometry, rig.completionPercentage || 0);
   }
   if (rig?.operatingState === "drilling" || rig?.executionState === "completed") {
     return rig?.endPoint || rig?.startPoint || null;
@@ -303,38 +501,26 @@ function createTerrainTexture() {
   }
 
   const gradient = context.createLinearGradient(0, 0, canvas.width, canvas.height);
-  gradient.addColorStop(0, "#223f37");
-  gradient.addColorStop(0.5, "#33594a");
-  gradient.addColorStop(1, "#214236");
+  gradient.addColorStop(0, "#1d4538");
+  gradient.addColorStop(0.52, "#245340");
+  gradient.addColorStop(1, "#1e4739");
   context.fillStyle = gradient;
   context.fillRect(0, 0, canvas.width, canvas.height);
 
-  for (let index = 0; index < 520; index += 1) {
+  for (let index = 0; index < 380; index += 1) {
     const x = Math.random() * canvas.width;
     const y = Math.random() * canvas.height;
-    const radius = 8 + (Math.random() * 28);
-    context.fillStyle = `rgba(110, 255, 177, ${0.015 + (Math.random() * 0.05)})`;
+    const radius = 5 + (Math.random() * 16);
+    context.fillStyle = `rgba(179, 233, 195, ${0.012 + (Math.random() * 0.022)})`;
     context.beginPath();
     context.arc(x, y, radius, 0, Math.PI * 2);
     context.fill();
   }
 
-  context.strokeStyle = "rgba(196,255,220,0.08)";
-  context.lineWidth = 1;
-  for (let index = 0; index < 24; index += 1) {
-    const y = (index / 24) * canvas.height;
-    context.beginPath();
-    context.moveTo(0, y);
-    context.lineTo(canvas.width, y + ((Math.random() - 0.5) * 40));
-    context.stroke();
-  }
-
-  for (let index = 0; index < 18; index += 1) {
-    const x = (index / 18) * canvas.width;
-    context.beginPath();
-    context.moveTo(x, 0);
-    context.lineTo(x + ((Math.random() - 0.5) * 60), canvas.height);
-    context.stroke();
+  for (let index = 0; index < 36; index += 1) {
+    const bandY = (index / 35) * canvas.height;
+    context.fillStyle = `rgba(255,255,255,${0.006 + (Math.random() * 0.006)})`;
+    context.fillRect(0, bandY, canvas.width, 1 + (Math.random() * 2));
   }
 
   const texture = new THREE.CanvasTexture(canvas);
@@ -385,7 +571,7 @@ function createTerrainGlow(centeredOutline) {
   return glowGroup;
 }
 
-function createStarField(count = 260) {
+function createStarField(count = 160) {
   const geometry = new THREE.BufferGeometry();
   const positions = new Float32Array(count * 3);
   const sizes = new Float32Array(count);
@@ -415,7 +601,7 @@ function createStarField(count = 260) {
   return new THREE.Points(geometry, material);
 }
 
-function createDustField(centeredOutline, count = 180) {
+function createDustField(centeredOutline, count = 110) {
   const bounds = new THREE.Box2().setFromPoints(centeredOutline);
   const positions = [];
   const polygon = centeredOutline;
@@ -495,39 +681,311 @@ function updatePulseLine(pointsObject, elapsed) {
   pointsObject.geometry.attributes.position.needsUpdate = true;
 }
 
-function buildRigNetworkConnections(rigEntries) {
-  if (rigEntries.length < 2) {
-    return [];
+function smoothRouteWorldPoints(points, density = 8) {
+  if (!points || points.length < 3) {
+    return points || [];
   }
 
-  const byId = new Map(rigEntries.map((entry) => [entry.rig.id, entry]));
-  const connectedKeys = new Set();
-  const connections = [];
+  const curve = new THREE.CatmullRomCurve3(points, false, "centripetal", 0.3);
+  const divisions = Math.min(120, Math.max(points.length * density, 28));
+  return curve.getPoints(divisions);
+}
 
-  rigEntries.forEach((entry) => {
-    const candidates = rigEntries
-      .filter((candidate) => candidate.rig.id !== entry.rig.id)
-      .map((candidate) => ({
-        targetId: candidate.rig.id,
-        distance: entry.position.distanceTo(candidate.position),
-      }))
-      .sort((left, right) => left.distance - right.distance)
-      .slice(0, Math.min(2, rigEntries.length - 1));
+function createRibbonGeometry(points, width = 1.2) {
+  const route = smoothRouteWorldPoints(points, 10);
+  if (!route || route.length < 2) {
+    return null;
+  }
 
-    candidates.forEach(({ targetId }) => {
-      const key = [entry.rig.id, targetId].sort().join(":");
-      if (connectedKeys.has(key)) {
-        return;
-      }
-      connectedKeys.add(key);
-      connections.push({
-        from: entry,
-        to: byId.get(targetId),
-      });
-    });
+  const positions = [];
+  const uvs = [];
+  const indices = [];
+  let distanceTravelled = 0;
+
+  route.forEach((point, index) => {
+    const previous = route[Math.max(0, index - 1)];
+    const next = route[Math.min(route.length - 1, index + 1)];
+    const direction = next.clone().sub(previous).setY(0);
+    if (direction.lengthSq() < 0.00001) {
+      direction.set(0, 0, 1);
+    } else {
+      direction.normalize();
+    }
+
+    const normal = new THREE.Vector3(-direction.z, 0, direction.x).multiplyScalar(width / 2);
+    const left = point.clone().add(normal);
+    const right = point.clone().sub(normal);
+    if (index > 0) {
+      distanceTravelled += point.distanceTo(route[index - 1]);
+    }
+
+    positions.push(left.x, left.y, left.z, right.x, right.y, right.z);
+    uvs.push(0, distanceTravelled, 1, distanceTravelled);
+
+    if (index < route.length - 1) {
+      const offset = index * 2;
+      indices.push(offset, offset + 1, offset + 2);
+      indices.push(offset + 1, offset + 3, offset + 2);
+    }
   });
 
-  return connections.filter((connection) => connection.from && connection.to);
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3));
+  geometry.setAttribute("uv", new THREE.Float32BufferAttribute(uvs, 2));
+  geometry.setIndex(indices);
+  geometry.computeVertexNormals();
+  return geometry;
+}
+
+function createRouteOverlay(points, {
+  roadWidth = 0.96,
+  roadColor = 0x5a6467,
+  roadOpacity = 0.8,
+  centerColor = 0xffdf9e,
+  centerOpacity = 0.84,
+  glowColor = 0xfff0bf,
+  glowOpacity = 0.12,
+} = {}) {
+  if (!points || points.length < 2) {
+    return null;
+  }
+
+  const smoothed = smoothRouteWorldPoints(points, 8);
+  const overlay = new THREE.Group();
+  const roadGeometry = createRibbonGeometry(smoothed, roadWidth);
+
+  if (roadGeometry) {
+    overlay.add(
+      new THREE.Mesh(
+        roadGeometry,
+        new THREE.MeshBasicMaterial({
+          color: roadColor,
+          transparent: true,
+          opacity: roadOpacity,
+          side: THREE.DoubleSide,
+          depthWrite: false,
+        }),
+      ),
+    );
+  }
+
+  const centerLine = new THREE.Line(
+    new THREE.BufferGeometry().setFromPoints(smoothed),
+    new THREE.LineBasicMaterial({
+      color: centerColor,
+      transparent: true,
+      opacity: centerOpacity,
+    }),
+  );
+  centerLine.position.y += 0.02;
+  overlay.add(centerLine);
+
+  const glow = new THREE.Line(
+    new THREE.BufferGeometry().setFromPoints(smoothed),
+    new THREE.LineBasicMaterial({
+      color: glowColor,
+      transparent: true,
+      opacity: glowOpacity,
+    }),
+  );
+  glow.position.y += 0.04;
+  overlay.add(glow);
+
+  return overlay;
+}
+
+function createRigNetworkFallbackCurve(from, to) {
+  const distance = from.distanceTo(to);
+  const midpoint = from.clone().lerp(to, 0.5);
+  const direction = to.clone().sub(from);
+  const side = new THREE.Vector3(-direction.z, 0, direction.x).normalize().multiplyScalar(Math.min(distance * 0.14, 10));
+  const arcHeight = Math.min(8, Math.max(2.8, distance * 0.05));
+  const controlA = from.clone().lerp(midpoint, 0.55).add(side).setY(TERRAIN_DEPTH + arcHeight);
+  const controlB = midpoint.clone().lerp(to, 0.55).add(side.multiplyScalar(0.55)).setY(TERRAIN_DEPTH + (arcHeight * 0.7));
+  return new THREE.CubicBezierCurve3(
+    from.clone(),
+    controlA,
+    controlB,
+    to.clone(),
+  ).getPoints(26);
+}
+
+function createCityZone(city, projectedPoint) {
+  const group = new THREE.Group();
+  const dotRadius = city.tier === "capital" ? 0.95 : city.tier === "metro" ? 0.78 : 0.62;
+
+  const dot = new THREE.Mesh(
+    new THREE.CircleGeometry(dotRadius, 28),
+    new THREE.MeshBasicMaterial({
+      color: city.tier === "capital" ? 0xffe082 : 0xe6eef5,
+      transparent: true,
+      opacity: 0.96,
+      side: THREE.DoubleSide,
+    }),
+  );
+  dot.rotation.x = -Math.PI / 2;
+  dot.position.y = TERRAIN_DEPTH + 0.1;
+  group.add(dot);
+
+  const label = createTextSprite(city.name, {
+    width: city.tier === "capital" ? 176 : 152,
+    height: 42,
+    fontSize: city.tier === "capital" ? 16 : 13,
+    fill: city.tier === "capital" ? "#ffe8a1" : "#dde8f0",
+    background: "rgba(7,17,22,0.0)",
+    stroke: "rgba(255,255,255,0.0)",
+  });
+  if (label) {
+    label.position.set(0, TERRAIN_DEPTH + 1.56, 0);
+    group.add(label);
+  }
+
+  group.position.copy(worldPoint(projectedPoint, 0));
+  return group;
+}
+
+function createMapGuideLine(points, color = 0xd9e4ef, opacity = 0.08) {
+  if (!points || points.length < 2) {
+    return null;
+  }
+
+  return new THREE.Line(
+    new THREE.BufferGeometry().setFromPoints(smoothRouteWorldPoints(points, 6)),
+    new THREE.LineBasicMaterial({
+      color,
+      transparent: true,
+      opacity,
+    }),
+  );
+}
+
+function projectMapPath(path, projection, terrainCenter, outlinePolygon, elevation = TERRAIN_DEPTH + 0.18, inset = 0.48) {
+  return (path || [])
+    .map((point) => projection.project(point).sub(terrainCenter))
+    .map((point) => (
+      isPointInsidePolygon(point, outlinePolygon)
+        ? point
+        : clampPointToPolygon(point, outlinePolygon, inset)
+    ))
+    .map((point) => worldPoint(point, elevation));
+}
+
+function createGeographyCorridor(points, kind = "regional") {
+  if (!points || points.length < 2) {
+    return null;
+  }
+
+  const palette = (
+    kind === "arterial"
+      ? {
+          base: 0x4c5d58,
+          baseOpacity: 0.42,
+          glow: 0xe9d79c,
+          glowOpacity: 0.06,
+          accent: 0xb7c6c0,
+          accentOpacity: 0.18,
+        }
+      : kind === "coast"
+        ? {
+            base: 0x5c7076,
+            baseOpacity: 0.26,
+            glow: 0xcdefff,
+            glowOpacity: 0.05,
+            accent: 0xc8dbe2,
+            accentOpacity: 0.12,
+          }
+        : {
+            base: 0x425158,
+            baseOpacity: 0.18,
+            glow: 0xf3f8fd,
+            glowOpacity: 0.035,
+            accent: 0xd5dee6,
+            accentOpacity: 0.08,
+          }
+  );
+
+  const smoothed = smoothRouteWorldPoints(points, 8);
+  const corridor = new THREE.Group();
+  corridor.add(
+    new THREE.Line(
+      new THREE.BufferGeometry().setFromPoints(smoothed),
+      new THREE.LineBasicMaterial({
+        color: palette.base,
+        transparent: true,
+        opacity: palette.baseOpacity,
+      }),
+    ),
+  );
+  corridor.add(
+    new THREE.Line(
+      new THREE.BufferGeometry().setFromPoints(smoothed),
+      new THREE.LineBasicMaterial({
+        color: palette.glow,
+        transparent: true,
+        opacity: palette.glowOpacity,
+      }),
+    ),
+  );
+  corridor.add(
+    new THREE.Line(
+      new THREE.BufferGeometry().setFromPoints(smoothed),
+      new THREE.LineBasicMaterial({
+        color: palette.accent,
+        transparent: true,
+        opacity: palette.accentOpacity,
+      }),
+    ),
+  );
+  return corridor;
+}
+
+function createBorderDetail(centeredOutline) {
+  const group = new THREE.Group();
+  const insetLoop = centeredOutline.map((point) => point.clone().multiplyScalar(0.987));
+  group.add(
+    new THREE.LineLoop(
+      new THREE.BufferGeometry().setFromPoints(insetLoop.map((point) => worldPoint(point, TERRAIN_DEPTH + 0.18))),
+      new THREE.LineBasicMaterial({
+        color: 0xf0f8f4,
+        transparent: true,
+        opacity: 0.14,
+      }),
+    ),
+  );
+
+  const sampled = [];
+  let carry = 0;
+  const step = 10;
+  for (let index = 0; index < centeredOutline.length; index += 1) {
+    const start = centeredOutline[index];
+    const end = centeredOutline[(index + 1) % centeredOutline.length];
+    const segment = end.clone().sub(start);
+    const length = segment.length();
+    if (!length) {
+      continue;
+    }
+    const direction = segment.clone().normalize();
+    for (let travelled = step - carry; travelled < length; travelled += step) {
+      sampled.push(start.clone().add(direction.clone().multiplyScalar(travelled)));
+    }
+    carry = (carry + length) % step;
+  }
+
+  const geometry = new THREE.BufferGeometry().setFromPoints(
+    sampled.map((point) => worldPoint(point, TERRAIN_DEPTH + 0.22)),
+  );
+  const material = new THREE.PointsMaterial({
+    color: 0xdffbed,
+    size: 1.2,
+    transparent: true,
+    opacity: 0.22,
+    map: createPointSpriteTexture("#dffbed"),
+    alphaTest: 0.04,
+    depthWrite: false,
+    sizeAttenuation: true,
+  });
+  group.add(new THREE.Points(geometry, material));
+  return group;
 }
 
 function buildTerrain(outlineWorld2D) {
@@ -564,19 +1022,24 @@ function buildTerrain(outlineWorld2D) {
       }),
     ],
   );
-  terrain.castShadow = true;
-  terrain.receiveShadow = true;
+  terrain.castShadow = false;
+  terrain.receiveShadow = false;
 
   const topFace = new THREE.Mesh(
     new THREE.ShapeGeometry(terrainShape),
     new THREE.MeshBasicMaterial({
-      color: 0x6aa186,
+      color: 0x5d8f74,
       transparent: true,
-      opacity: 0.18,
+      opacity: 0.2,
+      depthWrite: false,
+      polygonOffset: true,
+      polygonOffsetFactor: -2,
+      polygonOffsetUnits: -2,
     }),
   );
   topFace.rotation.x = -Math.PI / 2;
-  topFace.position.y = TERRAIN_DEPTH + 0.02;
+  topFace.position.y = TERRAIN_DEPTH + 0.12;
+  topFace.renderOrder = 2;
 
   const topGrid = new THREE.Mesh(
     new THREE.ShapeGeometry(terrainShape),
@@ -584,11 +1047,12 @@ function buildTerrain(outlineWorld2D) {
       color: 0xc7ffe2,
       wireframe: true,
       transparent: true,
-      opacity: 0.045,
+      opacity: 0,
+      depthWrite: false,
     }),
   );
   topGrid.rotation.x = -Math.PI / 2;
-  topGrid.position.y = TERRAIN_DEPTH + 0.05;
+  topGrid.position.y = TERRAIN_DEPTH + 0.16;
 
   const topOutline = new THREE.LineLoop(
     new THREE.BufferGeometry().setFromPoints(centeredWorldOutline.map((point) => worldPoint(point, TERRAIN_DEPTH + 0.08))),
@@ -691,7 +1155,36 @@ function buildRigTone(rig, isSelected) {
 }
 
 function createRigMarker(rig, index, isSelected) {
-  return new THREE.Group();
+  const group = new THREE.Group();
+
+  const pad = new THREE.Mesh(
+    new THREE.CylinderGeometry(4.5, 5.1, 0.9, 28),
+    new THREE.MeshStandardMaterial({
+      color: isSelected ? 0x324337 : 0x1d2c31,
+      emissive: new THREE.Color(isSelected ? 0x7fa443 : 0x0b1b1f),
+      emissiveIntensity: isSelected ? 0.46 : 0.22,
+      roughness: 0.7,
+      metalness: 0.08,
+    }),
+  );
+  pad.position.y = 0.45;
+  pad.receiveShadow = true;
+  group.add(pad);
+
+  const ring = new THREE.Mesh(
+    new THREE.RingGeometry(5.4, 6.1, 40),
+    new THREE.MeshBasicMaterial({
+      color: isSelected ? 0xffe082 : rig?.executionState === "active" ? 0xf6c654 : 0x7fd7ff,
+      transparent: true,
+      opacity: isSelected ? 0.28 : 0.16,
+      side: THREE.DoubleSide,
+    }),
+  );
+  ring.rotation.x = -Math.PI / 2;
+  ring.position.y = 0.08;
+  group.add(ring);
+
+  return group;
 }
 
 function findSelectableParent(object) {
@@ -765,8 +1258,12 @@ export function ManagerRigsScene3D({
     );
     camera.position.set(96, 124, 132);
 
-    const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
-    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2.25));
+    const renderer = new THREE.WebGLRenderer({
+      antialias: (window.devicePixelRatio || 1) <= 1.5,
+      alpha: true,
+      powerPreference: "high-performance",
+    });
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 1.5));
     renderer.setSize(host.clientWidth || 1, host.clientHeight || 1, false);
     renderer.shadowMap.enabled = true;
     renderer.shadowMap.type = THREE.PCFSoftShadowMap;
@@ -804,7 +1301,7 @@ export function ManagerRigsScene3D({
     const keyLight = new THREE.DirectionalLight(0xd4ffd8, 1.5);
     keyLight.position.set(120, 160, 80);
     keyLight.castShadow = true;
-    keyLight.shadow.mapSize.set(2048, 2048);
+    keyLight.shadow.mapSize.set(1024, 1024);
     keyLight.shadow.camera.left = -120;
     keyLight.shadow.camera.right = 120;
     keyLight.shadow.camera.top = 120;
@@ -831,6 +1328,7 @@ export function ManagerRigsScene3D({
     scene.add(terrain.glowOutline);
     scene.add(terrain.sideOutline);
     scene.add(terrain.edgeGlow);
+    scene.add(createBorderDetail(terrain.centeredWorldOutline));
     scene.add(terrain.dust);
 
     const terrainShadow = new THREE.Mesh(
@@ -876,11 +1374,48 @@ export function ManagerRigsScene3D({
 
     const animatedPulseObjects = [];
 
-    const rigEntries = (rigs || [])
-      .map((rig, index) => ({ rig, index, point: resolveRigCurrentPoint(rig) }))
-      .filter((entry) => entry.point);
-    const rigNetworkEntries = [];
+    SAUDI_REGION_DIVIDERS.forEach((path) => {
+      const divider = createMapGuideLine(
+        projectMapPath(path, projection, terrain.center, outlinePolygon, TERRAIN_DEPTH + 0.2, 0.52),
+        0xf3f7fa,
+        0.12,
+      );
+      if (divider) {
+        geographyRoot.add(divider);
+      }
+    });
 
+    SAUDI_MAIN_CORRIDORS.forEach((corridor) => {
+      const corridorPoints = projectMapPath(
+        (corridor.points || []).map(([lat, lng]) => ({ lat, lng })),
+        projection,
+        terrain.center,
+        outlinePolygon,
+        TERRAIN_DEPTH + 0.26,
+        0.92,
+      );
+
+      const corridorLine = createGeographyCorridor(corridorPoints, corridor.kind);
+      if (corridorLine) {
+        geographyRoot.add(corridorLine);
+      }
+    });
+
+    SAUDI_MAIN_CITIES.forEach((city) => {
+      const point2D = projection.project({ lat: city.lat, lng: city.lng }).sub(terrain.center);
+      const clamped2D = isPointInsidePolygon(point2D, outlinePolygon)
+        ? point2D
+        : clampPointToPolygon(point2D, outlinePolygon, 1.4);
+      geographyRoot.add(createCityZone(city, clamped2D));
+    });
+
+    const rigEntries = (rigs || [])
+      .map((rig, index) => {
+        const displayRouteGeometry = buildRigDisplayRouteGeometry(rig);
+        const point = resolveRigCurrentPoint(rig, displayRouteGeometry);
+        return { rig, index, point, displayRouteGeometry };
+      })
+      .filter((entry) => entry.point);
     const selectableRoots = [];
     const rigNodes = [];
     const raycaster = new THREE.Raycaster();
@@ -888,27 +1423,25 @@ export function ManagerRigsScene3D({
     let pointerDownAt = null;
     let isDragging = false;
 
-    rigEntries.forEach(({ rig, index, point }) => {
+    rigEntries.forEach(({ rig, index, point, displayRouteGeometry }) => {
       const point2D = projection.project(point).sub(terrain.center);
       const clamped2D = isPointInsidePolygon(point2D, outlinePolygon)
         ? point2D
         : clampPointToPolygon(point2D, outlinePolygon, 0.8);
 
       const rigGroup = createRigMarker(rig, index, rig.id === selectedRigId);
-        const rigWorldPosition = worldPoint(clamped2D, TERRAIN_DEPTH + 0.08);
-        rigGroup.position.copy(rigWorldPosition);
-        rigGroup.userData = {
-          rigId: rig.id,
-          baseY: rigGroup.position.y,
-          floatOffset: index * 0.55,
+      const rigWorldPosition = worldPoint(clamped2D, TERRAIN_DEPTH + 0.08);
+      rigGroup.position.copy(rigWorldPosition);
+      rigGroup.userData = {
+        rigId: rig.id,
+        baseY: rigGroup.position.y,
+        floatOffset: index * 0.55,
         selectionBoost: rig.id === selectedRigIdRef.current ? 1 : 0,
       };
       rigRoot.add(rigGroup);
       selectableRoots.push(rigGroup);
       rigNodes.push({ group: rigGroup, rig, index });
-      rigNetworkEntries.push({ rig, index, group: rigGroup, position: rigWorldPosition.clone() });
-
-      const routePoints = (rig.routeGeometry || [])
+      const routePoints = (displayRouteGeometry || [])
         .filter((routePoint) => Array.isArray(routePoint) && routePoint.length >= 2)
         .map((routePoint) => projection.project({ lat: routePoint[0], lng: routePoint[1] }).sub(terrain.center))
         .map((routePoint) => (
@@ -919,67 +1452,50 @@ export function ManagerRigsScene3D({
         .map((routePoint) => worldPoint(routePoint, TERRAIN_DEPTH + 0.9));
 
       if (routePoints.length > 1) {
-        const line = new THREE.Line(
-          new THREE.BufferGeometry().setFromPoints(routePoints),
-          new THREE.LineBasicMaterial({
-            color: rig.executionState === "active" ? 0xff7468 : rig.id === selectedRigId ? 0xffe082 : 0x7fd7ff,
-            transparent: true,
-            opacity: rig.id === selectedRigId ? 0.98 : 0.7,
-          }),
-        );
-        routeRoot.add(line);
-
-        const glow = new THREE.Line(
-          new THREE.BufferGeometry().setFromPoints(routePoints),
-          new THREE.LineBasicMaterial({
-            color: rig.executionState === "active" ? 0xffbaa8 : 0xbceaff,
-            transparent: true,
-            opacity: rig.id === selectedRigId ? 0.22 : 0.12,
-          }),
-        );
-        glow.scale.multiplyScalar(1.0018);
-        routeRoot.add(glow);
+        const displayRoutePoints = smoothRouteWorldPoints(routePoints);
+        const routeVisual = createRouteOverlay(displayRoutePoints, {
+          roadWidth: rig.executionState === "active" ? 0.92 : rig.id === selectedRigId ? 0.76 : 0.56,
+          roadColor: rig.executionState === "active" ? 0x8c5447 : rig.id === selectedRigId ? 0x67644f : 0x4c5d65,
+          roadOpacity: rig.executionState === "active" ? 0.86 : 0.74,
+          centerColor: rig.executionState === "active" ? 0xff9d87 : rig.id === selectedRigId ? 0xffe082 : 0xa8dfff,
+          centerOpacity: rig.id === selectedRigId ? 0.92 : 0.7,
+          glowColor: rig.executionState === "active" ? 0xffccb7 : rig.id === selectedRigId ? 0xffefb3 : 0xd3eeff,
+          glowOpacity: rig.id === selectedRigId ? 0.14 : 0.07,
+        });
+        if (routeVisual) {
+          routeRoot.add(routeVisual);
+        }
 
         const pulses = createPulseLine(
-          routePoints,
+          displayRoutePoints,
           rig.executionState === "active" ? "#ff9c87" : "#bfe7ff",
-          rig.executionState === "active" ? 9 : 6,
-          rig.executionState === "active" ? 4.8 : 3.8,
+          rig.executionState === "active" ? 7 : 5,
+          rig.executionState === "active" ? 4.4 : 3.4,
         );
         pulseRoot.add(pulses);
         animatedPulseObjects.push(pulses);
+      } else if (rig.startPoint && rig.endPoint) {
+        const fallbackCurve = createRigNetworkFallbackCurve(
+          worldPoint(clamped2D, TERRAIN_DEPTH + 0.9),
+          worldPoint(
+            isPointInsidePolygon(projection.project(rig.endPoint).sub(terrain.center), outlinePolygon)
+              ? projection.project(rig.endPoint).sub(terrain.center)
+              : clampPointToPolygon(projection.project(rig.endPoint).sub(terrain.center), outlinePolygon, 0.78),
+            TERRAIN_DEPTH + 0.9,
+          ),
+        );
+        const line = createRouteOverlay(fallbackCurve, {
+          roadWidth: 0.64,
+          roadColor: 0x64553f,
+          centerColor: 0xffcf8a,
+          glowColor: 0xffe1b4,
+          centerOpacity: 0.52,
+          glowOpacity: 0.06,
+        });
+        if (line) {
+          routeRoot.add(line);
+        }
       }
-    });
-
-    buildRigNetworkConnections(rigNetworkEntries).forEach((connection) => {
-      const networkPoints = [
-        connection.from.position.clone().setY(TERRAIN_DEPTH + 1.05),
-        connection.to.position.clone().setY(TERRAIN_DEPTH + 1.05),
-      ];
-
-      const glow = new THREE.Line(
-        new THREE.BufferGeometry().setFromPoints(networkPoints),
-        new THREE.LineBasicMaterial({
-          color: 0x76ffc0,
-          transparent: true,
-          opacity: 0.08,
-        }),
-      );
-      geographyRoot.add(glow);
-
-      const line = new THREE.Line(
-        new THREE.BufferGeometry().setFromPoints(networkPoints),
-        new THREE.LineBasicMaterial({
-          color: 0x7dffd0,
-          transparent: true,
-          opacity: 0.22,
-        }),
-      );
-      geographyRoot.add(line);
-
-      const pulses = createPulseLine(networkPoints, "#7dffd0", 5, 3.2);
-      pulseRoot.add(pulses);
-      animatedPulseObjects.push(pulses);
     });
 
     loadRigTemplate().then((template) => {

@@ -2,7 +2,9 @@ import { AUTH_STORAGE_KEY } from "../../lib/constants.js";
 import {
   FIREBASE_USER_ROLES,
   createFirebaseUserAccount,
+  deleteUserProfile,
   ensureSeedUsers,
+  getUserProfileByEmail,
   getUserProfileById,
   signInFirebaseUser,
   upsertUserProfile,
@@ -124,6 +126,10 @@ function buildSessionFromUser(user = {}) {
   };
 }
 
+function canUseStaticFallback(user) {
+  return Boolean(user && (user.role === FIREBASE_USER_ROLES.manager || user.isDemo));
+}
+
 export async function authenticateUser(email, password) {
   const normalizedEmail = String(email || "").trim().toLowerCase();
   const staticUser = TEST_USERS.find(
@@ -131,9 +137,20 @@ export async function authenticateUser(email, password) {
   );
 
   if (staticUser) {
-    await ensureSeedUsers(TEST_USERS);
+    const remoteProfile =
+      await getUserProfileById(staticUser.id) ||
+      await getUserProfileByEmail(staticUser.email);
 
-    return buildSessionFromUser(staticUser);
+    if (remoteProfile && remoteProfile.active !== false) {
+      return buildSessionFromUser(remoteProfile);
+    }
+
+    if (canUseStaticFallback(staticUser)) {
+      await ensureSeedUsers(TEST_USERS);
+      return buildSessionFromUser(staticUser);
+    }
+
+    throw new Error("Invalid credentials. Please check your email and password.");
   }
 
   try {
@@ -198,6 +215,33 @@ export async function createForemanAccount({ name, email, password, managerId, a
   };
 }
 
+export async function updateForemanAccount({ id, name, email, managerId, assignedRig = null }) {
+  if (!id) {
+    throw new Error("Foreman id is required.");
+  }
+
+  const payload = {
+    id,
+    name,
+    email: String(email || "").trim().toLowerCase(),
+    role: FIREBASE_USER_ROLES.foreman,
+    managerId,
+    assignedRig,
+    active: true,
+  };
+
+  await upsertUserProfile(payload);
+  return payload;
+}
+
+export async function deleteForemanAccount(foremanId) {
+  if (!foremanId) {
+    return;
+  }
+
+  await deleteUserProfile(foremanId);
+}
+
 export function getManagedForemen(managerId) {
   return TEST_USERS.filter((user) => user.role === "Foreman" && user.managerId === managerId);
 }
@@ -216,9 +260,24 @@ export async function refreshSession() {
     return null;
   }
 
-  const remoteProfile = await getUserProfileById(storedSession.id);
+  const remoteProfile =
+    await getUserProfileById(storedSession.id) ||
+    await getUserProfileByEmail(storedSession.email);
+
   if (!remoteProfile) {
-    return storedSession;
+    const staticUser = TEST_USERS.find((user) => user.id === storedSession.id);
+    if (canUseStaticFallback(staticUser)) {
+      currentSession = buildSessionFromUser(staticUser);
+      persistSession(currentSession);
+      return currentSession;
+    }
+    clearSession();
+    return null;
+  }
+
+  if (remoteProfile.active === false) {
+    clearSession();
+    return null;
   }
 
   currentSession = buildSessionFromUser(remoteProfile);

@@ -50,6 +50,22 @@ function removeMoveBackup(moveId) {
   writeMoveBackups(backups);
 }
 
+function pruneMoveBackups(predicate) {
+  const backups = readMoveBackups();
+  let changed = false;
+
+  Object.keys(backups).forEach((moveId) => {
+    if (predicate(backups[moveId], moveId)) {
+      delete backups[moveId];
+      changed = true;
+    }
+  });
+
+  if (changed) {
+    writeMoveBackups(backups);
+  }
+}
+
 function readMoveBackup(moveId) {
   const backups = readMoveBackups();
   return backups[moveId] ? normalizeStoredMove(backups[moveId]) : null;
@@ -153,6 +169,7 @@ function compactPlayback(playback, options = {}) {
       journeyId: trip.journeyId || null,
       loadId: trip.loadId,
       loadCode: trip.loadCode || null,
+      isCriticalLift: Boolean(trip.isCriticalLift),
       description: trip.description,
       sourceLabel: trip.sourceLabel || null,
       destinationLabel: trip.destinationLabel || null,
@@ -185,6 +202,7 @@ function compactPlayback(playback, options = {}) {
       id: task.id,
       loadId: task.loadId,
       loadCode: task.loadCode || null,
+      isCriticalLift: Boolean(task.isCriticalLift),
       description: task.description,
       phase: task.phase,
       activityCode: task.activityCode || "",
@@ -454,12 +472,13 @@ export async function hydrateMoves(managerId, { summary = false } = {}) {
   }
 
   const remoteMoves = await fetchMoveRecords(managerId, { summary });
-  const backupMoves = Object.values(readMoveBackups()).filter((move) => {
+  const remoteMoveIds = new Set(remoteMoves.map((move) => move?.id).filter(Boolean));
+  pruneMoveBackups((move) => {
     const moveManagerId = move?.createdBy?.role === "Manager" ? move.createdBy?.id : move?.createdBy?.managerId;
-    return moveManagerId === managerId;
+    return moveManagerId === managerId && !remoteMoveIds.has(move?.id);
   });
 
-  return setMovesCache(mergeMoveCollections(remoteMoves, backupMoves));
+  return setMovesCache(remoteMoves);
 }
 
 export async function fetchMove(moveId) {
@@ -501,20 +520,22 @@ export async function upsertMove(move) {
   const compactedMove = compactMoveForStorage(normalizeStoredMove(move));
   const savedMove = normalizeStoredMove(await saveMoveRecord(compactedMove));
   persistMoveBackup(savedMove);
-  void saveMoveDoc(compactedMove).catch(() => {});
+  try {
+    await saveMoveDoc(savedMove);
+  } catch (error) {
+    console.error("Failed to save move to Firestore", error);
+  }
   const current = readMoves().filter((item) => item.id !== savedMove.id);
   return setMovesCache([savedMove, ...current]);
 }
 
 export async function removeMove(moveId) {
-  await deleteMoveRecord(moveId);
+  const remainingMoves = readMoves().filter((move) => move.id !== moveId);
+  setMovesCache(remainingMoves);
   removeMoveBackup(moveId);
-  try {
-    await deleteMoveDoc(moveId);
-  } catch {
-    // Keep the local removal even if Firestore cleanup fails.
-  }
-  return setMovesCache(readMoves().filter((move) => move.id !== moveId));
+  await deleteMoveRecord(moveId);
+  void deleteMoveDoc(moveId).catch(() => {});
+  return remainingMoves;
 }
 
 export function updateMoveProgress(moveId, progressMinute) {
