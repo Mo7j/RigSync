@@ -22,6 +22,7 @@ from models import (
     RigInventoryState,
     TruckSpec,
 )
+from planning_dataset import DATASET_PATH, load_planning_dataset
 
 
 FRONTEND_DIR = Path(__file__).resolve().parent.parent / "frontend"
@@ -279,7 +280,10 @@ def read_db_dataset():
 
 
 def get_active_dataset():
-    return read_db_dataset()
+    try:
+        return load_planning_dataset()
+    except Exception:
+        return read_db_dataset()
 
 
 def ensure_state_tables():
@@ -731,7 +735,7 @@ def get_dataset_status():
     dataset = get_active_dataset()
     return jsonify(
         {
-            "source": "database",
+            "source": str(DATASET_PATH),
             "rig_loads": len(dataset["rig_loads"]),
             "startup_loads": len(dataset["startup_loads"]),
             "truck_specs": len(dataset["truck_specs"]),

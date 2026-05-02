@@ -101,6 +101,86 @@ function normalizeTruckOptions(value) {
   return [...new Set(tokenizeTruckTypes(value).map((item) => normalizeTruckTypeLabel(item)).filter(Boolean))];
 }
 
+function fitsLoadToTruckSpec(load, truckSpec) {
+  if (!truckSpec) {
+    return false;
+  }
+
+  const loadDimensions = load?.dimensions || {};
+  const truckDimensions = truckSpec?.dimensions || {};
+  const loadWeight = Number(load?.weight_tons) || 0;
+  const maxWeight = Number(truckSpec?.max_weight_tons) || 0;
+
+  const weightOk = !loadWeight || !maxWeight || loadWeight <= maxWeight;
+  const lengthOk = !Number(loadDimensions.length) || !Number(truckDimensions.length) || Number(loadDimensions.length) <= Number(truckDimensions.length);
+  const widthOk = !Number(loadDimensions.width) || !Number(truckDimensions.width) || Number(loadDimensions.width) <= Number(truckDimensions.width);
+  const heightOk = !Number(loadDimensions.height) || !Number(truckDimensions.height) || Number(loadDimensions.height) <= Number(truckDimensions.height);
+
+  return weightOk && lengthOk && widthOk && heightOk;
+}
+
+function canMoveAsOversizePermit(load, truckSpec, truckType = "") {
+  if (!truckSpec) {
+    return false;
+  }
+
+  const normalizedType = normalizeTruckTypeLabel(truckType || truckSpec.type);
+  if (normalizedType !== "Low-bed" && normalizedType !== "Heavy Hauler") {
+    return false;
+  }
+
+  const loadWeight = Number(load?.weight_tons) || 0;
+  const maxWeight = Number(truckSpec?.max_weight_tons) || 0;
+  if (loadWeight && maxWeight && loadWeight > maxWeight) {
+    return false;
+  }
+
+  return true;
+}
+
+function normalizeLoadTruckFeasibility(logicalLoads = [], truckSetup = [], truckSpecs = []) {
+  const truckSpecMap = buildTruckSpecMap(truckSpecs);
+  const availableTypes = [...new Set((truckSetup || []).map((truck) => normalizeTruckTypeLabel(truck.type)).filter(Boolean))];
+  const availableFleetSpecs = availableTypes
+    .map((type) => ({
+      type,
+      spec: truckSpecMap.get(normalizeTruckTypeKey(type)) || null,
+    }))
+    .filter((entry) => entry.spec);
+
+  return (logicalLoads || []).map((load) => {
+    const declaredOptions = normalizeTruckOptions(load.truck_options || load.truck_types || load.truck_type);
+    const feasibleDeclared = declaredOptions.filter((type) =>
+      fitsLoadToTruckSpec(load, truckSpecMap.get(normalizeTruckTypeKey(type))) ||
+      canMoveAsOversizePermit(load, truckSpecMap.get(normalizeTruckTypeKey(type)), type),
+    );
+
+    if (feasibleDeclared.length) {
+      return {
+        ...load,
+        truck_options: feasibleDeclared,
+        truck_types: feasibleDeclared,
+        truck_type: feasibleDeclared.join(" / "),
+      };
+    }
+
+    const feasibleAvailable = availableFleetSpecs
+      .filter((entry) => fitsLoadToTruckSpec(load, entry.spec) || canMoveAsOversizePermit(load, entry.spec, entry.type))
+      .map((entry) => entry.type);
+
+    if (!feasibleAvailable.length) {
+      return load;
+    }
+
+    return {
+      ...load,
+      truck_options: feasibleAvailable,
+      truck_types: feasibleAvailable,
+      truck_type: feasibleAvailable.join(" / "),
+    };
+  });
+}
+
 function buildLegacyLogicalLoads(rawLoads) {
   const grouped = new Map();
 
@@ -197,6 +277,7 @@ function buildWorkbookLogicalLoads(rawLoads) {
       const logicalLoad = {
         id: nextLogicalId,
         template_id: load.id,
+        family_id: load.family_id || load.code || load.id,
         code: load.code,
         key: `${load.code || load.id}::${index}`,
         description: load.description,
@@ -531,7 +612,7 @@ function isSpecialPermitLoad(load, truck) {
 
   return (
     eligibleTypes.has(truckType) &&
-    truckType.includes("heavy") &&
+    (truckType.includes("heavy") || truckType === "lowbed") &&
     (maxWeightTons <= 0 || loadWeightTons <= maxWeightTons)
   );
 }
@@ -2272,6 +2353,7 @@ export async function buildPlayback(
         description: entry.load.description,
         sourceKind: entry.load.source_kind || "rig",
         sourceLabel: entry.load.sourceLabel || null,
+        sourcePoint: entry.load.sourcePoint || null,
         destinationLabel: entry.load.destinationLabel || null,
         dispatchStart: chosen.dispatchStart,
         pickupRouteMinutes: entry.load.pickupRouteMinutes || null,
@@ -2495,20 +2577,21 @@ export async function buildScenarioPlans(
   workerShiftConfig = null,
   progressOptions = {},
 ) {
+  const normalizedLogicalLoads = normalizeLoadTruckFeasibility(logicalLoads, truckSetup, truckSpecs);
   const workerHourlyCost = getAverageWorkerHourlyCost(workerShiftConfig);
-  const planningAnalysis = buildPlanningTaskGraph(logicalLoads, routeData);
+  const planningAnalysis = buildPlanningTaskGraph(normalizedLogicalLoads, routeData);
   const hasConfiguredWorkerRoster = Object.keys(workerShiftConfig?.roles || {}).length > 0;
   const maxShiftWorkers = Math.max(
     hasConfiguredWorkerRoster ? 4 : 8,
     hasConfiguredWorkerRoster ? (Number.parseInt(workerShiftConfig?.dayShift, 10) || 0) : 0,
     hasConfiguredWorkerRoster ? (Number.parseInt(workerShiftConfig?.nightShift, 10) || 0) : 0,
     Number(workerCount) || 0,
-    hasConfiguredWorkerRoster ? 0 : logicalLoads.length,
+    hasConfiguredWorkerRoster ? 0 : normalizedLogicalLoads.length,
     hasConfiguredWorkerRoster ? 0 : truckCount,
   );
   const candidateTruckSetups = buildScenarioResourceProfiles(
     truckSetup,
-    logicalLoads,
+    normalizedLogicalLoads,
     truckSpecs,
     Boolean(workerShiftConfig?.enforceExactFleet),
   );
@@ -2559,7 +2642,7 @@ export async function buildScenarioPlans(
     scenarioDefinitions.map((definition) => [
       definition.objective,
       hasConfiguredWorkerRoster
-        ? buildCandidateWorkerCounts(logicalLoads, maxShiftWorkers, definition.objective)
+        ? buildCandidateWorkerCounts(normalizedLogicalLoads, maxShiftWorkers, definition.objective)
         : [maxShiftWorkers],
     ]),
   );
@@ -2571,7 +2654,7 @@ export async function buildScenarioPlans(
       0,
     ),
   );
-  const loadsPerEvaluation = Math.max(1, logicalLoads.length + 1);
+  const loadsPerEvaluation = Math.max(1, normalizedLogicalLoads.length + 1);
   const totalWorkUnits = Math.max(1, totalScenarioEvaluations * loadsPerEvaluation);
   let completedEvaluations = 0;
   const reportProgress = typeof progressOptions.onProgress === "function" ? progressOptions.onProgress : null;
@@ -2615,7 +2698,7 @@ export async function buildScenarioPlans(
         const scenarioTruckCount = Math.max(1, candidateTruckSetup.reduce((sum, truck) => sum + truck.count, 0) || truckCount || 1);
         const scenarioWorkerCapacity = hasConfiguredWorkerRoster
           ? profileWorkerCount
-          : Math.max(maxShiftWorkers, scenarioTruckCount, logicalLoads.length);
+          : Math.max(maxShiftWorkers, scenarioTruckCount, normalizedLogicalLoads.length);
         if (reportProgress) {
           const completedWorkUnits = ((completedEvaluations - 1) * loadsPerEvaluation) + 1;
           reportProgress({
@@ -2631,12 +2714,12 @@ export async function buildScenarioPlans(
 
         try {
           const truckCostByType = buildTruckCostMap(candidateTruckSetup);
-          const waves = buildSchedules(logicalLoads, scenarioTruckCount, scenarioWorkerCapacity, definition.objective, truckCostByType);
+          const waves = buildSchedules(normalizedLogicalLoads, scenarioTruckCount, scenarioWorkerCapacity, definition.objective, truckCostByType);
           const playback = await buildPlayback(
             {
               routeMinutes: routeData.minutes,
               routeDistanceKm: routeData.distanceKm,
-              loads: logicalLoads,
+              loads: normalizedLogicalLoads,
               planningAnalysis,
               waves,
             },

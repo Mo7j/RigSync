@@ -2757,6 +2757,115 @@ p {
   display: none;
 }
 
+.manager-load-grid-card {
+  position: relative;
+  padding-top: 52px;
+}
+
+.manager-load-grid-toolbar {
+  position: absolute;
+  top: 14px;
+  right: 16px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  z-index: 1;
+}
+
+.manager-load-grid-toolbar-button {
+  min-height: 34px;
+  padding: 0 14px;
+}
+
+.manager-load-grid-edit-button {
+  width: 34px;
+  height: 34px;
+  border: 1px solid rgba(148, 163, 184, 0.16);
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--text);
+}
+
+.manager-edit-icon-svg {
+  width: 15px;
+  height: 15px;
+}
+
+.manager-load-grid {
+  grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+  gap: 7px;
+  max-height: none;
+  overflow: visible;
+  padding-right: 0;
+}
+
+.manager-load-tile {
+  gap: 4px;
+  min-height: 0;
+  padding: 7px 10px;
+  border-radius: 12px;
+}
+
+.manager-load-tile-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.manager-load-tile-title {
+  font-size: 0.72rem;
+  line-height: 1.1;
+}
+
+.manager-load-tile-pill {
+  min-height: 18px;
+  padding: 0 6px;
+  font-size: 0.6rem;
+}
+
+.manager-load-tile-category {
+  margin: 0;
+  font-size: 0.6rem;
+  line-height: 1.1;
+}
+
+.manager-load-tile-metrics {
+  grid-template-columns: 1fr;
+  gap: 4px;
+}
+
+.manager-load-tile .manager-rig-stat {
+  gap: 1px;
+}
+
+.manager-load-tile .manager-rig-stat span {
+  font-size: 0.58rem;
+  line-height: 1.1;
+}
+
+.manager-load-tile .manager-rig-stat strong {
+  font-size: 0.72rem;
+  line-height: 1.1;
+  overflow-wrap: anywhere;
+}
+
+.manager-load-tile .input {
+  min-height: 22px;
+  padding: 0 7px;
+  font-size: 0.68rem;
+}
+
+.manager-load-tile input[type="number"] {
+  -moz-appearance: textfield;
+  appearance: textfield;
+}
+
+.manager-load-tile input[type="number"]::-webkit-outer-spin-button,
+.manager-load-tile input[type="number"]::-webkit-inner-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+
 .manager-foreman-profile {
   display: grid;
   grid-template-columns: minmax(240px, 0.95fr) minmax(0, 1.35fr) auto;
@@ -3801,6 +3910,20 @@ p {
 
   .manager-resource-tags {
     grid-template-columns: 1fr;
+  }
+
+  .manager-load-grid-card {
+    padding-top: 64px;
+  }
+
+  .manager-load-grid-toolbar {
+    left: 16px;
+    right: 16px;
+    justify-content: flex-end;
+  }
+
+  .manager-load-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
   .manager-foreman-profile {

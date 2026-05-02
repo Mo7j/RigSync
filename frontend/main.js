@@ -2,9 +2,8 @@ import { React, createRoot, h } from "./lib/react.js";
 import { useHashRoute, navigateTo } from "./lib/router.js";
 import { DEFAULT_TRUCK_SETUP } from "./lib/constants.js";
 import { fetchLoads, fetchLocationLabel } from "./features/rigMoves/api.js";
-import { buildLogicalLoads, fetchRouteData, fallbackRouteData } from "./features/rigMoves/simulation.js";
-import { buildScenarioPlans } from "./features/rigMoves/isePlanner.js";
-import { buildOperatingSnapshot, buildStartupTransferSchedule } from "./features/rigMoves/operations.js";
+import { buildLogicalLoads, buildScenarioPlans, fetchRouteData, fallbackRouteData } from "./features/rigMoves/simulation.js";
+import { buildOperatingSnapshot, buildStartupPlanningLoads, buildStartupTransferSchedule } from "./features/rigMoves/operations.js";
 import { applyRigInventoryAdjustments, hydrateRigInventoryAdjustments, readRigInventoryAdjustments, setRigInventoryCache, writeRigInventoryAdjustments } from "./features/rigInventory/storage.js";
 import {
   authenticateUser,
@@ -422,6 +421,28 @@ function summarizeScenarioFailures(scenarioPlans) {
     })
     .slice(0, 3)
     .join(" ");
+}
+
+function clampTruckSetupToAvailability(truckSetup = [], availability = []) {
+  const availabilityByType = new Map(
+    (availability || []).map((item) => [
+      normalizePlannerTruckType(item?.type),
+      Math.max(0, Number.parseInt(item?.available ?? item?.count, 10) || 0),
+    ]),
+  );
+
+  return (truckSetup || [])
+    .map((item) => {
+      const type = normalizePlannerTruckType(item?.type);
+      const requestedCount = Math.max(0, Number.parseInt(item?.count, 10) || 0);
+      const availableCount = availabilityByType.get(type);
+      return {
+        ...item,
+        type,
+        count: Math.max(0, Math.min(requestedCount, availableCount ?? requestedCount)),
+      };
+    })
+    .filter((item) => item.type && item.count > 0);
 }
 
 function getLoadRequiredTruckTypes(load) {
@@ -930,14 +951,13 @@ function buildPlanningLoadsForMove({ baseLogicalLoads, move, teamMoves, startupR
     logicalLoads: baseLogicalLoads,
     startupRequirements,
   });
-  void operatingSnapshot;
+  const supportRouteMap = Object.fromEntries(
+    (move?.simulation?.supportRoutes || []).map((route) => [route.key, route]),
+  );
 
   return [
     ...(baseLogicalLoads || []),
-    ...buildLogicalLoads(startupRequirements || []).map((load) => ({
-      ...load,
-      source_kind: "startup",
-    })),
+    ...buildStartupPlanningLoads(startupRequirements, operatingSnapshot.startupLoads, supportRouteMap),
   ];
 }
 
@@ -1651,22 +1671,22 @@ function App() {
       }
 
       try {
-      const refreshedAvailability = buildFleetAvailability({
+        const refreshedAvailability = buildFleetAvailability({
           managerFleet,
           moves: managerScopedMoves,
           currentMoveId: activeMove.id,
         });
-      const refreshedMove = await buildMoveWithSimulation({
-        name: activeMove.name,
-        startPoint: activeMove.startPoint,
-        endPoint: activeMove.endPoint,
-        loadCount: logicalLoads.length,
-        logicalLoads,
-        truckSetup: activeMove.truckSetup || activeMove.simulation?.truckSetup || DEFAULT_TRUCK_SETUP,
-        previousMove: activeMove,
-        availability: refreshedAvailability,
-        scenarioTruckSetup: refreshedAvailability,
-      });
+        const refreshedMove = await buildMoveWithSimulation({
+          name: activeMove.name,
+          startPoint: activeMove.startPoint,
+          endPoint: activeMove.endPoint,
+          loadCount: logicalLoads.length,
+          logicalLoads,
+          truckSetup: refreshedAvailability,
+          previousMove: activeMove,
+          availability: refreshedAvailability,
+          scenarioTruckSetup: refreshedAvailability,
+        });
 
         if (!cancelled) {
           setMoves(await upsertMove(refreshedMove));
@@ -2042,7 +2062,7 @@ function App() {
     const availabilityByType = new Map(
       (availability || []).map((item) => [String(item.type || "").trim().toLowerCase(), item]),
     );
-    const sanitizedTruckSetup = truckSetup
+    const sanitizedTruckSetup = clampTruckSetupToAvailability(truckSetup, availability)
       .map((item) => ({
         ...item,
         type: normalizePlannerTruckType(item.type),
@@ -2196,12 +2216,12 @@ function App() {
       completedStages: 6,
       totalStages: 8,
     });
+    const supportRouteMap = Object.fromEntries(
+      supportRoutesWithPickup.map((route) => [route.key, route]),
+    );
     const planningLoads = [
       ...(logicalLoads || []),
-      ...buildLogicalLoads(startupRequirements || []).map((load) => ({
-        ...load,
-        source_kind: "startup",
-      })),
+      ...buildStartupPlanningLoads(startupRequirements, operatingSnapshot.startupLoads, supportRouteMap),
     ];
     const normalizedScenarioTruckSetup = (scenarioTruckSetup || sanitizedTruckSetup)
       .map((item) => ({

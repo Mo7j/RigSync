@@ -605,9 +605,16 @@ export function LeafletMap({
       return;
     }
 
+    const playbackTruckIds = [
+      ...new Set(
+        (simulation.bestPlan.playback.trips || [])
+          .map((trip) => Number.parseInt(trip?.truckId, 10) || 0)
+          .filter((truckId) => truckId > 0),
+      ),
+    ].sort((left, right) => left - right);
     const activeTruckIds = new Set();
 
-    for (let truckId = 1; truckId <= simulation.truckCount; truckId += 1) {
+    for (const truckId of playbackTruckIds) {
       const status = getTruckStatus(simulation.bestPlan.playback, currentMinute, truckId);
       const roadHoldState = getTruckRoadHoldState(
         simulation.bestPlan.playback,

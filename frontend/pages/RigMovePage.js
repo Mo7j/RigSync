@@ -7,7 +7,7 @@ import { Field, TextInput } from "../components/ui/Field.js";
 import { Modal } from "../components/ui/Modal.js";
 import { formatLocationLabel, formatMinutes } from "../lib/format.js";
 import { translate } from "../lib/language.js";
-import { buildScenarioPlans } from "../features/rigMoves/isePlanner.js";
+import { buildScenarioPlans } from "../features/rigMoves/simulation.js";
 import { buildOperatingSnapshot, buildStartupTransferSchedule } from "../features/rigMoves/operations.js";
 import { persistMoveSession } from "../features/rigMoves/storage.js";
 
@@ -456,6 +456,12 @@ function shouldUseDemoSensorTracking(executionAssignments = []) {
 
 function normalizeTruckSetup(move, availableFleet = []) {
   const source = move?.truckSetup?.length ? move.truckSetup : move?.simulation?.truckSetup || [];
+  const availableByType = new Map(
+    (availableFleet || []).map((item) => [
+      normalizeTruckTypeKey(item.type),
+      Math.max(0, Number.parseInt(item.available ?? item.count, 10) || 0),
+    ]),
+  );
   const configuredByType = new Map();
 
   source.forEach((item, index) => {
@@ -467,7 +473,15 @@ function normalizeTruckSetup(move, availableFleet = []) {
     configuredByType.set(typeKey, {
       id: item.id || `truck-${index + 1}`,
       type,
-      count: String(Math.max(0, Number.parseInt(item.count, 10) || 0)),
+      count: String(
+        Math.max(
+          0,
+          Math.min(
+            Math.max(0, Number.parseInt(item.count, 10) || 0),
+            availableByType.get(typeKey) ?? Math.max(0, Number.parseInt(item.count, 10) || 0),
+          ),
+        ),
+      ),
       hourlyCost: Math.max(0, Number(item.hourlyCost) || 0),
     });
   });
@@ -1519,6 +1533,32 @@ function buildDisplayedTruckCounts(truckSetup, targetTotal) {
   }
 
   return normalized;
+}
+
+function buildScenarioSupportRouteSchedule(playback, fallbackDestinationLabel = "Destination") {
+  const grouped = new Map();
+
+  (playback?.trips || [])
+    .filter((trip) => (trip?.sourceKind || "rig") === "startup" && trip?.sourcePoint)
+    .forEach((trip) => {
+      const key = `${trip.sourceLabel || "source"}::${trip.loadCode || trip.loadId}`;
+      if (!grouped.has(key)) {
+        grouped.set(key, {
+          key,
+          loadLabel: trip.description || `Load ${trip.loadCode || trip.loadId}`,
+          quantity: 0,
+          sourceLabel: trip.sourceLabel || "Support source",
+          sourcePoint: trip.sourcePoint || null,
+          destinationLabel: trip.destinationLabel || fallbackDestinationLabel,
+          truckLabel: trip.truckType || "Assigned truck",
+          geometry: trip.routeGeometry || null,
+        });
+      }
+
+      grouped.get(key).quantity += 1;
+    });
+
+  return [...grouped.values()];
 }
 
 function getRigSiteStats({ side, move, playback, currentMinute, totalMinutes }) {
@@ -5146,13 +5186,24 @@ export function RigMovePage({
   const displaySimulation = useMemo(() => {
     const rawBestPlan = selectedScenario?.bestVariant || safeMove.simulation?.bestPlan || fallbackScenario.bestVariant;
     const normalizedBestPlanPlayback = normalizeScenePlayback(rawBestPlan?.playback || fallbackPlayback);
+    const playbackTruckCount =
+      Math.max(
+        0,
+        ...((normalizedBestPlanPlayback?.trips || []).map((trip) => Number.parseInt(trip?.truckId, 10) || 0)),
+      ) || 0;
+    const scenarioTruckCount =
+      Number(selectedScenario?.allocatedTruckCount) ||
+      Number(selectedScenario?.truckCount) ||
+      (selectedScenario?.allocatedTruckSetup || selectedScenario?.truckSetup || []).reduce(
+        (sum, truck) => sum + Math.max(0, Number.parseInt(truck?.count, 10) || 0),
+        0,
+      ) ||
+      playbackTruckCount ||
+      safeMove.simulation?.truckCount ||
+      0;
     return {
       ...(safeMove.simulation || {}),
-      truckCount: Math.max(
-        selectedScenario?.truckCount || 0,
-        safeMove.simulation?.truckCount || 0,
-        normalizedBestPlanPlayback?.truckCount || 0,
-      ),
+      truckCount: scenarioTruckCount,
       bestPlan: {
         ...(rawBestPlan || {}),
         playback: normalizedBestPlanPlayback,
@@ -5353,11 +5404,20 @@ export function RigMovePage({
     ? Math.round((operatingSnapshot.startupSummary.coveredUnits / operatingSnapshot.startupSummary.totalUnits) * 100)
     : 0;
   const startupTransferSchedule = useMemo(
-    () =>
-      safeMove?.simulation?.supportRoutes?.length
-        ? safeMove.simulation.supportRoutes
-        : buildStartupTransferSchedule(operatingSnapshot.startupLoads, formatLocationLabel(safeMove?.endLabel, "Destination")),
-    [safeMove?.simulation?.supportRoutes, operatingSnapshot, safeMove?.endLabel],
+    () => {
+      const scenarioRoutes = buildScenarioSupportRouteSchedule(
+        selectedScenario?.bestVariant?.playback || activePlayback,
+        formatLocationLabel(safeMove?.endLabel, "Destination"),
+      );
+      if (scenarioRoutes.length) {
+        return scenarioRoutes;
+      }
+      if (safeMove?.simulation?.supportRoutes?.length) {
+        return safeMove.simulation.supportRoutes;
+      }
+      return buildStartupTransferSchedule(operatingSnapshot.startupLoads, formatLocationLabel(safeMove?.endLabel, "Destination"));
+    },
+    [selectedScenario, activePlayback, safeMove?.simulation?.supportRoutes, operatingSnapshot, safeMove?.endLabel],
   );
 
   function updateTruckCount(truckId, nextCountValue) {

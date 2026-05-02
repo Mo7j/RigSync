@@ -16,14 +16,14 @@ def resolve_dataset_path():
         return Path(override).expanduser()
 
     search_roots = [
+        PROJECT_ROOT,
         Path.home() / "Downloads" / "ise",
         Path.home() / "Downloads",
-        PROJECT_ROOT,
     ]
     candidate_names = (
+        "FinalData.xlsx",
         "ise_data_final_v2.xlsx",
         "iseData.xlsx",
-        "FinalData.xlsx",
     )
 
     for search_root in search_roots:
@@ -103,6 +103,7 @@ STARTUP_REUSABLE_IDS = {
     "SU-06",
     "SU-13",
     "SU-14",
+    "SU-15",
 }
 
 SHEET_NAME_CANDIDATES = {
@@ -238,11 +239,46 @@ def parse_phase_dependency_refs(value):
     ]
 
 
+def build_phase_refs_from_codes(codes, phase):
+    return [f"{code} ({phase})" for code in (codes or [])]
+
+
 def normalize_worker_role(value):
     text = normalize_text(value)
     if not text:
         return None
     return WORKER_ROLE_ALIASES.get(text.lower())
+
+
+def parse_role_counts_from_text(value, phase_code):
+    text = normalize_text(value)
+    if not text or "|" not in text:
+        return {}
+
+    phase_marker = f"{phase_code}:"
+    segment = None
+    for chunk in text.split("|"):
+        candidate = normalize_text(chunk)
+        if candidate and candidate.upper().startswith(phase_marker):
+            segment = candidate[len(phase_marker):].strip()
+            break
+
+    if not segment:
+        return {}
+
+    role_counts = {}
+    for piece in re.split(r"[;,]+", segment):
+        item = normalize_text(piece)
+        if not item:
+            continue
+        match = re.match(r"(.+?)\s+(\d+)$", item)
+        if not match:
+            continue
+        role_id = normalize_worker_role(match.group(1))
+        if not role_id:
+            continue
+        role_counts[role_id] = max(0, int(match.group(2)))
+    return role_counts
 
 
 def resolve_sheet(workbook, candidate_names):
@@ -362,6 +398,96 @@ def group_expanded_phase_rows(sheet):
     return [grouped[key] for key in sorted(grouped.keys())]
 
 
+def parse_compact_rig_load_rows(sheet):
+    rows = []
+
+    for values in sheet.iter_rows(min_row=2, values_only=True):
+        code = normalize_text(values[0] if values else None)
+        if not code:
+            continue
+
+        rig_down_dependency_codes = parse_dependency_codes(values[8] if len(values) > 8 else None)
+        rig_up_dependency_codes = parse_dependency_codes(values[9] if len(values) > 9 else None)
+        minimum_crew_text = values[14] if len(values) > 14 else None
+        optimal_crew_text = values[15] if len(values) > 15 else None
+
+        rows.append(
+            {
+                "code": code.upper(),
+                "load_type": normalize_text(values[1] if len(values) > 1 else None) or code.split("-", 1)[0],
+                "description": normalize_text(values[2] if len(values) > 2 else None),
+                "category": normalize_text(values[3] if len(values) > 3 else None),
+                "load_count": max(1, normalize_int(values[4] if len(values) > 4 else None) or 1),
+                "weight_tons": parse_weight_tons(values[5] if len(values) > 5 else None),
+                "weight_text": normalize_text(values[5] if len(values) > 5 else None),
+                "dimensions": parse_dimension_triplet(values[6] if len(values) > 6 else None),
+                "dimensions_text": normalize_text(values[6] if len(values) > 6 else None),
+                "priority": normalize_int(values[7] if len(values) > 7 else None) or 0,
+                "rig_down_dependency_codes": rig_down_dependency_codes,
+                "rig_down_dependency_phase_codes": build_phase_refs_from_codes(rig_down_dependency_codes, "RD"),
+                "rig_move_dependency_codes": [],
+                "rig_move_dependency_phase_codes": [],
+                "rig_up_dependency_codes": rig_up_dependency_codes,
+                "rig_up_dependency_phase_codes": build_phase_refs_from_codes(rig_up_dependency_codes, "RU"),
+                "avg_rig_down_minutes": parse_duration_minutes(values[10] if len(values) > 10 else None),
+                "avg_rig_up_minutes": parse_duration_minutes(values[11] if len(values) > 11 else None),
+                "is_critical": parse_yes_no(values[12] if len(values) > 12 else None),
+                "truck_type": normalize_text(values[13] if len(values) > 13 else None),
+                "truck_types": parse_truck_types(values[13] if len(values) > 13 else None),
+                "minimum_crew_down_roles": parse_role_counts_from_text(minimum_crew_text, "RD"),
+                "minimum_crew_up_roles": parse_role_counts_from_text(minimum_crew_text, "RU"),
+                "optimal_crew_down_roles": parse_role_counts_from_text(optimal_crew_text, "RD"),
+                "optimal_crew_up_roles": parse_role_counts_from_text(optimal_crew_text, "RU"),
+                "optimal_rig_down_minutes": parse_duration_minutes(values[16] if len(values) > 16 else None) or parse_duration_minutes(values[10] if len(values) > 10 else None),
+                "optimal_rig_up_minutes": parse_duration_minutes(values[17] if len(values) > 17 else None) or parse_duration_minutes(values[11] if len(values) > 11 else None),
+            }
+        )
+
+    return rows
+
+
+def parse_compact_startup_load_rows(sheet):
+    rows = []
+
+    for values in sheet.iter_rows(min_row=2, values_only=True):
+        code = normalize_text(values[0] if values else None)
+        if not code:
+            continue
+
+        dependency_codes = parse_dependency_codes(values[7] if len(values) > 7 else None)
+        dependency_phase_codes = build_phase_refs_from_codes(dependency_codes, "RU")
+        avg_rig_up_minutes = parse_duration_minutes(values[8] if len(values) > 8 else None)
+
+        rows.append(
+            {
+                "code": code.upper(),
+                "load_type": normalize_text(values[1] if len(values) > 1 else None) or "Startup",
+                "description": normalize_text(values[2] if len(values) > 2 else None),
+                "count": max(1, normalize_int(values[3] if len(values) > 3 else None) or 1),
+                "weight_tons": parse_weight_tons(values[4] if len(values) > 4 else None),
+                "weight_text": normalize_text(values[4] if len(values) > 4 else None),
+                "dimensions": parse_dimension_triplet(values[5] if len(values) > 5 else None),
+                "dimensions_text": normalize_text(values[5] if len(values) > 5 else None),
+                "priority": normalize_int(values[6] if len(values) > 6 else None) or 0,
+                "dependencyLabel": ", ".join(dependency_codes) if dependency_codes else "Standalone startup load",
+                "rig_move_dependency_codes": dependency_codes,
+                "rig_move_dependency_phase_codes": dependency_phase_codes,
+                "rig_up_dependency_codes": dependency_codes,
+                "rig_up_dependency_phase_codes": dependency_phase_codes,
+                "avg_rig_up_minutes": avg_rig_up_minutes,
+                "truck_type": normalize_text(values[9] if len(values) > 9 else None),
+                "truck_types": parse_truck_types(values[9] if len(values) > 9 else None),
+                "isReusable": code.upper() in STARTUP_REUSABLE_IDS,
+                "minimum_crew_up_count": 0,
+                "optimal_crew_up_count": 0,
+                "minimum_crew_up_roles": {},
+                "optimal_crew_up_roles": {},
+            }
+        )
+
+    return rows
+
+
 def build_rig_load_payload(row):
     return {
         "id": row["code"],
@@ -419,7 +545,7 @@ def build_startup_load_payload(row):
         "avg_rig_up_minutes": row.get("avg_rig_up_minutes"),
         "truck_type": row.get("truck_type"),
         "truckTypes": row.get("truck_types") or [],
-        "isReusable": any(row["code"].startswith(prefix) for prefix in STARTUP_REUSABLE_IDS),
+        "isReusable": row["code"] in STARTUP_REUSABLE_IDS,
         "minimum_crew_up_count": sum((row.get("minimum_crew_up_roles") or {}).values()),
         "optimal_crew_up_count": sum((row.get("optimal_crew_up_roles") or {}).values()),
         "minimum_crew_up_roles": row.get("minimum_crew_up_roles") or {},
@@ -444,18 +570,111 @@ def build_truck_spec_payload(values):
     }
 
 
+def fits_load_to_truck_type(load, truck_spec):
+    if not truck_spec:
+        return False
+
+    dimensions = load.get("dimensions") or {}
+    truck_dimensions = truck_spec.get("dimensions") or {}
+
+    weight_ok = (
+        not load.get("weight_tons")
+        or not truck_spec.get("max_weight_tons")
+        or float(load["weight_tons"]) <= float(truck_spec["max_weight_tons"])
+    )
+    length_ok = (
+        not dimensions.get("length")
+        or not truck_dimensions.get("length")
+        or float(dimensions["length"]) <= float(truck_dimensions["length"])
+    )
+    width_ok = (
+        not dimensions.get("width")
+        or not truck_dimensions.get("width")
+        or float(dimensions["width"]) <= float(truck_dimensions["width"])
+    )
+    height_ok = (
+        not dimensions.get("height")
+        or not truck_dimensions.get("height")
+        or float(dimensions["height"]) <= float(truck_dimensions["height"])
+    )
+
+    return weight_ok and length_ok and width_ok and height_ok
+
+
+def can_move_as_oversize_permit(load, truck_spec):
+    if not truck_spec:
+        return False
+
+    truck_type = normalize_text(truck_spec.get("type")) or ""
+    if truck_type not in {"Low-bed", "Heavy Hauler"}:
+        return False
+
+    load_weight = float(load.get("weight_tons") or 0)
+    max_weight = float(truck_spec.get("max_weight_tons") or 0)
+    if load_weight and max_weight and load_weight > max_weight:
+        return False
+
+    return True
+
+
+def augment_feasible_truck_types(loads, truck_specs):
+    ordered_specs = sorted(
+        (truck_specs or []),
+        key=lambda spec: (
+            float(spec.get("max_weight_tons") or 0),
+            float((spec.get("dimensions") or {}).get("length") or 0),
+            float((spec.get("dimensions") or {}).get("width") or 0),
+            float((spec.get("dimensions") or {}).get("height") or 0),
+        ),
+    )
+
+    for load in loads or []:
+        declared_types = list(load.get("truck_types") or [])
+        feasible_declared = [
+            truck_type
+            for truck_type in declared_types
+            if (
+                fits_load_to_truck_type(load, next((spec for spec in ordered_specs if spec.get("type") == truck_type), None))
+                or can_move_as_oversize_permit(load, next((spec for spec in ordered_specs if spec.get("type") == truck_type), None))
+            )
+        ]
+
+        if feasible_declared:
+          load["truck_types"] = feasible_declared
+          load["truck_type"] = " / ".join(feasible_declared)
+          continue
+
+        feasible_fallbacks = [
+            spec.get("type")
+            for spec in ordered_specs
+            if fits_load_to_truck_type(load, spec) or can_move_as_oversize_permit(load, spec)
+        ]
+        if feasible_fallbacks:
+            load["truck_types"] = feasible_fallbacks
+            load["truck_type"] = " / ".join(feasible_fallbacks)
+
+    return loads
+
+
 @lru_cache(maxsize=1)
 def load_planning_dataset():
     workbook = load_workbook(DATASET_PATH, data_only=True)
+    rig_sheet = resolve_sheet(workbook, SHEET_NAME_CANDIDATES["rig"])
+    startup_sheet = resolve_sheet(workbook, SHEET_NAME_CANDIDATES["startup"])
 
-    rig_loads = [
-        build_rig_load_payload(row)
-        for row in group_expanded_phase_rows(resolve_sheet(workbook, SHEET_NAME_CANDIDATES["rig"]))
-    ]
-    startup_loads = [
-        build_startup_load_payload(row)
-        for row in group_expanded_phase_rows(resolve_sheet(workbook, SHEET_NAME_CANDIDATES["startup"]))
-    ]
+    grouped_rig_rows = group_expanded_phase_rows(rig_sheet)
+    grouped_startup_rows = group_expanded_phase_rows(startup_sheet)
+
+    if grouped_rig_rows:
+        rig_loads = [build_rig_load_payload(row) for row in grouped_rig_rows]
+    else:
+        rig_loads = parse_compact_rig_load_rows(rig_sheet)
+
+    if grouped_startup_rows:
+        startup_loads = [build_startup_load_payload(row) for row in grouped_startup_rows]
+    else:
+        startup_loads = parse_compact_startup_load_rows(startup_sheet)
+
     truck_specs = [
         payload
         for payload in (
@@ -464,6 +683,8 @@ def load_planning_dataset():
         )
         if payload
     ]
+    rig_loads = augment_feasible_truck_types(rig_loads, truck_specs)
+    startup_loads = augment_feasible_truck_types(startup_loads, truck_specs)
 
     return {
         "rig_loads": rig_loads,

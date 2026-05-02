@@ -1,6 +1,7 @@
 import { TEST_USERS } from "../auth/auth.js";
 import { readRigInventoryAdjustments } from "../rigInventory/storage.js";
 import { createId } from "../../lib/id.js";
+import { buildLogicalLoads, haversineKilometers } from "./simulation.js";
 
 function normalizeTruckTypeKey(type) {
   const normalized = String(type || "")
@@ -127,6 +128,7 @@ export function buildStartupTransferLoads(startupLoads = [], supportRouteMap = {
         return {
           id: syntheticId,
           code: `${load.id}-X${sourceIndex + 1}-${itemIndex + 1}`,
+          family_id: load.id,
           key: `startup-transfer-${load.id}-${source.moveId}-${sourceIndex}-${itemIndex}`,
           supportRouteKey,
           description: `${load.description} transfer from ${source.rigLabel}`,
@@ -170,6 +172,38 @@ export function buildStartupTransferLoads(startupLoads = [], supportRouteMap = {
       }),
     ),
   );
+}
+
+export function buildStartupPlanningLoads(startupRequirements = [], startupLoads = [], supportRouteMap = {}) {
+  const transferLoads = buildStartupTransferLoads(startupLoads, supportRouteMap);
+  const transferredCountsByFamily = new Map();
+
+  transferLoads.forEach((load) => {
+    const familyId = String(load.family_id || load.code || "").trim();
+    if (!familyId) {
+      return;
+    }
+    transferredCountsByFamily.set(familyId, (transferredCountsByFamily.get(familyId) || 0) + 1);
+  });
+
+  const genericStartupLoads = buildLogicalLoads(startupRequirements || []).filter((load) => {
+    const familyId = String(load.family_id || load.code || "").trim();
+    const transferredCount = transferredCountsByFamily.get(familyId) || 0;
+    if (transferredCount <= 0) {
+      return true;
+    }
+
+    transferredCountsByFamily.set(familyId, transferredCount - 1);
+    return false;
+  }).map((load) => ({
+    ...load,
+    source_kind: "startup",
+  }));
+
+  return [
+    ...genericStartupLoads,
+    ...transferLoads,
+  ];
 }
 
 export function buildStartupTransferSchedule(startupLoads = [], destinationLabel = "Destination") {
@@ -280,11 +314,12 @@ export function buildOperatingSnapshot({ move, teamMoves = [], logicalLoads = []
           moveName: donor.moveName,
           rigLabel: donor.rigLabel,
           rigPoint: donor.rigPoint,
+          distanceKm: move?.endPoint && donor.rigPoint ? haversineKilometers(donor.rigPoint, move.endPoint) : Number.POSITIVE_INFINITY,
           available,
         };
       })
       .filter(Boolean)
-      .sort((a, b) => b.available - a.available || a.rigLabel.localeCompare(b.rigLabel));
+      .sort((a, b) => b.available - a.available || a.distanceKm - b.distanceKm || a.rigLabel.localeCompare(b.rigLabel));
 
     let remaining = load.count;
     const sourcingPlan = donorOptions

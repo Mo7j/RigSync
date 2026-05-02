@@ -83,6 +83,24 @@ function ForemanNavIcon({ name }) {
   );
 }
 
+function ForemanEditIcon() {
+  return h(
+    "svg",
+    {
+      className: "manager-edit-icon-svg",
+      viewBox: "0 0 24 24",
+      fill: "none",
+      stroke: "currentColor",
+      strokeWidth: "1.8",
+      strokeLinecap: "round",
+      strokeLinejoin: "round",
+      "aria-hidden": "true",
+    },
+    h("path", { d: "M12 20h9" }),
+    h("path", { d: "m16.5 3.5 4 4L8 20l-4 1 1-4Z" }),
+  );
+}
+
 function MetricStrip({ items, className = "" }) {
   return h(
     "div",
@@ -373,52 +391,66 @@ export function DashboardPage({
       h(MetricStrip, { key: "loads-strip", items: extraLoadSummaryItems }),
       h(
         Card,
-        { className: "dashboard-section-card manager-dashboard-panel", key: "needed-loads" },
+        { className: "dashboard-section-card manager-dashboard-panel manager-load-grid-card", key: "needed-loads" },
         h(
           "div",
-          { className: "section-heading" },
-          h("div", null, h("h2", null, "Needed Loads On Site"), h("p", { className: "muted-copy" }, "Only reusable needed loads can be adjusted here. Permanent rig loads stay read-only."))),
-          h(
-            "div",
-            { className: "auth-actions" },
-            isEditingLoads
-              ? [
-                  h(Button, {
-                    key: "cancel-load-edit",
-                    type: "button",
-                    variant: "ghost",
-                    onClick: () => {
-                      syncInventoryDraft(reusableNeededLoads);
-                      setIsEditingLoads(false);
-                    },
-                    children: "Cancel",
-                  }),
-                  h(Button, {
-                    key: "save-load-edit",
-                    type: "button",
-                    onClick: handleSaveLoads,
-                    children: "Save Loads",
-                  }),
-                ]
-              : h(Button, { type: "button", variant: "ghost", onClick: () => setIsEditingLoads(true), children: "Edit Loads" }),
-          ),
+          { className: "manager-load-grid-toolbar" },
+          isEditingLoads
+            ? [
+                h(Button, {
+                  key: "cancel-load-edit",
+                  type: "button",
+                  variant: "ghost",
+                  size: "sm",
+                  className: "manager-load-grid-toolbar-button",
+                  onClick: () => {
+                    syncInventoryDraft(reusableNeededLoads);
+                    setIsEditingLoads(false);
+                  },
+                  children: "Cancel",
+                }),
+                h(Button, {
+                  key: "save-load-edit",
+                  type: "button",
+                  size: "sm",
+                  className: "manager-load-grid-toolbar-button",
+                  onClick: handleSaveLoads,
+                  children: "Save",
+                }),
+              ]
+            : h(
+                "button",
+                {
+                  type: "button",
+                  className: "icon-button manager-load-grid-edit-button",
+                  onClick: () => setIsEditingLoads(true),
+                  "aria-label": "Edit loads",
+                  title: "Edit loads",
+                },
+                h(ForemanEditIcon),
+              ),
         ),
         reusableNeededLoads.length
           ? h(
               "div",
-              { className: "manager-foreman-list" },
+              { className: "manager-foreman-list manager-load-grid" },
               reusableNeededLoads.map((item) => {
                 const currentOnSiteCount = inventoryDraft[item.id]?.onSite ?? item.onSiteCount ?? 0;
                 const currentTransferableCount = inventoryDraft[item.id]?.transferable ?? item.transferableCount ?? 0;
 
                 return h(
                   "article",
-                  { key: item.id, className: "manager-resource-card manager-resource-card-strong" },
-                  h("div", { className: "manager-resource-card-head" }, h("div", null, h("strong", null, item.description), h("p", { className: "muted-copy" }, item.category)), h("span", { className: "section-pill" }, isEditingLoads ? "Editable" : `${currentOnSiteCount} on site`)),
+                  { key: item.id, className: "manager-resource-card manager-resource-card-strong manager-load-tile" },
                   h(
                     "div",
-                    { className: "manager-resource-metrics" },
-                    h("div", { className: "manager-rig-stat" }, h("span", null, "Truck"), h("strong", null, item.truckTypes.join(" / ") || "Planned")),
+                    { className: "manager-load-tile-head" },
+                    h("strong", { className: "manager-load-tile-title" }, item.description),
+                    h("span", { className: "section-pill manager-load-tile-pill" }, isEditingLoads ? "Edit" : `${currentOnSiteCount}`),
+                  ),
+                  h("p", { className: "muted-copy manager-load-tile-category" }, item.category),
+                  h(
+                    "div",
+                    { className: "manager-resource-metrics manager-load-tile-metrics" },
                     h("div", { className: "manager-rig-stat" }, h("span", null, "Needed"), h("strong", null, String(item.count))),
                     h(
                       "label",
@@ -460,11 +492,13 @@ export function DashboardPage({
                           })
                         : h("strong", null, String(currentTransferableCount)),
                     ),
+                    h("div", { className: "manager-rig-stat" }, h("span", null, "Truck"), h("strong", null, item.truckTypes.join(" / ") || "Planned")),
                   ),
                 );
               }),
             )
           : h("p", { className: "muted-copy" }, "No reusable needed loads are configured for this rig."),
+      ),
     ];
   }
 
