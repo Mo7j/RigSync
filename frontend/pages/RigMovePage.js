@@ -1646,6 +1646,78 @@ function getRigInsightStats({ side, move, playback, currentMinute, totalMinutes 
   };
 }
 
+function getExecutionRigStats({ side, move, playback, currentMinute, totalMinutes, executionAssignments = [] }) {
+  if (!side || !playback?.trips?.length || !(executionAssignments || []).length) {
+    return null;
+  }
+
+  const sourceAssignments = (executionAssignments || [])
+    .filter((assignment) => assignment?.taskType !== "return" && assignment?.loadId != null);
+  if (!sourceAssignments.length) {
+    return null;
+  }
+
+  const totalLoads = sourceAssignments.length;
+  const completedLoads = side === "source"
+    ? sourceAssignments.filter((assignment) => assignment?.stageStatus?.rigDownCompleted).length
+    : sourceAssignments.filter((assignment) => assignment?.stageStatus?.rigUpCompleted).length;
+  const movingLoads = sourceAssignments.filter(
+    (assignment) => assignment?.stageStatus?.rigDownCompleted && !assignment?.stageStatus?.rigUpCompleted,
+  ).length;
+  const loadingNow = sourceAssignments.filter((assignment) => {
+    const rigDownStart = Number(assignment?.stagePlan?.rigDown?.startMinute);
+    return Number.isFinite(rigDownStart) && currentMinute >= rigDownStart && !assignment?.stageStatus?.rigDownCompleted;
+  }).length;
+  const riggingNow = sourceAssignments.filter((assignment) => {
+    const rigUpStart = Number(assignment?.stagePlan?.rigUp?.startMinute);
+    return Number.isFinite(rigUpStart) && currentMinute >= rigUpStart && !assignment?.stageStatus?.rigUpCompleted;
+  }).length;
+  const remainingLoads = Math.max(0, totalLoads - completedLoads);
+  const progress = totalLoads > 0 ? Math.round((completedLoads / totalLoads) * 100) : 0;
+  const label = side === "source"
+    ? formatLocationLabel(move?.startLabel, "Source Site")
+    : formatLocationLabel(move?.endLabel, "Destination Site");
+  const stateLabel =
+    side === "source"
+      ? progress >= 100
+        ? "Shifted Out"
+        : progress > 0
+          ? "Shifting"
+          : "Waiting"
+      : progress >= 100
+        ? "Rig Up Complete"
+        : progress > 0
+          ? "Rigging Up"
+          : "Pending";
+  const nextEventMinute = side === "source"
+    ? sourceAssignments
+      .filter((assignment) => !assignment?.stageStatus?.rigDownCompleted)
+      .map((assignment) => Number(assignment?.stagePlan?.rigDown?.finishMinute))
+      .filter(Number.isFinite)
+      .sort((a, b) => a - b)[0]
+    : sourceAssignments
+      .filter((assignment) => !assignment?.stageStatus?.rigUpCompleted)
+      .map((assignment) => Number(assignment?.stagePlan?.rigUp?.finishMinute))
+      .filter(Number.isFinite)
+      .sort((a, b) => a - b)[0];
+
+  return {
+    side,
+    label,
+    sideLabel: side === "source" ? "Source Rig Site" : "Destination Rig Site",
+    stateLabel,
+    progress,
+    completedLoads,
+    remainingLoads,
+    movingLoads,
+    timeLeft: formatMinutes(Math.max(0, Math.round(totalMinutes - currentMinute))),
+    loadingNow,
+    riggingNow,
+    nextEventIn: nextEventMinute != null ? formatMinutes(Math.max(0, Math.round(nextEventMinute - currentMinute))) : "0m",
+    sitePressure: side === "source" ? `${remainingLoads} still staged` : `${remainingLoads} still pending receipt`,
+  };
+}
+
 function getSliderMaxCount(currentCount) {
   return Math.max(7, currentCount + 4);
 }
@@ -2903,7 +2975,7 @@ function formatExecutionDelayAmount(minutes, assignment) {
   if (safeMinutes < 1 || isDemoExecutionAssignment(assignment)) {
     return `${Math.round(safeMinutes * 60)} sec`;
   }
-  return `${Math.round(safeMinutes)} min`;
+  return formatSmartDuration(safeMinutes);
 }
 
 function formatExecutionTimeAmount(minutes, assignment) {
@@ -3939,10 +4011,20 @@ function getAssignmentExecutionMetrics(assignments = [], executionProgress = {})
       totalStageTasks: 3,
       completedStageTasks: completedStageCount,
       actualPercent: Math.round((completedStageCount / 3) * 100),
+      stageCounts: {
+        down: executionProgress?.rigDownCompleted ? 1 : 0,
+        move: executionProgress?.rigMoveCompleted ? 1 : 0,
+        up: executionProgress?.rigUpCompleted ? 1 : 0,
+      },
+      stageTotals: {
+        down: 1,
+        move: 1,
+        up: 1,
+      },
       stagePercents: {
-        down: executionProgress?.rigDownCompleted ? 100 : 0,
-        move: executionProgress?.rigMoveCompleted ? 100 : 0,
-        up: executionProgress?.rigUpCompleted ? 100 : 0,
+        down: (executionProgress?.rigDownCompleted ? 1 : 0) * (100 / 3),
+        move: (executionProgress?.rigMoveCompleted ? 1 : 0) * (100 / 3),
+        up: (executionProgress?.rigUpCompleted ? 1 : 0) * (100 / 3),
       },
     };
   }
@@ -3959,10 +4041,20 @@ function getAssignmentExecutionMetrics(assignments = [], executionProgress = {})
     totalStageTasks,
     completedStageTasks,
     actualPercent: Math.round((completedStageTasks / Math.max(totalStageTasks, 1)) * 100),
+    stageCounts: {
+      down: completedDown,
+      move: completedMove,
+      up: completedUp,
+    },
+    stageTotals: {
+      down: assignments.length,
+      move: assignments.length,
+      up: assignments.length,
+    },
     stagePercents: {
-      down: Math.round((completedDown / Math.max(driverCount, 1)) * 100),
-      move: Math.round((completedMove / Math.max(driverCount, 1)) * 100),
-      up: Math.round((completedUp / Math.max(driverCount, 1)) * 100),
+      down: (completedDown / Math.max(totalStageTasks, 1)) * 100,
+      move: (completedMove / Math.max(totalStageTasks, 1)) * 100,
+      up: (completedUp / Math.max(totalStageTasks, 1)) * 100,
     },
   };
 }
@@ -3973,6 +4065,13 @@ function formatHoursNumber(minutes = 0, digits = 1) {
 
 function renderElapsedTimeValue(totalMinutes = 0) {
   const normalizedMinutes = Math.max(0, Number(totalMinutes) || 0);
+  if (normalizedMinutes >= 60) {
+    return h(
+      "span",
+      { className: "scene-time-passed-value" },
+      h("span", { className: "scene-time-passed-main" }, formatSmartDuration(normalizedMinutes)),
+    );
+  }
   const wholeMinutes = Math.floor(normalizedMinutes);
   const seconds = Math.floor((normalizedMinutes - wholeMinutes) * 60);
 
@@ -5690,6 +5789,43 @@ function formatDaysHours(totalMinutes) {
   return `${days}d ${hours}h`;
 }
 
+function formatSmartDuration(totalMinutes = 0) {
+  const safeMinutes = Math.max(0, Number(totalMinutes) || 0);
+  if (safeMinutes >= 24 * 60) {
+    const totalHours = Math.floor(safeMinutes / 60);
+    const days = Math.floor(totalHours / 24);
+    const hours = totalHours % 24;
+    return hours > 0 ? `${days}d ${hours}h` : `${days}d`;
+  }
+  if (safeMinutes >= 60) {
+    const hours = Math.floor(safeMinutes / 60);
+    const minutes = Math.round(safeMinutes % 60);
+    return minutes > 0 ? `${hours}h ${minutes}m` : `${hours}h`;
+  }
+  return `${Math.round(safeMinutes)}m`;
+}
+
+function formatSignedSmartDuration(totalMinutes = 0) {
+  const roundedMinutes = Math.round(Number(totalMinutes) || 0);
+  if (roundedMinutes === 0) {
+    return "0m";
+  }
+  return `${roundedMinutes > 0 ? "+" : "-"}${formatSmartDuration(Math.abs(roundedMinutes))}`;
+}
+
+function formatPlanPaceDelta(totalMinutes = 0) {
+  const roundedMinutes = Math.round(Number(totalMinutes) || 0);
+  if (roundedMinutes === 0) {
+    return "On plan";
+  }
+  return `${formatSmartDuration(Math.abs(roundedMinutes))} ${roundedMinutes > 0 ? "behind" : "ahead"}`;
+}
+
+function formatStagePercent(value) {
+  const safeValue = Math.max(0, Number(value) || 0);
+  return formatPercentLabel(safeValue, safeValue < 10 ? 1 : 0);
+}
+
 function getPlanEtaLabel(dateValue, timeValue, durationMinutes) {
   const normalizedDate = normalizePlanningDate(dateValue);
   const planningStartMinutes = parsePlanningTimeMinutes(timeValue);
@@ -6065,6 +6201,8 @@ export function RigMovePage({
   const [customPlanError, setCustomPlanError] = useState("");
   const stableDemoTargetMinuteRef = useRef(null);
   const liveDemoTripKeyRef = useRef("");
+  const lastViewPersistKeyRef = useRef("");
+  const lastHydrationPersistKeyRef = useRef("");
 
   function handleSceneModeChange(nextMode) {
     if (nextMode === "timeline") {
@@ -6220,17 +6358,28 @@ export function RigMovePage({
       return;
     }
 
+    const viewPersistencePayload = {
+      activeView,
+      sceneMode,
+      previousSceneMode,
+      timelineZoom,
+      timelineRowType,
+      timelineGapMinutes,
+      planningStartDate,
+      planningStartTime,
+    };
+    const nextPersistKey = JSON.stringify(viewPersistencePayload);
+    if (lastViewPersistKeyRef.current === nextPersistKey) {
+      return;
+    }
+
     const timeoutId = window.setTimeout(() => {
-      void persistMoveSession(move.id, {
-        activeView,
-        sceneMode,
-        previousSceneMode,
-        timelineZoom,
-        timelineRowType,
-        timelineGapMinutes,
-        planningStartDate,
-        planningStartTime,
-      }).catch(() => {});
+      lastViewPersistKeyRef.current = nextPersistKey;
+      void persistMoveSession(move.id, viewPersistencePayload).catch(() => {
+        if (lastViewPersistKeyRef.current === nextPersistKey) {
+          lastViewPersistKeyRef.current = "";
+        }
+      });
     }, 500);
 
     return () => {
@@ -6242,6 +6391,8 @@ export function RigMovePage({
     setCustomScenario(null);
     setCustomPlanError("");
     setIsCalculatingCustomPlan(false);
+    lastViewPersistKeyRef.current = "";
+    lastHydrationPersistKeyRef.current = "";
   }, [move?.id]);
 
   const fallbackPlayback = {
@@ -6303,6 +6454,8 @@ export function RigMovePage({
   const isCustomizeActive = !readOnly && activePlanKey === "customize";
   const deferredTruckSetup = useDeferredValue(truckSetup);
   const deferredTotalTrucks = deferredTruckSetup.reduce((sum, item) => sum + (Number.parseInt(item.count, 10) || 0), 0);
+  const liveCustomizeTruckSetup = truckSetup;
+  const liveCustomizeTotalTrucks = liveCustomizeTruckSetup.reduce((sum, item) => sum + (Number.parseInt(item.count, 10) || 0), 0);
   const planningRouteData = useMemo(() => ({
     minutes: safeMove.simulation?.routeMinutes || baseActiveScenario?.routeMinutes || 0,
     distanceKm: safeMove.simulation?.routeDistanceKm || baseActiveScenario?.routeDistanceKm || safeMove.routeKm || 0,
@@ -6316,7 +6469,7 @@ export function RigMovePage({
       return undefined;
     }
 
-    const sanitizedTruckSetup = deferredTruckSetup
+    const sanitizedTruckSetup = liveCustomizeTruckSetup
       .map((item) => ({
         ...item,
         type: normalizeTruckTypeLabel(item?.type),
@@ -6324,12 +6477,23 @@ export function RigMovePage({
         hourlyCost: Math.max(0, Number(item?.hourlyCost) || 0),
       }))
       .filter((item) => item.type && item.count > 0);
+    const truckSetupSignature = JSON.stringify(
+      sanitizedTruckSetup.map((item) => ({
+        type: item.type,
+        count: item.count,
+        hourlyCost: item.hourlyCost,
+      })),
+    );
 
     if (!sanitizedTruckSetup.length || !logicalLoads.length) {
       setCustomScenario(null);
       setIsCalculatingCustomPlan(false);
       setCustomPlanError(sanitizedTruckSetup.length ? "" : "Add at least one truck type to preview a custom plan.");
       return undefined;
+    }
+
+    if (customScenario?.truckSetupSignature !== truckSetupSignature) {
+      setCustomScenario(null);
     }
 
     let cancelled = false;
@@ -6374,6 +6538,7 @@ export function RigMovePage({
           allocatedTruckSetup: sanitizedTruckSetup,
           truckSetup: sanitizedTruckSetup,
           allocatedTruckCount: sanitizedTruckSetup.reduce((sum, item) => sum + item.count, 0),
+          truckSetupSignature,
         });
       }).catch((error) => {
         if (!cancelled) {
@@ -6385,22 +6550,33 @@ export function RigMovePage({
           setIsCalculatingCustomPlan(false);
         }
       });
-    }, 450);
+    }, 150);
 
     return () => {
       cancelled = true;
       window.clearTimeout(timeoutId);
     };
-  }, [isCustomizeActive, readOnly, move?.id, deferredTruckSetup, logicalLoads, planningRouteData, truckSpecs, planningStartTime]);
+  }, [isCustomizeActive, readOnly, move?.id, liveCustomizeTruckSetup, logicalLoads, planningRouteData, truckSpecs, planningStartTime, customScenario?.truckSetupSignature]);
   const scenarioPlans = baseScenarioPlans;
   const activeScenario =
     scenarioPlans.find((scenario) => scenario.name === activeScenarioName) ||
     scenarioPlans[0] ||
     baseActiveScenario;
-  const selectedScenario = isCustomizeActive ? (customScenario || activeScenario) : activeScenario;
+  const currentCustomizeSignature = JSON.stringify(
+    liveCustomizeTruckSetup
+      .map((item) => ({
+        type: normalizeTruckTypeLabel(item?.type),
+        count: Math.max(0, Number.parseInt(item?.count, 10) || 0),
+        hourlyCost: Math.max(0, Number(item?.hourlyCost) || 0),
+      }))
+      .filter((item) => item.type && item.count > 0)
+      .map((item) => ({ type: item.type, count: item.count, hourlyCost: item.hourlyCost })),
+  );
+  const matchingCustomScenario = customScenario?.truckSetupSignature === currentCustomizeSignature ? customScenario : null;
+  const selectedScenario = isCustomizeActive ? (matchingCustomScenario || activeScenario) : activeScenario;
   const selectedAllocatedTruckSetup = selectedScenario?.allocatedTruckSetup || selectedScenario?.truckSetup || truckSetup;
   const effectiveTruckCount = isCustomizeActive
-    ? (deferredTotalTrucks || totalTrucks || selectedScenario?.allocatedTruckCount || selectedScenario?.truckCount || 1)
+    ? (liveCustomizeTotalTrucks || totalTrucks || selectedScenario?.allocatedTruckCount || selectedScenario?.truckCount || 1)
     : (
         selectedAllocatedTruckSetup.reduce((sum, truck) => sum + Math.max(0, Number.parseInt(truck?.count, 10) || 0), 0) ||
         selectedScenario?.allocatedTruckCount ||
@@ -6409,7 +6585,7 @@ export function RigMovePage({
         1
       );
   const effectiveTruckSetup = isCustomizeActive
-    ? deferredTruckSetup
+    ? liveCustomizeTruckSetup
     : buildDisplayedTruckCounts(selectedAllocatedTruckSetup, effectiveTruckCount).map((truck) => ({
         ...truck,
         count: String(truck.count),
@@ -6572,6 +6748,7 @@ export function RigMovePage({
   const visibleMinute = isLiveDemoTracking ? Math.min(liveDemoMinute, totalMinutes) : baseVisibleMinute;
   const canResumePlayback = visibleMinute > 0 && visibleMinute < totalMinutes;
   const completion = Math.min(100, Math.round((visibleMinute / Math.max(totalMinutes, 1)) * 100));
+  const timeLeftLabel = formatSmartDuration(Math.max(0, totalMinutes - visibleMinute));
   const phases = useMemo(
     () => getPhasePercentages(activePlayback, visibleMinute),
     [activePlayback, visibleMinute],
@@ -6604,7 +6781,22 @@ export function RigMovePage({
     () => getPlanRadarComparisonModel(scenarioPlans, selectedScenario, safeMove),
     [scenarioPlans, selectedScenario, safeMove],
   );
-  const previewPlanCard = planRadarModel.plans.find((plan) => plan.isSelected) || planRadarModel.plans[0] || null;
+  const previewPlanCard = useMemo(() => {
+    if (isCustomizeActive && matchingCustomScenario) {
+      return {
+        key: "customize-preview",
+        name: matchingCustomScenario.name || "Custom Plan",
+        totalMinutes: Math.max(0, Number(matchingCustomScenario?.totalMinutes) || 0),
+        totalCost: Math.max(0, Number(matchingCustomScenario?.costEstimate) || 0),
+        utilization: getScenarioUtilizationScore(matchingCustomScenario),
+        savings: 0,
+        idleMinutes: Math.max(0, Number(matchingCustomScenario?.idleMinutes) || 0),
+        fleetUse: 0,
+        isSelected: true,
+      };
+    }
+    return planRadarModel.plans.find((plan) => plan.isSelected) || planRadarModel.plans[0] || null;
+  }, [isCustomizeActive, matchingCustomScenario, planRadarModel.plans]);
   const previewRoundTrips = activePlanSummary.roundTrips;
   const previewTruckUsageLabel = activePlanDashboard.truckUsageLabel;
   const previewCostPerLoad = planComparisonStats.costPerLoad;
@@ -6705,6 +6897,7 @@ export function RigMovePage({
     { value: "1500", label: "Normal" },
     { value: "15000", label: "Medium" },
     { value: "50000", label: "Fast" },
+    { value: "200000", label: "Extra Fast" },
   ];
   const timelineGapOptions = [
     { value: 60, label: "1h" },
@@ -6793,8 +6986,9 @@ export function RigMovePage({
   const fallbackExecutionStartedAt = move?.executionStartedAt || executionAssignments[0]?.assignedAt || null;
   const executionStartedAtMs = fallbackExecutionStartedAt ? new Date(fallbackExecutionStartedAt).getTime() : null;
   const executionCompletedAtMs = move?.executionCompletedAt ? new Date(move.executionCompletedAt).getTime() : null;
+  const executionSpeedFactor = Math.max(0.1, (Number(playbackSpeed) || 1500) / 1500);
   const executionElapsedMinutes = executionStartedAtMs
-    ? Math.max(0, ((executionCompletedAtMs || executionNow) - executionStartedAtMs) / 60000)
+    ? Math.max(0, (((executionCompletedAtMs || executionNow) - executionStartedAtMs) / 60000) * executionSpeedFactor)
     : 0;
   const executionVisibleMinute =
     executionState === "active" || executionState === "completed"
@@ -6869,14 +7063,41 @@ export function RigMovePage({
       return undefined;
     }
 
+    const hydrationPayload = {
+      simulation: {
+        ...(sceneSimulation || {}),
+        supportRoutes: startupTransferSchedule,
+        preferredScenarioName: selectedScenario?.name || sceneSimulation?.preferredScenarioName || "",
+      },
+    };
+    const nextPersistKey = JSON.stringify({
+      moveId: move.id,
+      preferredScenarioName: hydrationPayload.simulation.preferredScenarioName,
+      routeGeometryCount: hydrationPayload.simulation.routeGeometry?.length || 0,
+      supportRouteSignature: (hydrationPayload.simulation.supportRoutes || []).map((route) => [
+        route?.key || "",
+        route?.geometry?.length || 0,
+        route?.pickupGeometry?.length || 0,
+        route?.sourceGeometry?.length || 0,
+      ]),
+      tripRouteSignature: (hydrationPayload.simulation.bestPlan?.playback?.trips || []).map((trip) => [
+        trip?.truckId || "",
+        trip?.loadId || "",
+        trip?.routeGeometry?.length || 0,
+        trip?.pickupRouteGeometry?.length || 0,
+      ]),
+    });
+    if (lastHydrationPersistKeyRef.current === nextPersistKey) {
+      return undefined;
+    }
+
     const timeoutId = window.setTimeout(() => {
-      void persistMoveSession(move.id, {
-        simulation: {
-          ...(sceneSimulation || {}),
-          supportRoutes: startupTransferSchedule,
-          preferredScenarioName: selectedScenario?.name || sceneSimulation?.preferredScenarioName || "",
-        },
-      }).catch(() => {});
+      lastHydrationPersistKeyRef.current = nextPersistKey;
+      void persistMoveSession(move.id, hydrationPayload).catch(() => {
+        if (lastHydrationPersistKeyRef.current === nextPersistKey) {
+          lastHydrationPersistKeyRef.current = "";
+        }
+      });
     }, 800);
 
     return () => {
@@ -6885,14 +7106,21 @@ export function RigMovePage({
   }, [move?.id, needsRouteHydrationPersistence, sceneSimulation, startupTransferSchedule, selectedScenario?.name]);
   const focusedRigStats = useMemo(
     () =>
-      getRigInsightStats({
+      getExecutionRigStats({
+        side: focusTarget?.kind === "rig" ? focusTarget.side : null,
+        move: safeMove,
+        playback: scenePlayback,
+        currentMinute: sceneMinute,
+        totalMinutes,
+        executionAssignments: displayExecutionAssignments,
+      }) || getRigInsightStats({
         side: focusTarget?.kind === "rig" ? focusTarget.side : null,
         move: safeMove,
         playback: scenePlayback,
         currentMinute: sceneMinute,
         totalMinutes,
       }),
-    [focusTarget, safeMove, scenePlayback, sceneMinute, totalMinutes],
+    [focusTarget, safeMove, scenePlayback, sceneMinute, totalMinutes, displayExecutionAssignments],
   );
   const focusedTruckStats = useMemo(
     () =>
@@ -6924,17 +7152,59 @@ export function RigMovePage({
   const executionPaceLabel = completionVariance >= 5 ? "Ahead of plan" : completionVariance <= -5 ? "Behind plan" : "On plan";
   const plannedTasksByNow = Math.round((plannedCompletionPercent / 100) * executionAssignmentMetrics.totalStageTasks);
   const actualTasksDone = executionAssignmentMetrics.completedStageTasks;
+  const actualCompletionLabel = formatStagePercent((actualTasksDone / Math.max(executionAssignmentMetrics.totalStageTasks, 1)) * 100);
   const nextExecutionAssignment = displayExecutionAssignments.find((assignment) => assignment.status !== "completed") || null;
   const nextExecutionTaskLabel = nextExecutionAssignment
     ? `${nextExecutionAssignment.driverName || "Driver"} • ${nextExecutionAssignment.currentStage === "rigDown" ? "Rig Down" : nextExecutionAssignment.currentStage === "rigMove" ? "Rig Move" : "Rig Up"}`
     : "All assigned tasks complete";
-  const timeLeftLabel = formatMinutes(Math.max(0, Math.round(executionTimelineTotalMinutes - executionVisibleMinute)));
-  const executionProjectedFinishMs = executionStartedAtMs != null
+  const remainingExecutionMinutes = Math.max(0, executionTimelineTotalMinutes - executionVisibleMinute);
+  const plannedTimeLeftLabel = formatSmartDuration(remainingExecutionMinutes);
+  const actualProgressRatio = Math.max(0, Math.min(1, actualCompletionPercent / 100));
+  const plannedProgressRatio = Math.max(0, Math.min(1, plannedCompletionPercent / 100));
+  const scheduleVarianceMinutes = Math.round((plannedProgressRatio - actualProgressRatio) * executionTimelineTotalMinutes);
+  const scheduleVarianceLabel = formatPlanPaceDelta(scheduleVarianceMinutes);
+  const forecastRemainingMinutes = Math.max(0, remainingExecutionMinutes + scheduleVarianceMinutes);
+  const forecastTimeLeftLabel = formatSmartDuration(forecastRemainingMinutes);
+  const timeLeftVarianceMinutes = Math.round(forecastRemainingMinutes - remainingExecutionMinutes);
+  const timeLeftVarianceLabel = formatSignedSmartDuration(timeLeftVarianceMinutes);
+  const executionDateTimeFormatter = new Intl.DateTimeFormat("en-US", {
+    month: "short",
+    day: "numeric",
+    year: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+  });
+  const plannedExecutionFinishMs = executionStartedAtMs != null
     ? executionStartedAtMs + (executionTimelineTotalMinutes * 60000)
     : null;
+  const executionProjectedFinishMs = executionState === "completed"
+    ? executionCompletedAtMs
+    : ((executionState === "active" || isPlaybackActiveState)
+      ? Date.now() + (forecastRemainingMinutes * 60000)
+      : (executionStartedAtMs != null
+        ? executionStartedAtMs + (executionTimelineTotalMinutes * 60000)
+        : null));
   const executionEtcLabel = executionProjectedFinishMs != null
-    ? new Date(executionProjectedFinishMs).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })
+    ? executionDateTimeFormatter.format(new Date(executionProjectedFinishMs))
     : "--";
+  const plannedExecutionEtcLabel = plannedExecutionFinishMs != null
+    ? executionDateTimeFormatter.format(new Date(plannedExecutionFinishMs))
+    : "--";
+  const etcVarianceColor = completionVariance > 0
+    ? "#71d08c"
+    : completionVariance < 0
+      ? "#ff7b72"
+      : "rgba(255,255,255,0.62)";
+  const scheduleVarianceColor = scheduleVarianceMinutes < 0
+    ? "#71d08c"
+    : scheduleVarianceMinutes > 0
+      ? "#ff7b72"
+      : "rgba(255,255,255,0.62)";
+  const timeLeftVarianceColor = timeLeftVarianceMinutes < 0
+    ? "#71d08c"
+    : timeLeftVarianceMinutes > 0
+      ? "#ff7b72"
+      : "rgba(255,255,255,0.62)";
   const isExecutionActive = executionState === "active";
   const isExecutionCompleted = executionState === "completed";
   const isPlanningStage = executionState === "planning";
@@ -7012,6 +7282,7 @@ export function RigMovePage({
         key: `execution-alert-trip-${activeTripAssignment?.id || "active"}`,
         order: 0,
         actionable: false,
+        assignmentId: activeTripAssignment?.id || null,
         tone: tripTone,
         icon: tripIcon,
         title: isReturnTrip ? "Trip: Return to source" : "Trip: To destination",
@@ -7028,54 +7299,60 @@ export function RigMovePage({
     }
 
     (displayExecutionAssignments || []).forEach((assignment, assignmentIndex) => {
-      const currentStage = getExecutionAssignmentStage(assignment?.stageStatus || {});
-      const isExecutionVisibleAssignment = assignment?.status === "active" || assignment?.status === "foreman";
-      if (!isExecutionVisibleAssignment || currentStage === "completed") {
-        return;
-      }
-      if (currentStage === "rigMove") {
-        return;
-      }
-
-      const currentStageIndex = stageKeys.indexOf(currentStage);
-      const stepNumber = ((assignment.sequence || (assignmentIndex + 1)) - 1) * 3 + Math.max(currentStageIndex, 0) + 1;
-      const stagePlan = assignment?.stagePlan?.[currentStage];
-      const plannedStart = Number(stagePlan?.startMinute);
-      const plannedFinish = Number(stagePlan?.finishMinute);
       const loadLabel = assignment?.simpleLoadLabel || `Load ${assignmentIndex + 1}`;
-      const timeLeftMinutes = Math.max(0, plannedFinish - executionVisibleMinute);
-      const lateMinutes = Math.max(0, executionVisibleMinute - plannedFinish);
-      const delayThresholdMinutes = getExecutionDelayThresholdMinutes(assignment);
-      const tone = lateMinutes > delayThresholdMinutes ? "red" : lateMinutes > 0 ? "amber" : "blue";
-      const icon = lateMinutes > delayThresholdMinutes ? "danger" : lateMinutes > 0 ? "warning" : "task";
-      const isForemanActionableStage = currentStage === "rigDown" || currentStage === "rigUp";
+      const stageStatus = assignment?.stageStatus || {};
 
-      alerts.push({
-        key: `execution-alert-${assignment?.id || `${loadLabel}-${currentStage}`}-${currentStage}`,
-        order: stepNumber,
-        assignmentId: assignment?.id || null,
-        stage: currentStage,
-        actionable: isForemanActionableStage,
-        tone,
-        icon,
-        title: `Step ${stepNumber}: ${loadLabel} ${getExecutionStageTitle(currentStage)}`,
-        meta: loadLabel,
-        copy: lateMinutes > delayThresholdMinutes
-          ? `${formatExecutionDelayAmount(lateMinutes, assignment)} late. Mark done when finished.`
-          : lateMinutes > 0
-            ? `${formatExecutionDelayAmount(lateMinutes, assignment)} late.`
-            : `${formatExecutionTimeAmount(timeLeftMinutes, assignment)} left.`,
-        detail: Number.isFinite(plannedFinish)
-          ? `Planned finish ${formatExecutionTimeAmount(plannedFinish, assignment)}`
-          : Number.isFinite(plannedStart)
-            ? `Started ${formatExecutionTimeAmount(plannedStart, assignment)}`
-            : "",
+      stageKeys.forEach((stageKey, stageIndex) => {
+        const completedKey = stageKey === "rigDown"
+          ? "rigDownCompleted"
+          : stageKey === "rigMove"
+            ? "rigMoveCompleted"
+            : "rigUpCompleted";
+        if (stageStatus?.[completedKey]) {
+          return;
+        }
+
+        const stagePlan = assignment?.stagePlan?.[stageKey];
+        const plannedStart = Number(stagePlan?.startMinute);
+        const plannedFinish = Number(stagePlan?.finishMinute);
+        if (!Number.isFinite(plannedStart) || executionVisibleMinute < plannedStart) {
+          return;
+        }
+
+        const stepNumber = ((assignment.sequence || (assignmentIndex + 1)) - 1) * 3 + stageIndex + 1;
+        const timeLeftMinutes = Math.max(0, plannedFinish - executionVisibleMinute);
+        const lateMinutes = Math.max(0, executionVisibleMinute - plannedFinish);
+        const delayThresholdMinutes = getExecutionDelayThresholdMinutes(assignment);
+        const tone = lateMinutes > delayThresholdMinutes ? "red" : lateMinutes > 0 ? "amber" : "blue";
+        const icon = lateMinutes > delayThresholdMinutes ? "danger" : lateMinutes > 0 ? "warning" : "task";
+
+        alerts.push({
+          key: `execution-alert-${assignment?.id || `${loadLabel}-${stageKey}`}-${stageKey}`,
+          order: stepNumber,
+          assignmentId: assignment?.id || null,
+          loadId: assignment?.loadId ?? null,
+          stage: stageKey,
+          actionable: stageKey === "rigDown" || stageKey === "rigUp",
+          tone,
+          icon,
+          title: `Step ${stepNumber}: ${loadLabel} ${getExecutionStageTitle(stageKey)}`,
+          meta: loadLabel,
+          copy: lateMinutes > delayThresholdMinutes
+            ? `${formatExecutionDelayAmount(lateMinutes, assignment)} late. Mark done when finished.`
+            : lateMinutes > 0
+              ? `${formatExecutionDelayAmount(lateMinutes, assignment)} late.`
+              : `${formatExecutionTimeAmount(timeLeftMinutes, assignment)} left.`,
+          detail: Number.isFinite(plannedFinish)
+            ? `Planned finish ${formatExecutionTimeAmount(plannedFinish, assignment)}`
+            : Number.isFinite(plannedStart)
+              ? `Started ${formatExecutionTimeAmount(plannedStart, assignment)}`
+              : "",
+        });
       });
     });
 
     return alerts
-      .sort((left, right) => (left.order ?? 0) - (right.order ?? 0))
-      .slice(0, 3);
+      .sort((left, right) => (left.order ?? 0) - (right.order ?? 0));
   }, [displayExecutionAssignments, executionVisibleMinute, isPlanningStage]);
   const activeTripAlertState = useMemo(() => {
     if (isPlanningStage) {
@@ -7125,6 +7402,10 @@ export function RigMovePage({
       plannedFinishMinute: plannedTripFinish,
     };
   }, [displayExecutionAssignments, executionVisibleMinute, isPlanningStage]);
+  const sceneDelayAlertState = useMemo(
+    () => executionAlerts.find((alert) => alert?.tone === "red") || activeTripAlertState,
+    [executionAlerts, activeTripAlertState],
+  );
 
   function renderDelayAlertIcon(tone, icon = "task") {
     const stroke = tone === "red" ? "#fda4af" : tone === "blue" ? "#93c5fd" : "#fcd34d";
@@ -7618,7 +7899,7 @@ export function RigMovePage({
                 currentMinute: sceneMinute,
                 delayMinute: executionVisibleMinute,
                 executionAssignments: displayExecutionAssignments,
-                activeTripAlert: activeTripAlertState,
+                activeTripAlert: sceneDelayAlertState,
                 sceneFocusResetKey,
                 heightClass: "scene-only-canvas",
                 showOverlay: false,
@@ -7698,7 +7979,7 @@ export function RigMovePage({
           ? h(
           "div",
           { className: "scene-bottom-controls" },
-          isPlanningStage
+          (isPlanningStage || isExecutionActive || isPlaybackActiveState)
             ? h(
                 "div",
                 {
@@ -7716,7 +7997,7 @@ export function RigMovePage({
                     "aria-haspopup": "listbox",
                     "aria-expanded": isSpeedDropdownOpen ? "true" : "false",
                   },
-                  h("span", null, "Speed"),
+                  h("span", null, `Speed: ${activePlaybackSpeedOption.label}`),
                 ),
                 isSpeedDropdownOpen
                   ? h(
@@ -8009,7 +8290,7 @@ export function RigMovePage({
               ),
               h(
                 "div",
-                { className: "scene-plan-dashboard" },
+                { className: "scene-plan-dashboard scene-plan-dashboard-clean" },
                 h(
                   "div",
                   { className: "scene-plan-summary-card scene-plan-summary-card-title" },
@@ -8078,8 +8359,30 @@ export function RigMovePage({
               h(
                 "div",
                 { className: "scene-plan-kpis" },
-                h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "ETC"), h("strong", null, executionEtcLabel)),
-                h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Actual Completion"), h("strong", null, `${actualCompletionPercent}%`)),
+                h(
+                  "div",
+                  { className: "scene-plan-kpi-card" },
+                  h("span", { className: "scene-dashboard-label" }, "ETC"),
+                  h(
+                    "strong",
+                    { className: "scene-plan-kpi-value" },
+                    executionEtcLabel,
+                    " ",
+                    h(
+                      "span",
+                      {
+                        style: {
+                          color: etcVarianceColor,
+                          fontSize: "0.58em",
+                          fontWeight: 700,
+                        },
+                      },
+                      completionVarianceLabel,
+                    ),
+                  ),
+                  h("span", { className: "scene-plan-kpi-meta" }, `Planned ETC ${plannedExecutionEtcLabel}`),
+                ),
+                h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Actual Completion"), h("strong", null, actualCompletionLabel)),
                 h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Planned By Now"), h("strong", null, `${plannedCompletionPercent}%`)),
                 h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Variance"), h("strong", null, completionVarianceLabel)),
                 h("div", { className: "scene-dashboard-stack-item" }, h("span", { className: "scene-dashboard-label" }, "Execution Pace"), h("strong", null, executionPaceLabel), h("p", { className: "scene-dashboard-copy" }, `${actualTasksDone}/${executionAssignmentMetrics.totalStageTasks} stage tasks complete against ${plannedTasksByNow} planned by now.`)),
@@ -8099,19 +8402,19 @@ export function RigMovePage({
                   h(
                     "div",
                     { className: "scene-dashboard-phase-row" },
-                    h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Rig Down"), h("strong", null, `${executionAssignmentMetrics.stagePercents.down}% actual / ${Math.round(phases.down)}% plan`)),
+                    h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Rig Down"), h("strong", null, `${formatStagePercent(executionAssignmentMetrics.stagePercents.down)} ${executionAssignmentMetrics.stageCounts.down}/${executionAssignmentMetrics.stageTotals.down}`)),
                     h(ProgressBar, { value: executionAssignmentMetrics.stagePercents.down }),
                   ),
                   h(
                     "div",
                     { className: "scene-dashboard-phase-row" },
-                    h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Move"), h("strong", null, `${executionAssignmentMetrics.stagePercents.move}% actual / ${Math.round(phases.move)}% plan`)),
+                    h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Move"), h("strong", null, `${formatStagePercent(executionAssignmentMetrics.stagePercents.move)} ${executionAssignmentMetrics.stageCounts.move}/${executionAssignmentMetrics.stageTotals.move}`)),
                     h(ProgressBar, { value: executionAssignmentMetrics.stagePercents.move }),
                   ),
                   h(
                     "div",
                     { className: "scene-dashboard-phase-row" },
-                    h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Rig Up"), h("strong", null, `${executionAssignmentMetrics.stagePercents.up}% actual / ${Math.round(phases.up)}% plan`)),
+                    h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Rig Up"), h("strong", null, `${formatStagePercent(executionAssignmentMetrics.stagePercents.up)} ${executionAssignmentMetrics.stageCounts.up}/${executionAssignmentMetrics.stageTotals.up}`)),
                     h(ProgressBar, { value: executionAssignmentMetrics.stagePercents.up }),
                   ),
                 ),
@@ -8125,7 +8428,23 @@ export function RigMovePage({
                   "div",
                   { className: "scene-dashboard-pair" },
                   h("div", { className: "scene-dashboard-inline scene-dashboard-pair-item" }, h("span", { className: "scene-dashboard-label" }, "Planned Tasks By Now"), h("strong", null, String(plannedTasksByNow))),
-                  h("div", { className: "scene-dashboard-inline scene-dashboard-pair-item" }, h("span", { className: "scene-dashboard-label" }, "Time Left"), h("strong", null, formatMinutes(Math.max(0, Math.round(totalMinutes - visibleMinute))))),
+                  h(
+                    "div",
+                    { className: "scene-dashboard-inline scene-dashboard-pair-item" },
+                    h("span", { className: "scene-dashboard-label" }, "Time Left"),
+                    h(
+                      "div",
+                      { className: "scene-dashboard-value-stack" },
+                      h(
+                        "strong",
+                        { style: { color: timeLeftVarianceColor } },
+                        forecastTimeLeftLabel,
+                        " ",
+                        h("span", { className: "scene-dashboard-value-delta", style: { color: timeLeftVarianceColor } }, timeLeftVarianceLabel),
+                      ),
+                      h("span", { className: "scene-dashboard-value-meta" }, `Plan ${plannedTimeLeftLabel}`),
+                    ),
+                  ),
                 ),
                 isOperationsStage
                   ? h(
@@ -8143,15 +8462,37 @@ export function RigMovePage({
               h(
                 "div",
                 { className: "scene-plan-kpis" },
-                h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "ETC"), h("strong", null, executionEtcLabel)),
+                h(
+                  "div",
+                  { className: "scene-plan-kpi-card" },
+                  h("span", { className: "scene-dashboard-label" }, "ETC"),
+                  h(
+                    "strong",
+                    { className: "scene-plan-kpi-value" },
+                    executionEtcLabel,
+                    " ",
+                    h(
+                      "span",
+                      {
+                        style: {
+                          color: etcVarianceColor,
+                          fontSize: "0.58em",
+                          fontWeight: 700,
+                        },
+                      },
+                      completionVarianceLabel,
+                    ),
+                  ),
+                  h("span", { className: "scene-plan-kpi-meta" }, `Planned ETC ${plannedExecutionEtcLabel}`),
+                ),
                 h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, t("timePassed", "Time Passed")), h("strong", null, renderElapsedTimeValue(executionVisibleMinute))),
-                h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Completion"), h("strong", null, `${actualCompletionPercent}%`)),
+                h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Completion"), h("strong", null, actualCompletionLabel)),
                 h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, "Plan By Now"), h("strong", null, `${plannedCompletionPercent}%`)),
                 h("div", { className: "scene-dashboard-stack-item" }, h("span", { className: "scene-dashboard-label" }, "Next Task"), h("strong", null, nextExecutionTaskLabel), h("p", { className: "scene-dashboard-copy" }, `${executionPaceLabel} • variance ${completionVarianceLabel}`)),
               ),
               h(
                 "div",
-                { className: "scene-plan-dashboard" },
+                { className: "scene-plan-dashboard scene-plan-dashboard-clean" },
                 h(
                   "div",
                   { className: "scene-plan-summary-card scene-plan-summary-card-title" },
@@ -8161,8 +8502,34 @@ export function RigMovePage({
                 h(
                   "div",
                   { className: "scene-dashboard-pair" },
-                  h("div", { className: "scene-dashboard-inline scene-dashboard-pair-item" }, h("span", { className: "scene-dashboard-label" }, t("aheadBehind", "Ahead / Behind")), h("strong", null, completionVarianceLabel)),
-                  h("div", { className: "scene-dashboard-inline scene-dashboard-pair-item" }, h("span", { className: "scene-dashboard-label" }, t("timeLeft", "Time Left")), h("strong", null, timeLeftLabel)),
+                  h(
+                    "div",
+                    { className: "scene-dashboard-inline scene-dashboard-pair-item" },
+                    h("span", { className: "scene-dashboard-label" }, t("aheadBehind", "Ahead / Behind")),
+                    h(
+                      "div",
+                      { className: "scene-dashboard-value-stack" },
+                      h("strong", { style: { color: scheduleVarianceColor } }, scheduleVarianceLabel),
+                      h("span", { className: "scene-dashboard-value-meta" }, completionVarianceLabel),
+                    ),
+                  ),
+                  h(
+                    "div",
+                    { className: "scene-dashboard-inline scene-dashboard-pair-item" },
+                    h("span", { className: "scene-dashboard-label" }, t("timeLeft", "Time Left")),
+                    h(
+                      "div",
+                      { className: "scene-dashboard-value-stack" },
+                      h(
+                        "strong",
+                        { style: { color: timeLeftVarianceColor } },
+                        forecastTimeLeftLabel,
+                        " ",
+                        h("span", { className: "scene-dashboard-value-delta", style: { color: timeLeftVarianceColor } }, timeLeftVarianceLabel),
+                      ),
+                      h("span", { className: "scene-dashboard-value-meta" }, `Plan ${plannedTimeLeftLabel}`),
+                    ),
+                  ),
                 ),
                 h(
                   "div",
@@ -8172,21 +8539,25 @@ export function RigMovePage({
                 ),
                 h(
                   "div",
-                  { className: "scene-dashboard-pair" },
-                  h("div", { className: "scene-dashboard-inline scene-dashboard-pair-item" }, h("span", { className: "scene-dashboard-label" }, t("rigDown", "Rig Down")), h("strong", null, `${executionAssignmentMetrics.stagePercents.down}% / ${Math.round(phases.down)}%`)),
-                  h("div", { className: "scene-dashboard-inline scene-dashboard-pair-item" }, h("span", { className: "scene-dashboard-label" }, t("move", "Move")), h("strong", null, `${executionAssignmentMetrics.stagePercents.move}% / ${Math.round(phases.move)}%`)),
-                ),
-                h(
-                  "div",
-                  { className: "scene-dashboard-pair" },
-                  h("div", { className: "scene-dashboard-inline scene-dashboard-pair-item" }, h("span", { className: "scene-dashboard-label" }, t("rigUp", "Rig Up")), h("strong", null, `${executionAssignmentMetrics.stagePercents.up}% / ${Math.round(phases.up)}%`)),
-                  h("div", { className: "scene-dashboard-inline scene-dashboard-pair-item" }, h("span", { className: "scene-dashboard-label" }, "Support Readiness"), h("strong", null, `${drillingReadinessPercent}%`)),
-                ),
-                h(
-                  "div",
-                  { className: "scene-dashboard-pair" },
-                  h("div", { className: "scene-dashboard-inline scene-dashboard-pair-item" }, h("span", { className: "scene-dashboard-label" }, t("plannedTasks", "Planned Tasks")), h("strong", null, String(plannedTasksByNow))),
-                  h("div", { className: "scene-dashboard-inline scene-dashboard-pair-item" }, h("span", { className: "scene-dashboard-label" }, "Missing Resources"), h("strong", null, String(operatingSnapshot.startupSummary.missingUnits))),
+                  { className: "scene-dashboard-phase-stack" },
+                  h(
+                    "div",
+                    { className: "scene-dashboard-phase-row" },
+                    h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, t("rigDown", "Rig Down")), h("strong", null, `${formatStagePercent(executionAssignmentMetrics.stagePercents.down)} ${executionAssignmentMetrics.stageCounts.down}/${executionAssignmentMetrics.stageTotals.down}`)),
+                    h(ProgressBar, { value: executionAssignmentMetrics.stagePercents.down }),
+                  ),
+                  h(
+                    "div",
+                    { className: "scene-dashboard-phase-row" },
+                    h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, t("move", "Move")), h("strong", null, `${formatStagePercent(executionAssignmentMetrics.stagePercents.move)} ${executionAssignmentMetrics.stageCounts.move}/${executionAssignmentMetrics.stageTotals.move}`)),
+                    h(ProgressBar, { value: executionAssignmentMetrics.stagePercents.move }),
+                  ),
+                  h(
+                    "div",
+                    { className: "scene-dashboard-phase-row" },
+                    h("div", { className: "scene-dashboard-inline scene-dashboard-kpi-item" }, h("span", { className: "scene-dashboard-label" }, t("rigUp", "Rig Up")), h("strong", null, `${formatStagePercent(executionAssignmentMetrics.stagePercents.up)} ${executionAssignmentMetrics.stageCounts.up}/${executionAssignmentMetrics.stageTotals.up}`)),
+                    h(ProgressBar, { value: executionAssignmentMetrics.stagePercents.up }),
+                  ),
                 ),
               ),
             )

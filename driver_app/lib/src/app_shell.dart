@@ -1,6 +1,6 @@
 import 'package:flutter/material.dart';
 
-import 'data/mock_driver_repository.dart';
+import 'data/live_driver_repository.dart';
 import 'models/driver_task.dart';
 import 'theme/app_theme.dart';
 import 'widgets/active_task_screen.dart';
@@ -15,7 +15,7 @@ class RigSyncDriverApp extends StatefulWidget {
 }
 
 class _RigSyncDriverAppState extends State<RigSyncDriverApp> {
-  final MockDriverRepository _repository = MockDriverRepository();
+  final LiveDriverRepository _repository = LiveDriverRepository();
 
   String? _driverName;
   List<DriverTask> _tasks = <DriverTask>[];
@@ -23,10 +23,10 @@ class _RigSyncDriverAppState extends State<RigSyncDriverApp> {
 
   Future<void> _handleLogin(String email, String password) async {
     final loginResult = await _repository.login(email: email, password: password);
-    final tasks = await _repository.fetchAssignedTasks();
+    final tasks = await _repository.fetchAssignedTasks(session: loginResult.session);
 
     setState(() {
-      _driverName = loginResult.driverName;
+      _driverName = loginResult.session.driverName;
       _tasks = tasks;
       _activeTask = null;
     });

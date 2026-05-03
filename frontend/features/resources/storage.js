@@ -280,6 +280,17 @@ function normalizeTaskAssignments(taskAssignments) {
     .filter((entry) => entry.driverId || entry.truckId || entry.moveId);
 }
 
+function pruneUnlinkedTrucks(trucks, drivers, taskAssignments) {
+  const linkedTruckIds = new Set(
+    [
+      ...(drivers || []).map((driver) => String(driver.truckId || "").trim()),
+      ...(taskAssignments || []).map((assignment) => String(assignment.truckId || "").trim()),
+    ].filter(Boolean),
+  );
+
+  return normalizeTrucks(trucks).filter((truck) => linkedTruckIds.has(truck.id));
+}
+
 function deriveTrucksFromDrivers(drivers) {
   return normalizeDrivers(drivers, null).map((driver, index) => {
     const truckType = normalizePlannerTruckType(driver.truckType) || "";
@@ -346,15 +357,14 @@ function assignDriverTruckIds(drivers, trucks) {
 
 function normalizeManagerResources(managerId, resources = {}) {
   const normalizedDrivers = normalizeDrivers(resources.drivers?.length ? resources.drivers : DEFAULT_MANAGER_DRIVERS[managerId] || [], managerId);
+  const normalizedTaskAssignments = normalizeTaskAssignments(resources.taskAssignments || resources.task_assignments || []);
   const explicitFleet = normalizeFleet(resources.fleet);
-  const explicitTrucks = normalizeTrucks(resources.trucks);
+  const explicitTrucks = pruneUnlinkedTrucks(resources.trucks, normalizedDrivers, normalizedTaskAssignments);
   const trucks = explicitTrucks.length
     ? explicitTrucks
-    : explicitFleet.length
-      ? buildTruckRecordsFromFleet(explicitFleet)
-      : normalizedDrivers.length
-        ? deriveTrucksFromDrivers(normalizedDrivers)
-        : buildDefaultTruckRecords(managerId);
+    : normalizedDrivers.length
+      ? deriveTrucksFromDrivers(normalizedDrivers)
+      : [];
   const fleet = explicitFleet.length
     ? explicitFleet
     : normalizeFleet(
@@ -368,7 +378,7 @@ function normalizeManagerResources(managerId, resources = {}) {
     fleet,
     trucks,
     drivers,
-    taskAssignments: normalizeTaskAssignments(resources.taskAssignments || resources.task_assignments || []),
+    taskAssignments: normalizedTaskAssignments,
     reports: normalizeReports(resources.reports || []),
   };
 }
@@ -424,23 +434,11 @@ export async function writeManagerResources(managerId, resources) {
 export async function writeManagerFleet(managerId, fleet) {
   const current = readManagerResources(managerId);
   const groupedFleet = normalizeFleet(fleet);
-  const nextTrucks = [];
-
-  groupedFleet.forEach((entry) => {
-    const prefix = getTypePrefix(entry.type);
-    for (let index = 0; index < entry.count; index += 1) {
-      nextTrucks.push({
-        id: `truck-${normalizeTypeKey(entry.type)}-${index + 1}`,
-        name: `${prefix}-${String(index + 1).padStart(2, "0")}`,
-        type: entry.type,
-      });
-    }
-  });
 
   const saved = await writeManagerResources(managerId, {
     ...current,
     fleet: groupedFleet,
-    trucks: nextTrucks,
+    trucks: current.trucks || [],
   });
 
   return saved.fleet;

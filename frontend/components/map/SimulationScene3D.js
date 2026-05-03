@@ -241,6 +241,23 @@ function formatSceneDelayLabel(minutes, fallback = "On time") {
   return remainingSeconds > 0 ? `${wholeMinutes} min ${remainingSeconds} sec` : `${wholeMinutes} min`;
 }
 
+function getExecutionRigVisualCounts(executionAssignments = []) {
+  const sourceAssignments = (executionAssignments || [])
+    .filter((assignment) => assignment?.taskType !== "return" && assignment?.loadId != null);
+  const totalTrips = Math.max(sourceAssignments.length, 1);
+  const shiftedCount = sourceAssignments.filter((assignment) => assignment?.stageStatus?.rigDownCompleted).length;
+  const riggedCount = sourceAssignments.filter((assignment) => assignment?.stageStatus?.rigUpCompleted).length;
+  const movingCount = sourceAssignments.filter(
+    (assignment) => assignment?.stageStatus?.rigDownCompleted && !assignment?.stageStatus?.rigUpCompleted,
+  ).length;
+  return {
+    totalTrips,
+    shiftedCount,
+    riggedCount,
+    movingCount,
+  };
+}
+
 function tintModel(root, color) {
   const tint = new THREE.Color(color);
   root.traverse((child) => {
@@ -483,6 +500,96 @@ function buildRigComponentBuckets(meshes, bucketCount = 6) {
       capturedMaterials: captureMeshMaterials(bucketMeshes),
     };
   }).filter((bucket) => bucket.meshes.length > 0);
+}
+
+function getRigComponentBucketIndex(loadIndex, totalLoads, totalBuckets) {
+  const safeLoadIndex = Math.max(0, Number(loadIndex) || 0);
+  const safeTotalLoads = Math.max(1, Number(totalLoads) || 1);
+  const safeTotalBuckets = Math.max(1, Number(totalBuckets) || 1);
+  return Math.min(safeTotalBuckets - 1, Math.floor((safeLoadIndex * safeTotalBuckets) / safeTotalLoads));
+}
+
+function getDelayedRigComponentHighlightKey(activeAlert, executionAssignments = [], side, bucketCount = 0) {
+  if (!activeAlert || activeAlert?.tone !== "red" || !bucketCount) {
+    return null;
+  }
+  if (side === "source" && activeAlert?.stage !== "rigDown") {
+    return null;
+  }
+  if (side === "destination" && activeAlert?.stage !== "rigUp") {
+    return null;
+  }
+
+  const sourceAssignments = (executionAssignments || [])
+    .filter((assignment) => assignment?.taskType !== "return" && assignment?.loadId != null)
+    .sort((left, right) => (left.sequence || 0) - (right.sequence || 0));
+  if (!sourceAssignments.length) {
+    return null;
+  }
+
+  const loadIndex = sourceAssignments.findIndex((assignment) =>
+    (activeAlert?.assignmentId && String(assignment?.id) === String(activeAlert.assignmentId)) ||
+    (activeAlert?.loadId != null && String(assignment?.loadId) === String(activeAlert.loadId)),
+  );
+  if (loadIndex < 0) {
+    return null;
+  }
+
+  const bucketIndex = getRigComponentBucketIndex(loadIndex, sourceAssignments.length, bucketCount);
+  return `rig-${side}-component-${bucketIndex}`;
+}
+
+function isMoveDelayAlert(activeAlert) {
+  if (!activeAlert || activeAlert?.tone !== "red") {
+    return false;
+  }
+  return activeAlert?.stage === "rigMove" || !activeAlert?.stage;
+}
+
+function getAssignmentDelayThresholdMinutesForScene(assignment) {
+  if (Number.isFinite(Number(assignment?.delayThresholdMinutes))) {
+    return Math.max(0, Number(assignment.delayThresholdMinutes));
+  }
+  return 20;
+}
+
+function getDelayedRigComponentHighlightKeyFromAssignments(side, currentMinute, executionAssignments = [], bucketCount = 0) {
+  if (!side || !bucketCount || !(executionAssignments || []).length) {
+    return null;
+  }
+
+  const sourceAssignments = (executionAssignments || [])
+    .filter((assignment) => assignment?.taskType !== "return" && assignment?.loadId != null)
+    .sort((left, right) => (left.sequence || 0) - (right.sequence || 0));
+  if (!sourceAssignments.length) {
+    return null;
+  }
+
+  const delayedAssignment = sourceAssignments.find((assignment) => {
+    const stageKey = side === "source" ? "rigDown" : "rigUp";
+    const completedKey = side === "source" ? "rigDownCompleted" : "rigUpCompleted";
+    if (assignment?.stageStatus?.[completedKey]) {
+      return false;
+    }
+    const plannedFinishMinute = Number(assignment?.stagePlan?.[stageKey]?.finishMinute);
+    if (!Number.isFinite(plannedFinishMinute)) {
+      return false;
+    }
+    const lateMinutes = Math.max(0, currentMinute - plannedFinishMinute);
+    return lateMinutes > getAssignmentDelayThresholdMinutesForScene(assignment);
+  });
+
+  if (!delayedAssignment) {
+    return null;
+  }
+
+  const loadIndex = sourceAssignments.findIndex((assignment) => String(assignment?.id) === String(delayedAssignment.id));
+  if (loadIndex < 0) {
+    return null;
+  }
+
+  const bucketIndex = getRigComponentBucketIndex(loadIndex, sourceAssignments.length, bucketCount);
+  return `rig-${side}-component-${bucketIndex}`;
 }
 
 function captureMeshMaterials(meshes) {
@@ -2070,6 +2177,7 @@ function buildRouteTooltip(routeInfo) {
         root,
         capturedMaterials: captureHighlightMaterials(root),
         color: 0xfbbf24,
+        delayedColor: 0xff4d4f,
         kind: "route",
         intensityFactor: 0.52,
         highlightOptions: {
@@ -2271,11 +2379,12 @@ function buildRouteTooltip(routeInfo) {
           startBoardGroup.add(part);
         });
         boardPickTargets.push(startBoardGroup);
-        highlightTargets.set("rig-board-source", {
-          root: startBoardGroup,
-          capturedMaterials: captureHighlightMaterials(startBoardGroup),
-          color: 0xfbbf24,
-          kind: "board",
+      highlightTargets.set("rig-board-source", {
+        root: startBoardGroup,
+        capturedMaterials: captureHighlightMaterials(startBoardGroup),
+        color: 0xfbbf24,
+        delayedColor: 0xff4d4f,
+        kind: "board",
           intensityFactor: 0.46,
           highlightOptions: {
             maxSurfaceMix: 0.34,
@@ -2320,6 +2429,7 @@ function buildRouteTooltip(routeInfo) {
               root: bucket.meshes[0],
               capturedMaterials: captureHighlightMaterialsFromMeshes(bucket.meshes),
               color: 0xfbbf24,
+              delayedColor: 0xff4d4f,
               kind: "rig-component",
               intensityFactor: 0.58,
               highlightOptions: {
@@ -2346,6 +2456,7 @@ function buildRouteTooltip(routeInfo) {
           root: startAsset,
           capturedMaterials: captureHighlightMaterials(startAsset),
           color: 0xfbbf24,
+          delayedColor: 0xff4d4f,
           kind: "rig",
           intensityFactor: 0.58,
           baseScale: startAsset.scale.clone(),
@@ -2375,6 +2486,7 @@ function buildRouteTooltip(routeInfo) {
           root: endBoardGroup,
           capturedMaterials: captureHighlightMaterials(endBoardGroup),
           color: 0xfbbf24,
+          delayedColor: 0xff4d4f,
           kind: "board",
           intensityFactor: 0.46,
           highlightOptions: {
@@ -2421,6 +2533,7 @@ function buildRouteTooltip(routeInfo) {
               root: bucket.meshes[0],
               capturedMaterials: captureHighlightMaterialsFromMeshes(bucket.meshes),
               color: 0xfbbf24,
+              delayedColor: 0xff4d4f,
               kind: "rig-component",
               intensityFactor: 0.58,
               highlightOptions: {
@@ -2447,6 +2560,7 @@ function buildRouteTooltip(routeInfo) {
           root: endAsset,
           capturedMaterials: captureHighlightMaterials(endAsset),
           color: 0xfbbf24,
+          delayedColor: 0xff4d4f,
           kind: "rig",
           intensityFactor: 0.58,
           baseScale: endAsset.scale.clone(),
@@ -2738,20 +2852,28 @@ function buildRouteTooltip(routeInfo) {
       }
 
       const sourceState = rigVisualStateRef.current.source;
-      const shiftedCount = playback.trips.filter((trip) => minute >= trip.rigDownFinish).length;
-      const riggedCount = playback.trips.filter((trip) => minute >= trip.rigUpFinish).length;
-      const movingCount = playback.trips.filter(
-        (trip) => minute >= trip.rigDownFinish && minute < trip.arrivalAtDestination,
-      ).length;
+      const rigCounts = (executionAssignmentsRef.current || []).length
+        ? getExecutionRigVisualCounts(executionAssignmentsRef.current)
+        : {
+            totalTrips,
+            shiftedCount: playback.trips.filter((trip) => minute >= trip.rigDownFinish).length,
+            riggedCount: playback.trips.filter((trip) => minute >= trip.rigUpFinish).length,
+            movingCount: playback.trips.filter(
+              (trip) => minute >= trip.rigDownFinish && minute < trip.arrivalAtDestination,
+            ).length,
+          };
+      const shiftedCount = rigCounts.shiftedCount;
+      const riggedCount = rigCounts.riggedCount;
+      const movingCount = rigCounts.movingCount;
       playbackStatsRef.current = {
-        totalTrips,
+        totalTrips: rigCounts.totalTrips,
         shiftedCount,
         riggedCount,
         movingCount,
       };
 
       if (sourceState?.capturedMaterials?.length) {
-        applyStatusPalette(sourceState.capturedMaterials, shiftedCount / totalTrips, {
+        applyStatusPalette(sourceState.capturedMaterials, shiftedCount / rigCounts.totalTrips, {
           active: {
             color: 0x3a4047,
             emissive: 0x1a1f24,
@@ -2771,9 +2893,9 @@ function buildRouteTooltip(routeInfo) {
         });
         (sourceState.componentBuckets || []).forEach((bucket, index, buckets) => {
           const totalComponents = Math.max(buckets.length || 1, 1);
-          const startLoadIndex = Math.floor((index * totalTrips) / totalComponents);
-          const endLoadIndex = Math.floor(((index + 1) * totalTrips) / totalComponents);
-          const assignedLoads = Math.max(endLoadIndex - startLoadIndex, totalTrips > 0 ? 1 : 0);
+          const startLoadIndex = Math.floor((index * rigCounts.totalTrips) / totalComponents);
+          const endLoadIndex = Math.floor(((index + 1) * rigCounts.totalTrips) / totalComponents);
+          const assignedLoads = Math.max(endLoadIndex - startLoadIndex, rigCounts.totalTrips > 0 ? 1 : 0);
           const completedWithin = Math.max(0, Math.min(assignedLoads, shiftedCount - startLoadIndex));
           const progress = assignedLoads > 0 ? (completedWithin / assignedLoads) : 0;
           applyRigPartOpacity(bucket.capturedMaterials, 1 - progress);
@@ -2782,7 +2904,7 @@ function buildRouteTooltip(routeInfo) {
 
       const destinationState = rigVisualStateRef.current.destination;
       if (destinationState?.capturedMaterials?.length) {
-        applyStatusPalette(destinationState.capturedMaterials, riggedCount / totalTrips, {
+        applyStatusPalette(destinationState.capturedMaterials, riggedCount / rigCounts.totalTrips, {
           active: {
             color: 0x3a4047,
             emissive: 0x1a1f24,
@@ -2802,15 +2924,72 @@ function buildRouteTooltip(routeInfo) {
         });
         (destinationState.componentBuckets || []).forEach((bucket, index, buckets) => {
           const totalComponents = Math.max(buckets.length || 1, 1);
-          const startLoadIndex = Math.floor((index * totalTrips) / totalComponents);
-          const endLoadIndex = Math.floor(((index + 1) * totalTrips) / totalComponents);
-          const assignedLoads = Math.max(endLoadIndex - startLoadIndex, totalTrips > 0 ? 1 : 0);
+          const startLoadIndex = Math.floor((index * rigCounts.totalTrips) / totalComponents);
+          const endLoadIndex = Math.floor(((index + 1) * rigCounts.totalTrips) / totalComponents);
+          const assignedLoads = Math.max(endLoadIndex - startLoadIndex, rigCounts.totalTrips > 0 ? 1 : 0);
           const completedWithin = Math.max(0, Math.min(assignedLoads, riggedCount - startLoadIndex));
           const progress = assignedLoads > 0 ? (completedWithin / assignedLoads) : 0;
           applyRigPartOpacity(bucket.capturedMaterials, progress);
         });
       }
 
+      const activeAlert = activeTripAlertRef.current;
+      const sourceRigTarget = highlightTargets.get("rig-source");
+      const sourceBoardTarget = highlightTargets.get("rig-board-source");
+      const destinationRigTarget = highlightTargets.get("rig-destination");
+      const destinationBoardTarget = highlightTargets.get("rig-board-destination");
+      const delayedRouteTarget = highlightTargets.get("move-route-outbound");
+      const delayedSourceComponentKey = getDelayedRigComponentHighlightKeyFromAssignments(
+        "source",
+        delayMinuteRef.current,
+        executionAssignmentsRef.current,
+        sourceState?.componentBuckets?.length || 0,
+      ) || getDelayedRigComponentHighlightKey(
+        activeAlert,
+        executionAssignmentsRef.current,
+        "source",
+        sourceState?.componentBuckets?.length || 0,
+      );
+      const delayedDestinationComponentKey = getDelayedRigComponentHighlightKeyFromAssignments(
+        "destination",
+        delayMinuteRef.current,
+        executionAssignmentsRef.current,
+        destinationState?.componentBuckets?.length || 0,
+      ) || getDelayedRigComponentHighlightKey(
+        activeAlert,
+        executionAssignmentsRef.current,
+        "destination",
+        destinationState?.componentBuckets?.length || 0,
+      );
+      if (sourceRigTarget?.root) {
+        sourceRigTarget.root.userData.isDelayed = false;
+      }
+      if (sourceBoardTarget?.root) {
+        sourceBoardTarget.root.userData.isDelayed = false;
+      }
+      if (destinationRigTarget?.root) {
+        destinationRigTarget.root.userData.isDelayed = false;
+      }
+      if (destinationBoardTarget?.root) {
+        destinationBoardTarget.root.userData.isDelayed = false;
+      }
+      if (delayedRouteTarget?.root) {
+        delayedRouteTarget.root.userData.isDelayed = false;
+      }
+      (sourceState?.componentBuckets || []).forEach((bucket) => {
+        const target = highlightTargets.get(`rig-source-component-${bucket.index}`);
+        if (target?.root) {
+          target.root.userData.isDelayed = target.root.userData.highlightKey === delayedSourceComponentKey;
+        }
+      });
+      (destinationState?.componentBuckets || []).forEach((bucket) => {
+        const target = highlightTargets.get(`rig-destination-component-${bucket.index}`);
+        if (target?.root) {
+          target.root.userData.isDelayed = target.root.userData.highlightKey === delayedDestinationComponentKey;
+        }
+      });
+
+      let outboundRouteDelayed = false;
       truckMeshes.forEach((mesh, truckId) => {
         if (truckId > activeTruckCount) {
           mesh.visible = false;
@@ -2948,7 +3127,6 @@ function buildRouteTooltip(routeInfo) {
         mesh.visible = true;
         mesh.position.copy(currentWorld);
         mesh.rotation.y = heading;
-        const activeAlert = activeTripAlertRef.current;
         const visibleLoadId = referenceTrip?.loadId ?? null;
         const alertMatchesTruck = Boolean(
           activeAlert && (
@@ -2959,7 +3137,7 @@ function buildRouteTooltip(routeInfo) {
           ),
         );
         const alertDrivenDelayed = Boolean(
-          alertMatchesTruck && activeAlert?.tone === "red",
+          (alertMatchesTruck && activeAlert?.tone === "red") || delayState.isDelayed,
         );
         setTruckDelayVisualState(mesh, alertDrivenDelayed);
         const roadLight = mesh.userData?.roadLight;
@@ -2987,7 +3165,14 @@ function buildRouteTooltip(routeInfo) {
         mesh.userData.loadId = activeTrip?.loadId ?? completedTrip?.loadId ?? null;
         mesh.userData.distanceKm = distanceKm;
         mesh.userData.routeDistanceKm = measuredRouteMetrics.totalKm;
+        outboundRouteDelayed ||= Boolean(
+          ((alertMatchesTruck && isMoveDelayAlert(activeAlert)) || delayState.isDelayed) &&
+          !roadHoldState.holdReturn,
+        );
       });
+      if (delayedRouteTarget?.root) {
+        delayedRouteTarget.root.userData.isDelayed = outboundRouteDelayed;
+      }
     }
 
     function animate(now) {
@@ -3069,15 +3254,15 @@ function buildRouteTooltip(routeInfo) {
         const highlightStrength = isActive
           ? (0.44 + ((Math.sin(elapsedSeconds * 5.8) + 1) * 0.14)) * (target.intensityFactor ?? 1)
           : 0;
-        const truckIsDelayed = target.kind === "truck" && Boolean(target.root?.userData?.isDelayed);
-        const delayedTruckStrength = truckIsDelayed
+        const targetIsDelayed = ["truck", "route", "board", "rig", "rig-component"].includes(target.kind) && Boolean(target.root?.userData?.isDelayed);
+        const delayedTargetStrength = targetIsDelayed
           ? 0.34 + ((Math.sin(elapsedSeconds * 5.8) + 1) * 0.1)
           : 0;
-        const effectiveStrength = Math.max(highlightStrength, delayedTruckStrength);
-        const highlightColor = target.kind === "truck" && target.root?.userData?.isDelayed
+        const effectiveStrength = Math.max(highlightStrength, delayedTargetStrength);
+        const highlightColor = targetIsDelayed
           ? (target.delayedColor || target.color)
           : target.color;
-        const highlightOptions = truckIsDelayed
+        const highlightOptions = targetIsDelayed
           ? {
               ...target.highlightOptions,
               hoverBaseColor: 0x301010,
@@ -3089,13 +3274,13 @@ function buildRouteTooltip(routeInfo) {
               baseMixScale: 0.24,
             }
           : target.highlightOptions;
-        if (target.kind === "rig-component" && isActive) {
+        if (target.kind === "rig-component" && (isActive || targetIsDelayed)) {
           applyRigComponentHoverState(target.capturedMaterials, highlightColor, effectiveStrength);
         } else {
           applyHighlightState(target.capturedMaterials, highlightColor, effectiveStrength, highlightOptions);
         }
-        if (truckIsDelayed) {
-          setTruckDelayVisualState(target.root, true, delayedTruckStrength);
+        if (target.kind === "truck" && targetIsDelayed) {
+          setTruckDelayVisualState(target.root, true, delayedTargetStrength);
         } else if (target.kind === "truck") {
           setTruckDelayVisualState(target.root, false, 0);
         }

@@ -13,8 +13,8 @@ class LoginScreen extends StatefulWidget {
 }
 
 class _LoginScreenState extends State<LoginScreen> {
-  final TextEditingController _emailController = TextEditingController(text: 'driver@rigsync.com');
-  final TextEditingController _passwordController = TextEditingController(text: '123456');
+  final TextEditingController _emailController = TextEditingController();
+  final TextEditingController _passwordController = TextEditingController();
   bool _isSubmitting = false;
   String? _error;
 
@@ -127,7 +127,7 @@ class _LoginScreenState extends State<LoginScreen> {
                           borderRadius: BorderRadius.circular(18),
                         ),
                         child: Text(
-                          'Demo only. This screen is not connected to the platform yet.',
+                          'This screen now uses the live Firebase driver account created from the manager portal.',
                           style: theme.textTheme.bodyMedium,
                         ),
                       ),
