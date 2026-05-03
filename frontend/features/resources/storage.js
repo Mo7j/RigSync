@@ -1,28 +1,7 @@
-import { DEFAULT_TRUCK_SETUP } from "../../lib/constants.js";
 import { fetchManagerResourcesDoc, saveManagerResourcesDoc } from "../../lib/firebaseOperations.js";
 
-const DEFAULT_MANAGER_FLEETS = {
-  "manager-nasser": [
-    { id: "heavy-haul", type: "Heavy Hauler", count: 6, hourlyCost: 260 },
-    { id: "flatbed", type: "Flat-bed", count: 4, hourlyCost: 105 },
-    { id: "low-bed", type: "Low-bed", count: 3, hourlyCost: 155 },
-  ],
-  "manager-demo": [
-    { id: "demo-low-bed", type: "Low-bed", count: 1, hourlyCost: 95 },
-  ],
-};
-
-const DEFAULT_MANAGER_DRIVERS = {
-  "manager-demo": [
-    {
-      id: "driver-demo",
-      name: "Demo Driver",
-      email: "driver-demo@rigsync.com",
-      truckType: "Low-bed",
-      truckId: "truck-lowbed-1",
-    },
-  ],
-};
+const DEFAULT_MANAGER_FLEETS = {};
+const DEFAULT_MANAGER_DRIVERS = {};
 
 const managerResourceCache = new Map();
 
@@ -68,7 +47,7 @@ function getTypePrefix(type) {
 }
 
 function buildDefaultTruckRecords(managerId) {
-  const fleet = DEFAULT_MANAGER_FLEETS[managerId] || DEFAULT_TRUCK_SETUP;
+  const fleet = DEFAULT_MANAGER_FLEETS[managerId] || [];
   const trucks = [];
 
   fleet.forEach((entry) => {
@@ -330,7 +309,7 @@ function normalizeManagerResources(managerId, resources = {}) {
     : normalizeFleet(
         explicitTrucks.length || normalizedDrivers.length
           ? deriveFleetFromTrucks(trucks)
-          : DEFAULT_MANAGER_FLEETS[managerId] || DEFAULT_TRUCK_SETUP,
+          : (DEFAULT_MANAGER_FLEETS[managerId] || []),
       );
   const drivers = assignDriverTruckIds(normalizedDrivers, trucks);
 
@@ -349,11 +328,11 @@ export function setManagerResourcesCache(managerId, resources) {
 }
 
 export function getDefaultManagerFleet(managerId) {
-  return normalizeFleet(DEFAULT_MANAGER_FLEETS[managerId] || DEFAULT_TRUCK_SETUP);
+  return normalizeFleet(DEFAULT_MANAGER_FLEETS[managerId] || []);
 }
 
 export function readManagerResources(managerId) {
-  return managerResourceCache.get(managerId) || normalizeManagerResources(managerId);
+  return managerResourceCache.get(managerId) || normalizeManagerResources(managerId, {});
 }
 
 export async function hydrateManagerResources(managerId) {
@@ -362,7 +341,10 @@ export async function hydrateManagerResources(managerId) {
   }
 
   const payload = await fetchManagerResourcesDoc(managerId);
-  const normalized = payload ? normalizeManagerResources(managerId, payload) : normalizeManagerResources(managerId);
+  if (!payload) {
+    throw new Error(`Manager resources document is missing for ${managerId}.`);
+  }
+  const normalized = normalizeManagerResources(managerId, payload);
   managerResourceCache.set(managerId, normalized);
   return normalized;
 }

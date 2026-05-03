@@ -1,9 +1,9 @@
 import { React, createRoot, h } from "./lib/react.js";
 import { useHashRoute, navigateTo } from "./lib/router.js";
-import { DEFAULT_TRUCK_SETUP } from "./lib/constants.js";
 import { fetchLoads, fetchLocationLabel } from "./features/rigMoves/api.js";
 import { buildLogicalLoads, buildScenarioPlans, fetchRouteData, fallbackRouteData } from "./features/rigMoves/simulation.js";
 import { buildOperatingSnapshot, buildStartupPlanningLoads, buildStartupTransferSchedule } from "./features/rigMoves/operations.js";
+import { buildLiveSourceInventorySnapshot } from "./features/rigMoves/sourceInventory.js";
 import { applyRigInventoryAdjustments, hydrateRigInventoryAdjustments, readRigInventoryAdjustments, setRigInventoryCache, writeRigInventoryAdjustments } from "./features/rigInventory/storage.js";
 import {
   authenticateUser,
@@ -50,98 +50,9 @@ import { formatCoordinate, formatDate, formatMinutes } from "./lib/format.js";
 import { DEFAULT_LANGUAGE, LANGUAGE_STORAGE_KEY, getLanguageDirection } from "./lib/language.js";
 
 const { useEffect, useRef, useState } = React;
-const DEMO_ACCOUNT_EMAIL = "demo@rigsync.com";
 const NORMAL_PLAYBACK_SPEED = 1500;
 const DEFAULT_PLAYBACK_SPEED = 15000;
 const DEMO_SENSOR_SYNC_INTERVAL_MS = 2500;
-const DEMO_RIG_LOADS = [
-  {
-    id: "demo-load-1",
-    code: "DM-01",
-    description: "Demo power skid",
-    category: "Demo",
-    priority: 1,
-    truck_type: "Low-bed",
-    truck_types: ["Low-bed"],
-    load_count: 1,
-    weight_tons: 12,
-    avg_rig_down_minutes: 20,
-    avg_rig_up_minutes: 20,
-    optimal_rig_down_minutes: 15,
-    optimal_rig_up_minutes: 15,
-    minimum_crew_down_count: 1,
-    minimum_crew_up_count: 1,
-    optimal_crew_down_count: 1,
-    optimal_crew_up_count: 1,
-    minimum_crew_down_roles: { operator: 1 },
-    minimum_crew_up_roles: { operator: 1 },
-    optimal_crew_down_roles: { operator: 1 },
-    optimal_crew_up_roles: { operator: 1 },
-  },
-  {
-    id: "demo-load-2",
-    code: "DM-02",
-    description: "Demo pipe basket",
-    category: "Demo",
-    priority: 2,
-    truck_type: "Low-bed",
-    truck_types: ["Low-bed"],
-    load_count: 1,
-    weight_tons: 8,
-    avg_rig_down_minutes: 15,
-    avg_rig_up_minutes: 15,
-    optimal_rig_down_minutes: 10,
-    optimal_rig_up_minutes: 10,
-    minimum_crew_down_count: 1,
-    minimum_crew_up_count: 1,
-    optimal_crew_down_count: 1,
-    optimal_crew_up_count: 1,
-    minimum_crew_down_roles: { operator: 1 },
-    minimum_crew_up_roles: { operator: 1 },
-    optimal_crew_down_roles: { operator: 1 },
-    optimal_crew_up_roles: { operator: 1 },
-    rig_down_dependency_codes: ["DM-01"],
-    rig_move_dependency_codes: ["DM-01"],
-  },
-  {
-    id: "demo-load-3",
-    code: "DM-03",
-    description: "Demo mud tank",
-    category: "Demo",
-    priority: 3,
-    truck_type: "Low-bed",
-    truck_types: ["Low-bed"],
-    load_count: 1,
-    weight_tons: 10,
-    avg_rig_down_minutes: 18,
-    avg_rig_up_minutes: 18,
-    optimal_rig_down_minutes: 12,
-    optimal_rig_up_minutes: 12,
-    minimum_crew_down_count: 1,
-    minimum_crew_up_count: 1,
-    optimal_crew_down_count: 1,
-    optimal_crew_up_count: 1,
-    minimum_crew_down_roles: { operator: 1 },
-    minimum_crew_up_roles: { operator: 1 },
-    optimal_crew_down_roles: { operator: 1 },
-    optimal_crew_up_roles: { operator: 1 },
-    rig_down_dependency_codes: ["DM-02"],
-    rig_move_dependency_codes: ["DM-02"],
-  },
-];
-const DEMO_TRUCK_SPECS = [
-  {
-    type: "Low-bed",
-    max_weight_tons: 20,
-    average_speed_kmh: 25,
-    alpha: 0.2,
-    hourlyCost: 95,
-  },
-];
-
-function isDemoSession(session) {
-  return Boolean(session?.isDemo || String(session?.email || "").trim().toLowerCase() === DEMO_ACCOUNT_EMAIL);
-}
 
 function getAssignmentDelayThresholdMinutes(assignment) {
   if (Number.isFinite(Number(assignment?.delayThresholdMinutes))) {
@@ -150,173 +61,6 @@ function getAssignmentDelayThresholdMinutes(assignment) {
   return 20;
 }
 
-function buildSimpleDemoPlayback({
-  loads,
-  routeGeometry,
-  startLabel,
-  endLabel,
-  truckType = "Low-bed",
-  truckId = "demo-low-bed-1",
-}) {
-  const selectedLoads = (loads || []).slice(0, 3);
-  const pickupBufferMinutes = 0;
-  const destinationBufferMinutes = 0;
-  const stagingGapMinutes = 1;
-  const trips = [];
-  const steps = [];
-  const tasks = [];
-  let nextDispatchMinute = 1;
-
-  selectedLoads.forEach((load, index) => {
-    const isFinalLoad = index === selectedLoads.length - 1;
-    const loadId = index + 1;
-    const loadCode = `${load?.code || `DM-0${loadId}`}-L1`;
-    const description = load?.description || `Demo load ${loadId}`;
-    const routeMinutes = 1;
-    const rigDownDuration = 1 + (index % 2);
-    const rigUpDuration = 1 + ((index + 1) % 2);
-    const rigDownStart = Math.max(0, nextDispatchMinute - pickupBufferMinutes - rigDownDuration);
-    const rigDownFinish = rigDownStart + rigDownDuration;
-    const pickupLoadStart = rigDownFinish;
-    const pickupLoadFinish = pickupLoadStart + pickupBufferMinutes;
-    const moveStart = pickupLoadFinish;
-    const arrivalAtDestination = moveStart + routeMinutes;
-    const unloadDropStart = arrivalAtDestination;
-    const unloadDropFinish = unloadDropStart + destinationBufferMinutes;
-    const rigUpStart = unloadDropFinish;
-    const rigUpFinish = rigUpStart + rigUpDuration;
-    const returnStart = isFinalLoad ? null : rigUpFinish;
-    const returnToSource = isFinalLoad ? null : (returnStart + routeMinutes);
-
-    trips.push({
-      truckId,
-      truckType,
-      journeyId: `${loadCode}-journey`,
-      loadId,
-      loadCode,
-      description,
-      sourceLabel: startLabel,
-      destinationLabel: endLabel,
-      dispatchStart: rigDownStart,
-      pickupRouteMinutes: 0,
-      pickupRouteGeometry: [],
-      routeMinutes,
-      routeGeometry,
-      moveStart,
-      loadStart: rigDownStart,
-      rigDownStart,
-      rigDownFinish,
-      pickupLoadStart,
-      pickupLoadFinish,
-      arrivalAtDestination,
-      unloadDropStart,
-      unloadDropFinish,
-      rigUpStart,
-      rigUpFinish,
-      returnStart,
-      returnToSource,
-      sourceKind: "rig",
-    });
-
-    steps.push(
-      {
-        type: "rig-down-start",
-        minute: rigDownStart,
-        title: `${loadCode} rig down starts`,
-        description: `${description} begins rig down at ${startLabel}.`,
-      },
-      {
-        type: "move-start",
-        minute: moveStart,
-        title: `${truckType} departs with ${loadCode}`,
-        description: `${description} begins rig moving to ${endLabel}.`,
-      },
-      {
-        type: "rig-up-start",
-        minute: rigUpStart,
-        title: `${loadCode} rig up starts`,
-        description: `${description} begins rig up at ${endLabel}.`,
-      },
-    );
-
-    tasks.push(
-      {
-        id: `${loadCode} (RD)`,
-        loadId,
-        loadCode,
-        description,
-        phase: "rig_down",
-        activityCode: "RD",
-        activityLabel: "Rig Down",
-        sourceKind: "rig",
-        predecessorIds: [],
-        startMinute: rigDownStart,
-        endMinute: rigDownFinish,
-        earliestStart: rigDownStart,
-        earliestFinish: rigDownFinish,
-        latestStart: rigDownStart,
-        latestFinish: rigDownFinish,
-        slack: 0,
-        isCritical: true,
-      },
-      {
-        id: `${loadCode} (RM)`,
-        loadId,
-        loadCode,
-        description,
-        phase: "move",
-        activityCode: "RM",
-        activityLabel: "Rig Moving",
-        sourceKind: "rig",
-        predecessorIds: [`${loadCode} (RD)`],
-        startMinute: moveStart,
-        endMinute: arrivalAtDestination,
-        earliestStart: moveStart,
-        earliestFinish: arrivalAtDestination,
-        latestStart: moveStart,
-        latestFinish: arrivalAtDestination,
-        slack: 0,
-        isCritical: true,
-      },
-      {
-        id: `${loadCode} (RU)`,
-        loadId,
-        loadCode,
-        description,
-        phase: "rig_up",
-        activityCode: "RU",
-        activityLabel: "Rig Up",
-        sourceKind: "rig",
-        predecessorIds: [`${loadCode} (RM)`],
-        startMinute: rigUpStart,
-        endMinute: rigUpFinish,
-        earliestStart: rigUpStart,
-        earliestFinish: rigUpFinish,
-        latestStart: rigUpStart,
-        latestFinish: rigUpFinish,
-        slack: 0,
-        isCritical: true,
-      },
-    );
-
-    nextDispatchMinute = (returnToSource ?? rigUpFinish) + stagingGapMinutes;
-  });
-
-  const totalMinutes = Math.max(...trips.map((trip) => trip.rigUpFinish), 1);
-
-  return {
-    totalMinutes,
-    journeys: trips,
-    trips,
-    steps,
-    tasks,
-    planningAnalysis: {
-      projectFinish: totalMinutes,
-      criticalTaskIds: tasks.map((task) => task.id),
-    },
-    resourceUsage: [],
-  };
-}
 
 function readStoredLanguage() {
   try {
@@ -525,6 +269,18 @@ function getSessionManagerId(session) {
   }
 
   return session.role === "Manager" ? session.id : session.managerId || null;
+}
+
+function getMoveManagerId(move) {
+  if (!move) {
+    return null;
+  }
+
+  return (
+    move.managerId ||
+    (move.createdBy?.role === "Manager" ? move.createdBy?.id : move.createdBy?.managerId) ||
+    null
+  );
 }
 
 function getAssignmentStageLabel(stageState = {}) {
@@ -986,6 +742,7 @@ function App() {
   const [managedForemen, setManagedForemen] = useState([]);
   const [loginProfiles, setLoginProfiles] = useState([]);
   const [managerFleet, setManagerFleet] = useState([]);
+  const [managerDashboardError, setManagerDashboardError] = useState("");
   const [isSimulatingMove, setIsSimulatingMove] = useState(false);
   const [simulationProgress, setSimulationProgress] = useState(
     createSimulationProgressState({ percent: 0, message: "" }),
@@ -1066,15 +823,6 @@ function App() {
       setLoadsError("");
 
       try {
-        if (isDemoSession(session)) {
-          if (!cancelled) {
-            setLoads(DEMO_RIG_LOADS);
-            setStartupRequirements([]);
-            setTruckSpecs(DEMO_TRUCK_SPECS);
-          }
-          return;
-        }
-
         const dataset = await fetchLoads();
         if (!cancelled) {
           setLoads(dataset.rigLoads || []);
@@ -1221,8 +969,7 @@ function App() {
         if (!move) {
           return false;
         }
-        const moveManagerId = move.createdBy?.role === "Manager" ? move.createdBy?.id : move.createdBy?.managerId;
-        return moveManagerId === managerId;
+        return getMoveManagerId(move) === managerId;
       })
     : [];
   const visibleMoves = session?.role === "Foreman"
@@ -1294,6 +1041,7 @@ function App() {
       setManagerResources({ fleet: [], trucks: [], drivers: [], taskAssignments: [] });
       setManagedForemen([]);
       setManagerFleet([]);
+      setManagerDashboardError("");
       setAreManagerResourcesHydrated(true);
       setAreMovesHydrated(true);
       return undefined;
@@ -1301,13 +1049,18 @@ function App() {
 
     setAreMovesHydrated(false);
     setAreManagerResourcesHydrated(false);
+    setManagerDashboardError("");
 
     void hydrateMoves(managerId, { summary: true })
       .then((hydratedMoves) => {
         setMoves(hydratedMoves);
         setAreMovesHydrated(true);
       })
-      .catch(() => {});
+      .catch((error) => {
+        setMoves([]);
+        setAreMovesHydrated(true);
+        setManagerDashboardError(error?.message || "Failed to load manager moves.");
+      });
 
     void hydrateManagerResources(managerId)
       .then((hydratedResources) => {
@@ -1315,8 +1068,11 @@ function App() {
         setManagerFleet(hydratedResources.fleet || readManagerFleet(managerId));
         setAreManagerResourcesHydrated(true);
       })
-      .catch(() => {
+      .catch((error) => {
+        setManagerResources({ fleet: [], trucks: [], drivers: [], taskAssignments: [] });
+        setManagerFleet([]);
         setAreManagerResourcesHydrated(true);
+        setManagerDashboardError(error?.message || "Manager resources document is missing.");
       });
 
     const unsubscribeMoves = subscribeManagerMoves(managerId, (remoteMoves) => {
@@ -1326,10 +1082,18 @@ function App() {
     });
 
     const unsubscribeResources = subscribeManagerResources(managerId, (remoteResources) => {
-      const normalizedResources = setManagerResourcesCache(managerId, remoteResources || readManagerResources(managerId));
+      if (!remoteResources) {
+        setManagerResources({ fleet: [], trucks: [], drivers: [], taskAssignments: [] });
+        setManagerFleet([]);
+        setAreManagerResourcesHydrated(true);
+        setManagerDashboardError(`Manager resources document is missing for ${managerId}.`);
+        return;
+      }
+      const normalizedResources = setManagerResourcesCache(managerId, remoteResources);
       setManagerResources(normalizedResources);
       setManagerFleet(normalizedResources.fleet || readManagerFleet(managerId));
       setAreManagerResourcesHydrated(true);
+      setManagerDashboardError("");
     });
 
     return () => {
@@ -1832,6 +1596,7 @@ function App() {
         endPoint: formValues.endPoint,
         startLabel: formValues.startLabel,
         endLabel: formValues.endLabel,
+        planningStartDate: formValues.planningStartDate,
         loadCount: logicalLoads.length,
         logicalLoads,
         truckSetup: availableTruckSetup,
@@ -1886,179 +1651,22 @@ function App() {
     }
   }
 
-  async function buildDemoMoveWithSimpleSchedule({
+  async function buildMoveWithSimulation({
     name,
     startPoint,
     endPoint,
     startLabel: providedStartLabel,
     endLabel: providedEndLabel,
+    planningStartDate: requestedPlanningStartDate = null,
+    loadCount,
     logicalLoads,
     truckSetup,
     previousMove,
+    availability = [],
+    scenarioTruckSetup = null,
+    enforceExactFleet = false,
+    onProgress = null,
   }) {
-    const routeData = (() => fallbackRouteData(startPoint, endPoint))();
-    let resolvedRouteData = routeData;
-    let routeMode = "estimated";
-    let startLabel = providedStartLabel || previousMove?.startLabel || formatCoordinate(startPoint);
-    let endLabel = providedEndLabel || previousMove?.endLabel || formatCoordinate(endPoint);
-
-    try {
-      resolvedRouteData = await fetchRouteData(startPoint, endPoint);
-      routeMode = "live";
-    } catch {
-      resolvedRouteData = routeData;
-    }
-
-    const shouldResolveStartLabel = !startLabel || isCoordinateLabel(startLabel);
-    const shouldResolveEndLabel = !endLabel || isCoordinateLabel(endLabel);
-    if (shouldResolveStartLabel || shouldResolveEndLabel) {
-      try {
-        const [nextStartLabel, nextEndLabel] = await Promise.all([
-          shouldResolveStartLabel ? fetchLocationLabel(startPoint) : Promise.resolve(null),
-          shouldResolveEndLabel ? fetchLocationLabel(endPoint) : Promise.resolve(null),
-        ]);
-        startLabel = nextStartLabel || startLabel;
-        endLabel = nextEndLabel || endLabel;
-      } catch {
-        // Keep coordinate fallback labels when reverse geocoding is unavailable.
-      }
-    }
-
-    const normalizedTruckSetup = (truckSetup || [])
-      .map((item) => ({
-        ...item,
-        type: normalizePlannerTruckType(item.type),
-        count: Math.max(0, Number.parseInt(item.count, 10) || 0),
-        hourlyCost: Math.max(0, Number(item.hourlyCost) || 0),
-      }))
-      .filter((item) => item.type && item.count > 0);
-    const lowBedTruck =
-      normalizedTruckSetup.find((truck) => normalizePlannerTruckType(truck.type) === "Low-bed") ||
-      normalizedTruckSetup[0] ||
-      { id: "demo-low-bed", type: "Low-bed", count: 1, hourlyCost: 95 };
-    const demoLoads = (logicalLoads || DEMO_RIG_LOADS).slice(0, 3);
-    const playback = buildSimpleDemoPlayback({
-      loads: demoLoads,
-      routeGeometry: resolvedRouteData.geometry || [],
-      startLabel,
-      endLabel,
-      truckType: lowBedTruck.type || "Low-bed",
-      truckId: `${lowBedTruck.id || "demo-low-bed"}-1`,
-    });
-    const bestPlan = {
-      name: "Demo schedule",
-      routeMinutes: 4,
-      processingMinutes: Math.max(0, playback.totalMinutes - 4),
-      totalMinutes: playback.totalMinutes,
-      playback,
-    };
-    const bestScenario = {
-      name: "Demo schedule",
-      truckCount: 1,
-      capacity: 1,
-      routeDistanceKm: resolvedRouteData.distanceKm,
-      routeMinutes: 4,
-      routeSource: resolvedRouteData.source,
-      routeGeometry: resolvedRouteData.geometry || [],
-      totalMinutes: playback.totalMinutes,
-      truckSetup: [lowBedTruck],
-      allocatedTruckSetup: [lowBedTruck],
-      usedTruckSetup: [{ id: lowBedTruck.id, type: lowBedTruck.type, count: 1, hourlyCost: lowBedTruck.hourlyCost || 95 }],
-      allocatedTruckCount: 1,
-      utilization: 100,
-      truckUtilization: 100,
-      idleMinutes: 0,
-      costEstimate: Math.round(((lowBedTruck.hourlyCost || 95) * playback.totalMinutes) / 60),
-      bestVariant: bestPlan,
-    };
-    const simulation = {
-      startPoint,
-      endPoint,
-      truckCount: 1,
-      truckSetup: [lowBedTruck],
-      routeDistanceKm: resolvedRouteData.distanceKm,
-      routeMinutes: 4,
-      routeSource: resolvedRouteData.source,
-      routeGeometry: resolvedRouteData.geometry || [],
-      supportRoutes: [],
-      preferredScenarioName: bestScenario.name,
-      scenarioPlans: [bestScenario],
-      bestScenario,
-      bestPlan,
-    };
-
-    if (!previousMove) {
-      return createMoveRecord({
-        name,
-        startPoint,
-        endPoint,
-        startLabel,
-        endLabel,
-        routeMode,
-        loadCount: demoLoads.length,
-        simulation,
-        createdBy: session
-          ? {
-              id: session.id,
-              name: session.name,
-              role: session.role,
-              managerId: session.managerId || null,
-              isDemo: Boolean(session.isDemo),
-            }
-          : null,
-      });
-    }
-
-    return {
-      ...previousMove,
-      name,
-      updatedAt: new Date().toISOString(),
-      routeMode,
-      loadCount: demoLoads.length,
-      startLabel,
-      endLabel,
-      truckSetup: [lowBedTruck],
-      routeKm: resolvedRouteData.distanceKm,
-      eta: formatMinutes(bestPlan.totalMinutes),
-      routeTime: formatMinutes(4),
-      progressMinute: previousMove.progressMinute || 0,
-      completionPercentage: previousMove.completionPercentage || 0,
-      playbackSpeed: previousMove.playbackSpeed || NORMAL_PLAYBACK_SPEED,
-      planningStartDate: previousMove.planningStartDate || new Date().toISOString().slice(0, 10),
-      planningStartTime: previousMove.planningStartTime || "06:00",
-      simulation,
-    };
-  }
-
-  async function buildMoveWithSimulation({ name, startPoint, endPoint, startLabel: providedStartLabel, endLabel: providedEndLabel, loadCount, logicalLoads, truckSetup, previousMove, availability = [], scenarioTruckSetup = null, enforceExactFleet = false, onProgress = null }) {
-    if (isDemoSession(session)) {
-      onProgress?.({
-        percent: 20,
-        message: "Preparing demo schedule",
-        detail: "Stage 1 of 2. Building the fixed two-load demo plan.",
-        completedStages: 1,
-        totalStages: 2,
-      });
-      const demoMove = await buildDemoMoveWithSimpleSchedule({
-        name,
-        startPoint,
-        endPoint,
-        startLabel: providedStartLabel,
-        endLabel: providedEndLabel,
-        logicalLoads,
-        truckSetup,
-        previousMove,
-      });
-      onProgress?.({
-        percent: 100,
-        message: "Demo schedule ready",
-        detail: "Stage 2 of 2. The demo move was created without the production planner.",
-        completedStages: 2,
-        totalStages: 2,
-      });
-      return demoMove;
-    }
-
     const availabilityByType = new Map(
       (availability || []).map((item) => [String(item.type || "").trim().toLowerCase(), item]),
     );
@@ -2135,6 +1743,19 @@ function App() {
       completedStages: 3,
       totalStages: 8,
     });
+    let liveSourceInventorySnapshot = null;
+    try {
+      liveSourceInventorySnapshot = await buildLiveSourceInventorySnapshot({
+        currentMove: previousMove || null,
+        currentUser: session,
+        managedForemen,
+        managerScopedMoves,
+        startupRequirements,
+        destinationPoint: endPoint,
+      });
+    } catch {
+      liveSourceInventorySnapshot = null;
+    }
     const moveContext =
       previousMove ||
       {
@@ -2156,6 +1777,7 @@ function App() {
       teamMoves: managerScopedMoves,
       logicalLoads,
       startupRequirements,
+      liveSourceInventorySnapshot,
     });
     onProgress?.({
       percent: 22,
@@ -2239,13 +1861,18 @@ function App() {
         }.`,
       );
     }
+    const planningStartDate =
+      requestedPlanningStartDate ||
+      previousMove?.planningStartDate ||
+      new Date().toISOString().slice(0, 10);
+    const planningStartTime = previousMove?.planningStartTime || "06:00";
     const scenarioPlans = await buildScenarioPlans(planningLoads, routeData, planningCrewBaseline, truckCount, normalizedScenarioTruckSetup, truckSpecs, {
       dayShift: planningCrewBaseline,
       nightShift: planningCrewBaseline,
       roles: {},
       averageHourlyCost: 0,
-      startHour: Number.parseInt((previousMove?.planningStartTime || "06:00").split(":")[0], 10) || 6,
-      startMinute: Number.parseInt((previousMove?.planningStartTime || "06:00").split(":")[1], 10) || 0,
+      startHour: Number.parseInt((planningStartTime || "06:00").split(":")[0], 10) || 6,
+      startMinute: Number.parseInt((planningStartTime || "06:00").split(":")[1], 10) || 0,
       enforceExactFleet,
     }, {
       onProgress,
@@ -2291,6 +1918,8 @@ function App() {
         routeMode,
         loadCount: planningLoads.length,
         simulation,
+        planningStartDate,
+        planningStartTime,
         createdBy: session
           ? {
               id: session.id,
@@ -2318,8 +1947,8 @@ function App() {
       progressMinute: previousMove.progressMinute || 0,
       completionPercentage: previousMove.completionPercentage || 0,
       playbackSpeed: previousMove.playbackSpeed || DEFAULT_PLAYBACK_SPEED,
-      planningStartDate: previousMove.planningStartDate || new Date().toISOString().slice(0, 10),
-      planningStartTime: previousMove.planningStartTime || "06:00",
+      planningStartDate,
+      planningStartTime,
       simulation,
     };
   }
@@ -3254,6 +2883,7 @@ function App() {
         foremen: managedForemen,
         managerResources,
         managerFleet,
+        dashboardError: managerDashboardError,
         currentUser: session,
         currentDate: new Date(),
         onOpenMove: handleOpenMove,

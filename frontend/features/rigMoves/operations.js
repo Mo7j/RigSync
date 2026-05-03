@@ -1,4 +1,3 @@
-import { TEST_USERS } from "../auth/auth.js";
 import { readRigInventoryAdjustments } from "../rigInventory/storage.js";
 import { createId } from "../../lib/id.js";
 import { buildLogicalLoads, haversineKilometers } from "./simulation.js";
@@ -62,14 +61,6 @@ function getRigLabel(move) {
   return move?.endLabel || move?.name || "Unnamed rig";
 }
 
-function getUserAssignedRigId(userId) {
-  return TEST_USERS.find((user) => user.id === userId)?.assignedRig?.id || `rig-${userId || "home"}`;
-}
-
-function getUserAssignedRig(userId) {
-  return TEST_USERS.find((user) => user.id === userId)?.assignedRig || null;
-}
-
 function buildReusableLoadInventory(logicalLoads = []) {
   const grouped = new Map();
 
@@ -97,23 +88,6 @@ function buildReusableLoadInventory(logicalLoads = []) {
     return String(a.description).localeCompare(String(b.description));
   });
 }
-
-export const DEFAULT_STARTUP_REQUIREMENTS = [
-  { id: "SU-01", description: "Drill pipe", count: 4, priority: 7, truckTypes: ["Flat-bed", "Low-bed"], dependencyLabel: "After RL-31 and RL-36", isReusable: true },
-  { id: "SU-02", description: "Drill collars / BHA tools", count: 2, priority: 7, truckTypes: ["Low-bed", "Heavy Hauler"], dependencyLabel: "After RL-31", isReusable: true },
-  { id: "SU-03", description: "Drill bit", count: 1, priority: 7, truckTypes: ["Flat-bed"], dependencyLabel: "After SU-02", isReusable: true },
-  { id: "SU-04", description: "Subs / crossovers / float subs", count: 1, priority: 7, truckTypes: ["Flat-bed"], dependencyLabel: "After SU-02", isReusable: true },
-  { id: "SU-05", description: "Tubular handling tools", count: 2, priority: 6, truckTypes: ["Flat-bed"], dependencyLabel: "Standalone startup load", isReusable: true },
-  { id: "SU-06", description: "Tubular baskets / pipe accessories", count: 2, priority: 6, truckTypes: ["Flat-bed"], dependencyLabel: "After RL-31", isReusable: true },
-  { id: "SU-07", description: "Drilling fluid / spud mud", count: 4, priority: 7, truckTypes: ["Flat-bed", "Low-bed"], dependencyLabel: "After RL-14 and RL-11", isReusable: false },
-  { id: "SU-08", description: "Mud chemicals", count: 4, priority: 7, truckTypes: ["Flat-bed"], dependencyLabel: "After RL-14", isReusable: false },
-  { id: "SU-09", description: "Water / brine supply", count: 3, priority: 7, truckTypes: ["Low-bed"], dependencyLabel: "After RL-12", isReusable: false },
-  { id: "SU-10", description: "Diesel fuel", count: 2, priority: 7, truckTypes: ["Low-bed"], dependencyLabel: "After RL-10", isReusable: false },
-  { id: "SU-11", description: "Lubricants & hydraulic oil", count: 1, priority: 6, truckTypes: ["Flat-bed"], dependencyLabel: "Standalone startup load", isReusable: false },
-  { id: "SU-12", description: "Grease, filters & maintenance consumables", count: 1, priority: 6, truckTypes: ["Flat-bed"], dependencyLabel: "Standalone startup load", isReusable: false },
-  { id: "SU-13", description: "Standpipe manifold parts & seals", count: 1, priority: 6, truckTypes: ["Flat-bed"], dependencyLabel: "Startup support item", isReusable: true },
-  { id: "SU-14", description: "BOP test equipment", count: 1, priority: 7, truckTypes: ["Low-bed"], dependencyLabel: "After RL-26", isReusable: true },
-];
 
 export function buildStartupTransferLoads(startupLoads = [], supportRouteMap = {}) {
   let syntheticId = 90000;
@@ -176,34 +150,8 @@ export function buildStartupTransferLoads(startupLoads = [], supportRouteMap = {
 
 export function buildStartupPlanningLoads(startupRequirements = [], startupLoads = [], supportRouteMap = {}) {
   const transferLoads = buildStartupTransferLoads(startupLoads, supportRouteMap);
-  const transferredCountsByFamily = new Map();
-
-  transferLoads.forEach((load) => {
-    const familyId = String(load.family_id || load.code || "").trim();
-    if (!familyId) {
-      return;
-    }
-    transferredCountsByFamily.set(familyId, (transferredCountsByFamily.get(familyId) || 0) + 1);
-  });
-
-  const genericStartupLoads = buildLogicalLoads(startupRequirements || []).filter((load) => {
-    const familyId = String(load.family_id || load.code || "").trim();
-    const transferredCount = transferredCountsByFamily.get(familyId) || 0;
-    if (transferredCount <= 0) {
-      return true;
-    }
-
-    transferredCountsByFamily.set(familyId, transferredCount - 1);
-    return false;
-  }).map((load) => ({
-    ...load,
-    source_kind: "startup",
-  }));
-
-  return [
-    ...genericStartupLoads,
-    ...transferLoads,
-  ];
+  void startupRequirements;
+  return transferLoads;
 }
 
 export function buildStartupTransferSchedule(startupLoads = [], destinationLabel = "Destination") {
@@ -225,7 +173,7 @@ export function buildStartupTransferSchedule(startupLoads = [], destinationLabel
 function normalizeStartupRequirements(startupRequirements = undefined) {
   const source = Array.isArray(startupRequirements)
     ? startupRequirements
-    : DEFAULT_STARTUP_REQUIREMENTS;
+    : [];
   const grouped = new Map();
 
   source.forEach((load) => {
@@ -266,33 +214,81 @@ function normalizeStartupRequirements(startupRequirements = undefined) {
   }));
 }
 
-export function buildOperatingSnapshot({ move, teamMoves = [], logicalLoads = [], startupRequirements = undefined }) {
+export function buildOperatingSnapshot({
+  move,
+  teamMoves = [],
+  logicalLoads = [],
+  startupRequirements = undefined,
+  liveSourceInventorySnapshot = null,
+}) {
   const reusableInventory = buildReusableLoadInventory(logicalLoads);
   const managerId = move?.createdBy?.managerId || null;
   const currentForemanId = move?.createdBy?.id || null;
-  const donorRigs = TEST_USERS.filter(
-    (user) =>
-      user.role === "Foreman" &&
-      user.managerId === managerId &&
-      user.id !== currentForemanId,
-  ).map((user) => {
-    const latestRigMove =
-      (teamMoves || [])
-        .filter((candidate) => candidate?.createdBy?.id === user.id)
-        .sort((a, b) => new Date(b.updatedAt || b.createdAt || 0) - new Date(a.updatedAt || a.createdAt || 0))[0] || null;
-    const assignedRig = getUserAssignedRig(user.id);
+  const donorRigByForemanId = new Map();
+  (teamMoves || [])
+    .filter((candidate) => candidate?.createdBy?.managerId === managerId)
+    .filter((candidate) => candidate?.createdBy?.id && candidate.createdBy.id !== currentForemanId)
+    .filter((candidate) => candidate?.endPoint)
+    .sort((a, b) => new Date(b.updatedAt || b.createdAt || 0) - new Date(a.updatedAt || a.createdAt || 0))
+    .forEach((candidate) => {
+      const foremanId = String(candidate.createdBy.id);
+      if (donorRigByForemanId.has(foremanId)) {
+        return;
+      }
+      donorRigByForemanId.set(foremanId, {
+        foremanId,
+        rigId: String(candidate?.endLabel || candidate?.name || foremanId),
+        rigLabel: candidate?.endLabel || candidate?.name || foremanId,
+        rigPoint: candidate?.endPoint || null,
+        moveName: candidate?.name || candidate?.endLabel || foremanId,
+      });
+    });
+  const donorRigs = [...donorRigByForemanId.values()];
 
-    return {
-      foremanId: user.id,
-      rigId: getUserAssignedRigId(user.id),
-      rigLabel: latestRigMove?.endLabel || assignedRig?.startLabel || assignedRig?.name || user.name,
-      rigPoint: latestRigMove?.endPoint || assignedRig?.startPoint || null,
-      moveName: latestRigMove?.name || `${assignedRig?.name || user.name} rig`,
-    };
+  const liveSourceNodesById = new Map(
+    (liveSourceInventorySnapshot?.sourceNodes || []).map((node) => [String(node.source_id || "").trim(), node]),
+  );
+  const liveSourceInventoryByFamily = new Map();
+  (liveSourceInventorySnapshot?.sourceInventory || []).forEach((row) => {
+    const familyId = String(row.family_id || "").trim();
+    if (!familyId) {
+      return;
+    }
+    if (!liveSourceInventoryByFamily.has(familyId)) {
+      liveSourceInventoryByFamily.set(familyId, []);
+    }
+    liveSourceInventoryByFamily.get(familyId).push(row);
   });
 
   const startupLoads = normalizeStartupRequirements(startupRequirements).map((load) => {
-    const donorOptions = donorRigs
+    const liveDonorOptions = load.isReusable
+      ? (liveSourceInventoryByFamily.get(String(load.id || "").trim()) || [])
+        .map((row) => {
+          const sourceId = String(row.source_id || "").trim();
+          const sourceNode = liveSourceNodesById.get(sourceId) || null;
+          const remainingUnits = Math.max(
+            0,
+            (Number.parseInt(row.available_units, 10) || 0) - (Number.parseInt(row.reserved_units, 10) || 0),
+          );
+          if (!sourceId || remainingUnits < 1) {
+            return null;
+          }
+
+          return {
+            moveId: sourceId,
+            moveName: sourceNode?.source_name || sourceId,
+            rigLabel: sourceNode?.source_name || sourceId,
+            rigPoint: sourceNode?.point || null,
+            distanceKm: Number.isFinite(Number(sourceNode?.distance_to_destination_km))
+              ? Number(sourceNode.distance_to_destination_km)
+              : (move?.endPoint && sourceNode?.point ? haversineKilometers(sourceNode.point, move.endPoint) : Number.POSITIVE_INFINITY),
+            available: Math.min(load.count, remainingUnits),
+          };
+        })
+        .filter(Boolean)
+      : [];
+
+    const donorOptions = (liveDonorOptions.length ? liveDonorOptions : donorRigs
       .map((donor) => {
         if (!load.isReusable) {
           return null;
@@ -318,7 +314,7 @@ export function buildOperatingSnapshot({ move, teamMoves = [], logicalLoads = []
           available,
         };
       })
-      .filter(Boolean)
+      .filter(Boolean))
       .sort((a, b) => b.available - a.available || a.distanceKm - b.distanceKm || a.rigLabel.localeCompare(b.rigLabel));
 
     let remaining = load.count;
@@ -356,6 +352,7 @@ export function buildOperatingSnapshot({ move, teamMoves = [], logicalLoads = []
   const startupMissing = startupLoads.reduce((sum, item) => sum + item.missingCount, 0);
 
   return {
+    donorRigs,
     reusableInventory,
     startupLoads,
     reusableSummary: {
@@ -367,7 +364,7 @@ export function buildOperatingSnapshot({ move, teamMoves = [], logicalLoads = []
       totalUnits: startupNeeded,
       coveredUnits: startupCovered,
       missingUnits: startupMissing,
-      donorRigCount: donorRigs.length,
+      donorRigCount: liveSourceInventorySnapshot?.sourceNodes?.length || donorRigs.length,
     },
   };
 }

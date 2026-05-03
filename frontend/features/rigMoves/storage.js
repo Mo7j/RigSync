@@ -1,8 +1,7 @@
 import { clampPercentage, formatCoordinate, formatMinutes, formatShortDate } from "../../lib/format.js";
 import { createId } from "../../lib/id.js";
 import { haversineKilometers } from "./simulation.js";
-import { deleteMoveDoc, fetchMoveDoc, saveMoveDoc } from "../../lib/firebaseOperations.js";
-import { deleteMoveRecord, fetchMoveRecord, fetchMoveRecords, saveMoveRecord } from "./api.js";
+import { deleteMoveDoc, fetchManagerMoveDocs, fetchMoveDoc, saveMoveDoc } from "../../lib/firebaseOperations.js";
 
 let movesCache = [];
 const MOVE_BACKUP_STORAGE_KEY = "rigsync.moveBackups";
@@ -142,6 +141,12 @@ function compactPlayback(playback, options = {}) {
 
   const includeGeometry = options.includeGeometry !== false;
   const includeJourneys = options.includeJourneys === true;
+  const includeTrips = options.includeTrips !== false;
+  const includeSteps = options.includeSteps === true;
+  const includeTasks = options.includeTasks === true;
+  const journeyGeometryMaxPoints = options.journeyGeometryMaxPoints || 48;
+  const tripRouteGeometryMaxPoints = options.tripRouteGeometryMaxPoints || 48;
+  const tripPickupGeometryMaxPoints = options.tripPickupGeometryMaxPoints || 48;
 
   return {
     totalMinutes: playback.totalMinutes,
@@ -160,10 +165,10 @@ function compactPlayback(playback, options = {}) {
           returnToSource: journey.returnToSource ?? 0,
           routeMinutes: journey.routeMinutes || null,
           routeDistanceKm: journey.routeDistanceKm || null,
-          routeGeometry: includeGeometry ? compactGeometry(journey.routeGeometry || [], 24) : [],
+          routeGeometry: includeGeometry ? compactGeometry(journey.routeGeometry || [], journeyGeometryMaxPoints) : [],
         }))
       : [],
-    trips: (playback.trips || []).map((trip) => ({
+    trips: includeTrips ? (playback.trips || []).map((trip) => ({
       truckId: trip.truckId,
       truckType: trip.truckType,
       journeyId: trip.journeyId || null,
@@ -171,13 +176,15 @@ function compactPlayback(playback, options = {}) {
       loadCode: trip.loadCode || null,
       isCriticalLift: Boolean(trip.isCriticalLift),
       description: trip.description,
+      sourceKind: trip.sourceKind || "rig",
       sourceLabel: trip.sourceLabel || null,
+      sourcePoint: trip.sourcePoint || null,
       destinationLabel: trip.destinationLabel || null,
       dispatchStart: trip.dispatchStart ?? trip.loadStart,
       pickupRouteMinutes: trip.pickupRouteMinutes || null,
-      pickupRouteGeometry: includeGeometry ? compactGeometry(trip.pickupRouteGeometry || [], 16) : [],
+      pickupRouteGeometry: includeGeometry ? compactGeometry(trip.pickupRouteGeometry || [], tripPickupGeometryMaxPoints) : [],
       routeMinutes: trip.routeMinutes || null,
-      routeGeometry: includeGeometry ? compactGeometry(trip.routeGeometry || [], 24) : [],
+      routeGeometry: includeGeometry ? compactGeometry(trip.routeGeometry || [], tripRouteGeometryMaxPoints) : [],
       moveStart: trip.moveStart ?? null,
       loadStart: trip.loadStart,
       rigDownStart: trip.rigDownStart ?? trip.loadStart,
@@ -191,14 +198,14 @@ function compactPlayback(playback, options = {}) {
       rigUpFinish: trip.rigUpFinish,
       returnStart: trip.returnStart ?? trip.arrivalAtDestination,
       returnToSource: trip.returnToSource,
-    })),
-    steps: (playback.steps || []).map((step) => ({
+    })) : [],
+    steps: includeSteps ? (playback.steps || []).map((step) => ({
       type: step.type,
       minute: step.minute,
       title: step.title,
       description: step.description,
-    })),
-    tasks: (playback.tasks || []).map((task) => ({
+    })) : [],
+    tasks: includeTasks ? (playback.tasks || []).map((task) => ({
       id: task.id,
       loadId: task.loadId,
       loadCode: task.loadCode || null,
@@ -217,7 +224,7 @@ function compactPlayback(playback, options = {}) {
       latestFinish: task.latestFinish ?? ((task.endMinute ?? 0) + (task.slack ?? 0)),
       slack: task.slack ?? 0,
       isCritical: Boolean(task.isCritical),
-    })),
+    })) : [],
     planningAnalysis: playback.planningAnalysis
       ? {
           projectFinish: playback.planningAnalysis.projectFinish ?? playback.totalMinutes ?? 0,
@@ -232,7 +239,6 @@ function compactScenarioPlan(plan) {
     return null;
   }
 
-  const compactedPlayback = compactPlayback(plan.bestVariant?.playback || plan.playback, { includeGeometry: false });
   return {
     name: plan.name,
     truckCount: plan.truckCount,
@@ -250,13 +256,33 @@ function compactScenarioPlan(plan) {
     truckUtilization: plan.truckUtilization,
     idleMinutes: plan.idleMinutes,
     costEstimate: plan.costEstimate,
+    sourceReservations: (plan.sourceReservations || []).map((reservation) => ({
+      sourceId: reservation.sourceId,
+      sourceLabel: reservation.sourceLabel,
+      familyId: reservation.familyId,
+      loadCode: reservation.loadCode,
+      description: reservation.description,
+      distanceKm: reservation.distanceKm,
+      availableUnits: reservation.availableUnits,
+      reservedUnitsBefore: reservation.reservedUnitsBefore,
+      unitsReserved: reservation.unitsReserved,
+      selectionMode: reservation.selectionMode || null,
+    })),
     bestVariant: plan.bestVariant
       ? {
           name: plan.bestVariant.name,
           routeMinutes: plan.bestVariant.routeMinutes,
           processingMinutes: plan.bestVariant.processingMinutes,
           totalMinutes: plan.bestVariant.totalMinutes,
-          playback: compactedPlayback,
+          playback: compactPlayback(plan.bestVariant.playback, {
+            includeGeometry: true,
+            includeJourneys: false,
+            includeTrips: true,
+            includeSteps: false,
+            includeTasks: false,
+            tripRouteGeometryMaxPoints: 48,
+            tripPickupGeometryMaxPoints: 48,
+          }),
         }
       : null,
   };
@@ -272,7 +298,15 @@ function compactBestPlan(plan) {
     routeMinutes: plan.routeMinutes,
     processingMinutes: plan.processingMinutes,
     totalMinutes: plan.totalMinutes,
-    playback: compactPlayback(plan.playback, { includeGeometry: false, includeJourneys: false }),
+    playback: compactPlayback(plan.playback, {
+      includeGeometry: true,
+      includeJourneys: false,
+      includeTrips: true,
+      includeSteps: false,
+      includeTasks: true,
+      tripRouteGeometryMaxPoints: 48,
+      tripPickupGeometryMaxPoints: 48,
+    }),
   };
 }
 
@@ -296,20 +330,26 @@ function compactSimulation(simulation) {
     routeDistanceKm: simulation.routeDistanceKm,
     routeMinutes: simulation.routeMinutes,
     routeSource: simulation.routeSource,
-    routeGeometry: compactGeometry(simulation.routeGeometry || []),
+    routeGeometry: compactGeometry(simulation.routeGeometry || [], 180),
     supportRoutes: (simulation.supportRoutes || []).map((route) => ({
       key: route.key,
       loadLabel: route.loadLabel,
       quantity: route.quantity,
+      startLabel: route.startLabel || "",
+      startPoint: route.startPoint || null,
       sourceLabel: route.sourceLabel,
       sourcePoint: route.sourcePoint || null,
       destinationLabel: route.destinationLabel,
       truckLabel: route.truckLabel,
       routeSource: route.routeSource || "",
-      geometry: compactGeometry(route.geometry || [], 32),
+      geometry: compactGeometry(route.geometry || [], 120),
       routeMinutes: route.routeMinutes || null,
       routeDistanceKm: route.routeDistanceKm || null,
-      pickupGeometry: compactGeometry(route.pickupGeometry || [], 24),
+      sourceGeometry: compactGeometry(route.sourceGeometry || [], 120),
+      sourceRouteSource: route.sourceRouteSource || "",
+      sourceRouteMinutes: route.sourceRouteMinutes || null,
+      sourceRouteDistanceKm: route.sourceRouteDistanceKm || null,
+      pickupGeometry: compactGeometry(route.pickupGeometry || [], 120),
       pickupRouteSource: route.pickupRouteSource || "",
       pickupRouteMinutes: route.pickupRouteMinutes || null,
       pickupRouteDistanceKm: route.pickupRouteDistanceKm || null,
@@ -408,7 +448,15 @@ function normalizeStoredSimulation(simulation) {
       };
     }
 
-    return plan;
+    return {
+      ...plan,
+      bestVariant: plan.bestVariant
+        ? {
+            ...plan.bestVariant,
+            playback: plan.bestVariant.playback || null,
+          }
+        : plan.bestVariant,
+    };
   });
 
   return {
@@ -434,12 +482,12 @@ function normalizeStoredMove(move) {
   return {
     ...move,
     managerId: resolvedManagerId,
-    createdBy: move.createdBy || {
-      id: "foreman-fahad",
-      name: "Fahad Al-Qahtani",
-      role: "Foreman",
-      managerId: resolvedManagerId || "manager-nasser",
-    },
+    createdBy: move.createdBy
+      ? {
+          ...move.createdBy,
+          managerId: move.createdBy.managerId || resolvedManagerId,
+        }
+      : null,
     executionState: move.executionState || "planning",
     operatingState: move.operatingState || (move.executionState === "completed" ? "drilling" : "standby"),
     executionProgress: {
@@ -467,11 +515,12 @@ function sortMoves(moves) {
 }
 
 export async function hydrateMoves(managerId, { summary = false } = {}) {
+  void summary;
   if (!managerId) {
     return setMovesCache([]);
   }
 
-  const remoteMoves = await fetchMoveRecords(managerId, { summary });
+  const remoteMoves = await fetchManagerMoveDocs(managerId);
   const remoteMoveIds = new Set(remoteMoves.map((move) => move?.id).filter(Boolean));
   pruneMoveBackups((move) => {
     const moveManagerId = move?.createdBy?.role === "Manager" ? move.createdBy?.id : move?.createdBy?.managerId;
@@ -485,17 +534,9 @@ export async function fetchMove(moveId) {
   let payload = null;
 
   try {
-    payload = normalizeStoredMove(await fetchMoveRecord(moveId));
+    payload = normalizeStoredMove(await fetchMoveDoc(moveId));
   } catch {
     payload = null;
-  }
-
-  if (!payload) {
-    try {
-      payload = normalizeStoredMove(await fetchMoveDoc(moveId));
-    } catch {
-      payload = null;
-    }
   }
 
   if (!payload) {
@@ -518,13 +559,8 @@ export function readMoves() {
 
 export async function upsertMove(move) {
   const compactedMove = compactMoveForStorage(normalizeStoredMove(move));
-  const savedMove = normalizeStoredMove(await saveMoveRecord(compactedMove));
+  const savedMove = normalizeStoredMove(await saveMoveDoc(compactedMove));
   persistMoveBackup(savedMove);
-  try {
-    await saveMoveDoc(savedMove);
-  } catch (error) {
-    console.error("Failed to save move to Firestore", error);
-  }
   const current = readMoves().filter((item) => item.id !== savedMove.id);
   return setMovesCache([savedMove, ...current]);
 }
@@ -533,8 +569,7 @@ export async function removeMove(moveId) {
   const remainingMoves = readMoves().filter((move) => move.id !== moveId);
   setMovesCache(remainingMoves);
   removeMoveBackup(moveId);
-  await deleteMoveRecord(moveId);
-  void deleteMoveDoc(moveId).catch(() => {});
+  await deleteMoveDoc(moveId);
   return remainingMoves;
 }
 
@@ -581,22 +616,26 @@ export async function persistMoveSession(moveId, sessionState) {
   });
   const syncedMove = normalizeStoredMove(persistedMove);
 
-  await saveMoveRecord(persistedMove);
+  await saveMoveDoc(persistedMove);
   persistMoveBackup(persistedMove);
-  void saveMoveDoc({
-    id: moveId,
-    managerId: updatedMove.managerId,
-    createdBy: updatedMove.createdBy,
-    ...sessionState,
-    executionProgress: updatedMove.executionProgress,
-    updatedAt: persistedMove.updatedAt,
-  }).catch(() => {});
   const current = readMoves().filter((item) => item.id !== syncedMove.id);
   setMovesCache([syncedMove, ...current]);
   return syncedMove;
 }
 
-export function createMoveRecord({ name, startPoint, endPoint, startLabel, endLabel, simulation, routeMode, loadCount, createdBy = null }) {
+export function createMoveRecord({
+  name,
+  startPoint,
+  endPoint,
+  startLabel,
+  endLabel,
+  simulation,
+  routeMode,
+  loadCount,
+  createdBy = null,
+  planningStartDate = null,
+  planningStartTime = "06:00",
+}) {
   const totalMinutes = simulation.bestPlan.totalMinutes;
   const routeKm =
     simulation?.routeDistanceKm ||
@@ -621,8 +660,8 @@ export function createMoveRecord({ name, startPoint, endPoint, startLabel, endLa
     routeKm,
     eta: formatMinutes(totalMinutes),
     routeTime: formatMinutes(simulation.routeMinutes),
-    planningStartDate: now.toISOString().slice(0, 10),
-    planningStartTime: "06:00",
+    planningStartDate: planningStartDate || now.toISOString().slice(0, 10),
+    planningStartTime: planningStartTime || "06:00",
     progressMinute: 0,
     completionPercentage: 0,
     executionState: "planning",

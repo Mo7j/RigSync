@@ -2,22 +2,16 @@ import { React, h } from "../lib/react.js";
 import { Button } from "../components/ui/Button.js";
 import { Card } from "../components/ui/Card.js";
 import { Field, TextInput } from "../components/ui/Field.js";
-import { TEST_USERS, TEST_USER } from "../features/auth/auth.js";
 import { translate } from "../lib/language.js";
 
 const { useMemo, useState } = React;
 
 export function LoginPage({ isAuthenticated, onLogin, onBackHome, language = "en", onToggleLanguage, loginProfiles = [] }) {
-  const [email, setEmail] = useState(TEST_USER.email);
-  const [password, setPassword] = useState(TEST_USER.password);
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
   const [error, setError] = useState("");
   const [isSubmitting, setIsSubmitting] = useState(false);
-  const selectableProfiles = useMemo(() => {
-    if (loginProfiles.length) {
-      return loginProfiles;
-    }
-    return TEST_USERS;
-  }, [loginProfiles]);
+  const selectableProfiles = useMemo(() => loginProfiles, [loginProfiles]);
 
   async function handleSubmit(event) {
     event.preventDefault();
@@ -83,28 +77,27 @@ export function LoginPage({ isAuthenticated, onLogin, onBackHome, language = "en
           { className: "muted-copy" },
           translate(language, "loginSubtitle", "Sign in to access the dashboard and operational workspace."),
         ),
-        h(
-          "div",
-          { className: "auth-demo-accounts" },
-          selectableProfiles.map((user) =>
-            h(
-              "button",
-              {
-                key: user.id || user.email,
-                type: "button",
-                className: "auth-demo-account",
-                onClick: () => {
-                  setEmail(user.email);
-                  if (user.password) {
-                    setPassword(user.password);
-                  }
+        selectableProfiles.length
+          ? h(
+            "div",
+            { className: "auth-demo-accounts" },
+            selectableProfiles.map((user) =>
+              h(
+                "button",
+                {
+                  key: user.id || user.email,
+                  type: "button",
+                  className: "auth-demo-account",
+                  onClick: () => {
+                    setEmail(user.email || "");
+                  },
                 },
-              },
-              h("strong", null, user.role),
-              h("span", null, `${user.name} - ${user.email}`),
+                h("strong", null, user.role),
+                h("span", null, `${user.name} - ${user.email}`),
+              ),
             ),
-          ),
-        ),
+          )
+          : null,
         h(
           "form",
           { className: "auth-form", onSubmit: handleSubmit },

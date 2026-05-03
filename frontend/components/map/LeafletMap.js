@@ -161,12 +161,70 @@ function bindClampedTooltip(layer, content, options) {
 }
 
 function shouldShowTruckMarker(status) {
-  return (
-    status?.startsWith("In transit") ||
-    status?.startsWith("Heading to pickup") ||
-    status?.startsWith("Delivered") ||
-    status === "Returning"
-  );
+  return Boolean(status);
+}
+
+function getTripMapKey(trip) {
+  return `${trip?.truckId || "truck"}::${trip?.loadId || "load"}::${trip?.dispatchStart || trip?.moveStart || 0}`;
+}
+
+function getGeometryRouteKey(geometry = []) {
+  if (!geometry?.length) {
+    return "";
+  }
+
+  const start = geometry[0];
+  const end = geometry[geometry.length - 1];
+  if (!start || !end) {
+    return "";
+  }
+
+  return `${start[0]},${start[1]}->${end[0]},${end[1]}`;
+}
+
+function isValidMapPoint(point) {
+  return Number.isFinite(Number(point?.lat)) && Number.isFinite(Number(point?.lng));
+}
+
+function reverseGeometry(geometry = []) {
+  return [...geometry].reverse();
+}
+
+function getSupportRouteLineSpecs(route, endPoint) {
+  const specs = [];
+
+  if (route?.sourcePoint && endPoint) {
+    specs.push({
+      key: `${route.key}::pickup`,
+      geometry: route.pickupGeometry?.length
+        ? route.pickupGeometry
+        : fallbackRouteData(endPoint, route.sourcePoint).geometry,
+      style: {
+        color: "#f5c04a",
+        weight: 2,
+        opacity: 0.75,
+        dashArray: "10 10",
+        lineCap: "round",
+        lineJoin: "round",
+      },
+    });
+    specs.push({
+      key: `${route.key}::loaded`,
+      geometry: route.geometry?.length
+        ? route.geometry
+        : fallbackRouteData(route.sourcePoint, endPoint).geometry,
+      style: {
+        color: "#8bc7ff",
+        weight: 2,
+        opacity: 0.75,
+        dashArray: "10 10",
+        lineCap: "round",
+        lineJoin: "round",
+      },
+    });
+  }
+
+  return specs.filter((spec) => spec.geometry?.length >= 2);
 }
 
 function focusMapOnPoint(map, point, zoom = 12) {
@@ -237,6 +295,7 @@ export function LeafletMap({
   const [locationRequestState, setLocationRequestState] = useState("idle");
   const [locationRequestError, setLocationRequestError] = useState("");
   const [supportRouteGeometryMap, setSupportRouteGeometryMap] = useState({});
+  const [pickupRouteGeometryMap, setPickupRouteGeometryMap] = useState({});
   const mapElementRef = useRef(null);
   const mapRef = useRef(null);
   const markersRef = useRef({ start: null, end: null });
@@ -247,6 +306,7 @@ export function LeafletMap({
   const routeKeyRef = useRef("");
   const pointBoundsKeyRef = useRef("");
   const supportRouteCacheRef = useRef(new Map());
+  const pickupRouteCacheRef = useRef(new Map());
   const supportRouteRequestKey = useMemo(
     () =>
       JSON.stringify({
@@ -255,9 +315,20 @@ export function LeafletMap({
           key: route?.key || "",
           sourcePoint: route?.sourcePoint ? [route.sourcePoint.lat, route.sourcePoint.lng] : null,
         })),
-      }),
+    }),
     [supportRoutes, endPoint],
   );
+  const pickupRouteRequestKey = useMemo(() => {
+    const trips = simulation?.bestPlan?.playback?.trips || [];
+    return JSON.stringify(
+      trips
+        .filter((trip) => (trip?.sourceKind || "rig") === "startup")
+        .map((trip) => ({
+          key: getTripMapKey(trip),
+          pickupRouteKey: getGeometryRouteKey(trip?.pickupRouteGeometry || []),
+        })),
+    );
+  }, [simulation?.bestPlan?.playback?.trips]);
 
   useEffect(() => {
     if (!mapElementRef.current || mapRef.current || !window.L) {
@@ -400,6 +471,148 @@ export function LeafletMap({
   }, [supportRouteRequestKey]);
 
   useEffect(() => {
+    let cancelled = false;
+
+    async function loadPickupRoutes() {
+      const playbackTrips = simulation?.bestPlan?.playback?.trips || [];
+      const startupTrips = playbackTrips.filter((trip) => (trip?.sourceKind || "rig") === "startup" && trip?.pickupRouteGeometry?.length >= 2);
+      if (!startupTrips.length) {
+        setPickupRouteGeometryMap({});
+        return;
+      }
+
+      const nextMap = {};
+      startupTrips.forEach((trip) => {
+        const tripKey = getTripMapKey(trip);
+        const pickupGeometry = trip.pickupRouteGeometry || [];
+        const cacheKey = getGeometryRouteKey(pickupGeometry);
+        const cachedGeometry = cacheKey ? pickupRouteCacheRef.current.get(cacheKey) : null;
+        nextMap[tripKey] = cachedGeometry?.length > 2 ? cachedGeometry : pickupGeometry;
+      });
+      if (!cancelled) {
+        setPickupRouteGeometryMap(nextMap);
+      }
+
+      const routesToFetch = startupTrips.filter((trip) => {
+        const pickupGeometry = trip.pickupRouteGeometry || [];
+        const cacheKey = getGeometryRouteKey(pickupGeometry);
+        if (!cacheKey) {
+          return false;
+        }
+        if (pickupGeometry.length > 2) {
+          pickupRouteCacheRef.current.set(cacheKey, pickupGeometry);
+          return false;
+        }
+        return !(pickupRouteCacheRef.current.get(cacheKey)?.length > 2);
+      });
+      if (!routesToFetch.length) {
+        return;
+      }
+
+      for (const trip of routesToFetch) {
+        if (cancelled) {
+          return;
+        }
+
+        const pickupGeometry = trip.pickupRouteGeometry || [];
+        const start = pickupGeometry[0];
+        const end = pickupGeometry[pickupGeometry.length - 1];
+        if (!start || !end) {
+          continue;
+        }
+
+        const cacheKey = getGeometryRouteKey(pickupGeometry);
+        const cachedGeometry = pickupRouteCacheRef.current.get(cacheKey);
+        if (cachedGeometry?.length > 2) {
+          nextMap[getTripMapKey(trip)] = cachedGeometry;
+          continue;
+        }
+
+        const startPoint = { lat: start[0], lng: start[1] };
+        const endPoint = { lat: end[0], lng: end[1] };
+        let resolvedGeometry = pickupGeometry;
+
+        try {
+          const routeData = await fetchRouteData(startPoint, endPoint);
+          if (routeData?.geometry?.length > 2) {
+            resolvedGeometry = routeData.geometry;
+            pickupRouteCacheRef.current.set(cacheKey, resolvedGeometry);
+          }
+        } catch {
+          if (!pickupRouteCacheRef.current.has(cacheKey)) {
+            pickupRouteCacheRef.current.set(cacheKey, pickupGeometry);
+          }
+        }
+
+        nextMap[getTripMapKey(trip)] = resolvedGeometry;
+      }
+
+      if (!cancelled) {
+        setPickupRouteGeometryMap({ ...nextMap });
+      }
+    }
+
+    loadPickupRoutes();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [pickupRouteRequestKey]);
+
+  const playbackForMap = useMemo(() => {
+    const playback = simulation?.bestPlan?.playback;
+    if (!playback?.trips?.length) {
+      return playback;
+    }
+
+    const nextTrips = (playback.trips || []).map((trip) => {
+      const tripKey = getTripMapKey(trip);
+      let resolvedPickupGeometry = pickupRouteGeometryMap[tripKey] || trip.pickupRouteGeometry || [];
+      let resolvedLoadedGeometry = trip.routeGeometry || [];
+      let matchedSupportRoute = null;
+
+      if ((trip?.sourcePoint?.lat != null && trip?.sourcePoint?.lng != null) && endPoint) {
+        matchedSupportRoute = (supportRoutes || []).find(
+          (route) =>
+            route?.sourcePoint &&
+            Math.abs(route.sourcePoint.lat - trip.sourcePoint.lat) < 0.00001 &&
+            Math.abs(route.sourcePoint.lng - trip.sourcePoint.lng) < 0.00001,
+        );
+        if (matchedSupportRoute?.key && supportRouteGeometryMap[matchedSupportRoute.key]?.length > 2) {
+          resolvedLoadedGeometry = supportRouteGeometryMap[matchedSupportRoute.key];
+        }
+      }
+
+      const pickupStart = resolvedPickupGeometry?.[0] || null;
+      const pickupEnd = resolvedPickupGeometry?.[resolvedPickupGeometry.length - 1] || null;
+      if (
+        resolvedLoadedGeometry?.length > 2 &&
+        pickupStart &&
+        pickupEnd &&
+        endPoint &&
+        Math.abs(pickupStart[0] - endPoint.lat) < 0.00001 &&
+        Math.abs(pickupStart[1] - endPoint.lng) < 0.00001 &&
+        trip?.sourcePoint &&
+        Math.abs(pickupEnd[0] - trip.sourcePoint.lat) < 0.00001 &&
+        Math.abs(pickupEnd[1] - trip.sourcePoint.lng) < 0.00001
+      ) {
+        resolvedPickupGeometry = reverseGeometry(resolvedLoadedGeometry);
+      }
+
+      return {
+        ...trip,
+        pickupRouteGeometry: resolvedPickupGeometry,
+        routeGeometry: resolvedLoadedGeometry,
+      };
+    });
+
+    return {
+      ...playback,
+      trips: nextTrips,
+    };
+  }, [simulation, supportRoutes, supportRouteGeometryMap, pickupRouteGeometryMap, endPoint]);
+
+  useEffect(() => {
     const map = mapRef.current;
     if (!map || pickerTarget) {
       return undefined;
@@ -506,25 +719,17 @@ export function LeafletMap({
         supportMarkersRef.current.set(route.key, marker);
       }
 
-      const geometry =
-        supportRouteGeometryMap[route.key] || [
-          [route.sourcePoint.lat, route.sourcePoint.lng],
-          [endPoint.lat, endPoint.lng],
-        ];
-
-      const line = window.L.polyline(
-        geometry,
+      const routeLineSpecs = getSupportRouteLineSpecs(
         {
-          color: "#8bc7ff",
-          weight: 2,
-          opacity: 0.75,
-          dashArray: "10 10",
-          lineCap: "round",
-          lineJoin: "round",
+          ...route,
+          geometry: supportRouteGeometryMap[route.key] || route.geometry,
         },
-      ).addTo(map);
-
-      supportRouteLinesRef.current.push(line);
+        endPoint,
+      );
+      routeLineSpecs.forEach((spec) => {
+        const line = window.L.polyline(spec.geometry, spec.style).addTo(map);
+        supportRouteLinesRef.current.push(line);
+      });
     });
 
     supportMarkersRef.current.forEach((marker, key) => {
@@ -599,7 +804,7 @@ export function LeafletMap({
       return;
     }
 
-    if (!simulation?.bestPlan?.playback?.trips?.length || !simulation?.routeGeometry?.length) {
+    if (!playbackForMap?.trips?.length || !simulation?.routeGeometry?.length) {
       truckMarkersRef.current.forEach((marker) => marker.remove());
       truckMarkersRef.current.clear();
       return;
@@ -607,7 +812,7 @@ export function LeafletMap({
 
     const playbackTruckIds = [
       ...new Set(
-        (simulation.bestPlan.playback.trips || [])
+        (playbackForMap.trips || [])
           .map((trip) => Number.parseInt(trip?.truckId, 10) || 0)
           .filter((truckId) => truckId > 0),
       ),
@@ -615,36 +820,28 @@ export function LeafletMap({
     const activeTruckIds = new Set();
 
     for (const truckId of playbackTruckIds) {
-      const status = getTruckStatus(simulation.bestPlan.playback, currentMinute, truckId);
+      const status = getTruckStatus(playbackForMap, currentMinute, truckId);
       const roadHoldState = getTruckRoadHoldState(
-        simulation.bestPlan.playback,
+        playbackForMap,
         currentMinute,
         truckId,
         executionAssignments,
       );
       const delayState = getTruckDelayState(
-        simulation.bestPlan.playback,
+        playbackForMap,
         delayMinute,
         truckId,
         executionAssignments,
       );
-      if (!shouldShowTruckMarker(status) && !roadHoldState.holdOutbound && !roadHoldState.holdReturn) {
-        const hiddenMarker = truckMarkersRef.current.get(truckId);
-        if (hiddenMarker) {
-          hiddenMarker.remove();
-          truckMarkersRef.current.delete(truckId);
-        }
-        continue;
-      }
 
       const position = getTruckPosition(
-        simulation.bestPlan.playback,
+        playbackForMap,
         simulation.routeGeometry,
         currentMinute,
         truckId,
         executionAssignments,
       );
-      if (!position) {
+      if (!isValidMapPoint(position)) {
         continue;
       }
 
@@ -685,7 +882,7 @@ export function LeafletMap({
         truckMarkersRef.current.delete(truckId);
       }
     });
-  }, [simulation, currentMinute, delayMinute, executionAssignments, onRigFocusChange, onTruckFocusChange]);
+  }, [simulation, playbackForMap, currentMinute, delayMinute, executionAssignments, onRigFocusChange, onTruckFocusChange]);
 
   function handleUseMyLocation(event) {
     event.stopPropagation();

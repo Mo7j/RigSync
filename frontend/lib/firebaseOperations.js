@@ -247,21 +247,6 @@ export async function createFirebaseUserAccount({ email, password, profile }) {
   }
 }
 
-export async function ensureSeedUsers(users = []) {
-  for (const user of users) {
-    await upsertUserProfile({
-      id: user.id,
-      role: user.role,
-      name: user.name,
-      email: user.email,
-      managerId: user.managerId || null,
-      teamForemanIds: user.teamForemanIds || [],
-      assignedRig: user.assignedRig || null,
-      active: true,
-    });
-  }
-}
-
 export function subscribeManagerMoves(managerId, callback) {
   if (!managerId) {
     callback([]);
@@ -272,6 +257,16 @@ export function subscribeManagerMoves(managerId, callback) {
   return onSnapshot(ref, (snapshot) => {
     callback(snapshot.docs.map(normalizeDocSnapshot).filter(Boolean).map(deserializeMovePayload));
   });
+}
+
+export async function fetchManagerMoveDocs(managerId) {
+  if (!managerId) {
+    return [];
+  }
+
+  const ref = query(collection(firebaseDb, FIRESTORE_COLLECTIONS.moves), where("managerId", "==", managerId));
+  const snapshot = await getDocs(ref);
+  return snapshot.docs.map(normalizeDocSnapshot).filter(Boolean).map(deserializeMovePayload);
 }
 
 export async function fetchMoveDoc(moveId) {

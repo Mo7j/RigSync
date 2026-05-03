@@ -400,6 +400,10 @@ function captureHighlightMaterials(root) {
   return materials;
 }
 
+function captureHighlightMaterialsFromMeshes(meshes) {
+  return (meshes || []).flatMap((mesh) => captureHighlightMaterials(mesh));
+}
+
 function applyHighlightState(capturedMaterials, color, strength = 0, options = {}) {
   const targetColor = new THREE.Color(color);
   const hoverBaseColor = new THREE.Color(options.hoverBaseColor ?? 0x6a6553);
@@ -429,10 +433,10 @@ function applyHighlightState(capturedMaterials, color, strength = 0, options = {
         material.emissive.copy(original.emissive).lerp(targetColor, Math.min(0.48, strength * emissiveMixScale));
         material.emissiveIntensity = original.emissiveIntensity + (strength * 0.18);
       }
-      if ("opacity" in material && material.transparent && original) {
+      if ("opacity" in material && material.transparent && original && strength > 0) {
         material.opacity = isLine
-          ? Math.max(original.opacity, 0.48 + (strength * 0.18))
-          : Math.max(original.opacity, 0.9 + (strength * 0.04));
+          ? Math.max(material.opacity ?? 0, 0.48 + (strength * 0.18))
+          : Math.max(material.opacity ?? 0, 0.9 + (strength * 0.04));
       }
       if (isLine) {
         material.transparent = true;
@@ -466,6 +470,21 @@ function collectStatusMeshes(root) {
   });
 }
 
+function buildRigComponentBuckets(meshes, bucketCount = 6) {
+  const sortedMeshes = [...(meshes || [])];
+  const totalBuckets = Math.max(1, bucketCount);
+  return Array.from({ length: totalBuckets }, (_, index) => {
+    const start = Math.floor((index * sortedMeshes.length) / totalBuckets);
+    const end = Math.floor(((index + 1) * sortedMeshes.length) / totalBuckets);
+    const bucketMeshes = sortedMeshes.slice(start, Math.max(end, start + 1));
+    return {
+      index,
+      meshes: bucketMeshes,
+      capturedMaterials: captureMeshMaterials(bucketMeshes),
+    };
+  }).filter((bucket) => bucket.meshes.length > 0);
+}
+
 function captureMeshMaterials(meshes) {
   return meshes.map((mesh) => {
     const materials = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
@@ -475,8 +494,26 @@ function captureMeshMaterials(meshes) {
         color: material.color ? material.color.clone() : null,
         emissive: "emissive" in material && material.emissive ? material.emissive.clone() : null,
         emissiveIntensity: material.emissiveIntensity || 0,
+        opacity: "opacity" in material ? material.opacity ?? 1 : 1,
+        transparent: Boolean(material.transparent),
       })),
     };
+  });
+}
+
+function applyRigPartOpacity(capturedMaterials, opacityRatio) {
+  const clampedOpacity = Math.max(0, Math.min(1, Number(opacityRatio) || 0));
+  capturedMaterials.forEach(({ mesh, materials }) => {
+    const materialList = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+    materialList.forEach((material, materialIndex) => {
+      const original = materials[materialIndex];
+      if (!material || !("opacity" in material)) {
+        return;
+      }
+      material.transparent = true;
+      material.opacity = Math.max(0, Math.min(original?.opacity ?? 1, clampedOpacity));
+      material.depthWrite = clampedOpacity > 0.02;
+    });
   });
 }
 
@@ -2266,17 +2303,22 @@ function buildRouteTooltip(routeInfo) {
           startAsset.rotation.y = Math.PI * 0.18;
           startAsset.position.copy(getRigBoardRigWorld(straightStartWorld.clone().setY(0), routeDirectionWorld, 24, 2.1));
           const statusMeshes = collectStatusMeshes(startAsset);
-          statusMeshes.forEach((mesh, index) => {
-            mesh.userData.rigComponent = {
+          const componentBuckets = buildRigComponentBuckets(statusMeshes, 6);
+          componentBuckets.forEach((bucket, index) => {
+            const highlightKey = `rig-source-component-${index}`;
+            const componentInfo = {
               side: "source",
               index,
-              totalComponents: statusMeshes.length,
-              name: mesh.name?.trim() || `Source Module ${index + 1}`,
+              totalComponents: componentBuckets.length,
+              name: `Source Part ${index + 1}`,
             };
-            mesh.userData.highlightKey = `rig-source-component-${index}`;
-            highlightTargets.set(mesh.userData.highlightKey, {
-              root: mesh,
-              capturedMaterials: captureHighlightMaterials(mesh),
+            bucket.meshes.forEach((mesh) => {
+              mesh.userData.rigComponent = componentInfo;
+              mesh.userData.highlightKey = highlightKey;
+            });
+            highlightTargets.set(highlightKey, {
+              root: bucket.meshes[0],
+              capturedMaterials: captureHighlightMaterialsFromMeshes(bucket.meshes),
               color: 0xfbbf24,
               kind: "rig-component",
               intensityFactor: 0.58,
@@ -2285,7 +2327,7 @@ function buildRouteTooltip(routeInfo) {
                 surfaceMixScale: 0.5,
                 emissiveMixScale: 0.5,
               },
-              baseScale: mesh.scale.clone(),
+              baseScale: bucket.meshes[0].scale.clone(),
             });
           });
           startAsset.userData.rigInfo = {
@@ -2295,6 +2337,7 @@ function buildRouteTooltip(routeInfo) {
           rigVisualStateRef.current.source = {
             meshes: statusMeshes,
             capturedMaterials: captureMeshMaterials(statusMeshes),
+            componentBuckets,
           };
         }
         startAsset.userData.highlightKey = "rig-source";
@@ -2361,17 +2404,22 @@ function buildRouteTooltip(routeInfo) {
           endAsset.rotation.y = -Math.PI * 0.12;
           endAsset.position.copy(getRigBoardRigWorld(straightEndWorld.clone().setY(0), routeDirectionWorld.clone().multiplyScalar(-1), 28, 2.3));
           const statusMeshes = collectStatusMeshes(endAsset);
-          statusMeshes.forEach((mesh, index) => {
-            mesh.userData.rigComponent = {
+          const componentBuckets = buildRigComponentBuckets(statusMeshes, 6);
+          componentBuckets.forEach((bucket, index) => {
+            const highlightKey = `rig-destination-component-${index}`;
+            const componentInfo = {
               side: "destination",
               index,
-              totalComponents: statusMeshes.length,
-              name: mesh.name?.trim() || `Destination Module ${index + 1}`,
+              totalComponents: componentBuckets.length,
+              name: `Destination Part ${index + 1}`,
             };
-            mesh.userData.highlightKey = `rig-destination-component-${index}`;
-            highlightTargets.set(mesh.userData.highlightKey, {
-              root: mesh,
-              capturedMaterials: captureHighlightMaterials(mesh),
+            bucket.meshes.forEach((mesh) => {
+              mesh.userData.rigComponent = componentInfo;
+              mesh.userData.highlightKey = highlightKey;
+            });
+            highlightTargets.set(highlightKey, {
+              root: bucket.meshes[0],
+              capturedMaterials: captureHighlightMaterialsFromMeshes(bucket.meshes),
               color: 0xfbbf24,
               kind: "rig-component",
               intensityFactor: 0.58,
@@ -2380,7 +2428,7 @@ function buildRouteTooltip(routeInfo) {
                 surfaceMixScale: 0.5,
                 emissiveMixScale: 0.5,
               },
-              baseScale: mesh.scale.clone(),
+              baseScale: bucket.meshes[0].scale.clone(),
             });
           });
           endAsset.userData.rigInfo = {
@@ -2390,6 +2438,7 @@ function buildRouteTooltip(routeInfo) {
           rigVisualStateRef.current.destination = {
             meshes: statusMeshes,
             capturedMaterials: captureMeshMaterials(statusMeshes),
+            componentBuckets,
           };
         }
         endAsset.userData.highlightKey = "rig-destination";
@@ -2720,6 +2769,15 @@ function buildRouteTooltip(routeInfo) {
           gradientStops: [0x23282e, 0x2b3138, 0x3a4047],
           emissiveStops: [0x080b0e, 0x11161b, 0x1a1f24],
         });
+        (sourceState.componentBuckets || []).forEach((bucket, index, buckets) => {
+          const totalComponents = Math.max(buckets.length || 1, 1);
+          const startLoadIndex = Math.floor((index * totalTrips) / totalComponents);
+          const endLoadIndex = Math.floor(((index + 1) * totalTrips) / totalComponents);
+          const assignedLoads = Math.max(endLoadIndex - startLoadIndex, totalTrips > 0 ? 1 : 0);
+          const completedWithin = Math.max(0, Math.min(assignedLoads, shiftedCount - startLoadIndex));
+          const progress = assignedLoads > 0 ? (completedWithin / assignedLoads) : 0;
+          applyRigPartOpacity(bucket.capturedMaterials, 1 - progress);
+        });
       }
 
       const destinationState = rigVisualStateRef.current.destination;
@@ -2741,6 +2799,15 @@ function buildRouteTooltip(routeInfo) {
           },
           gradientStops: [0x23282e, 0x2b3138, 0x3a4047],
           emissiveStops: [0x080b0e, 0x11161b, 0x1a1f24],
+        });
+        (destinationState.componentBuckets || []).forEach((bucket, index, buckets) => {
+          const totalComponents = Math.max(buckets.length || 1, 1);
+          const startLoadIndex = Math.floor((index * totalTrips) / totalComponents);
+          const endLoadIndex = Math.floor(((index + 1) * totalTrips) / totalComponents);
+          const assignedLoads = Math.max(endLoadIndex - startLoadIndex, totalTrips > 0 ? 1 : 0);
+          const completedWithin = Math.max(0, Math.min(assignedLoads, riggedCount - startLoadIndex));
+          const progress = assignedLoads > 0 ? (completedWithin / assignedLoads) : 0;
+          applyRigPartOpacity(bucket.capturedMaterials, progress);
         });
       }
 
@@ -2802,11 +2869,11 @@ function buildRouteTooltip(routeInfo) {
         const delayState = getTruckDelayState(playback, delayMinuteRef.current, truckId, executionAssignmentsRef.current);
         const holdingAtDestinationOnRoad = roadHoldState.holdOutbound;
         const holdingAtSourceOnRoad = roadHoldState.holdReturn;
-        const returnStartedConfirmed = roadHoldState.returnStartedConfirmed;
         const parkedAtDestination = executionTruckState.phase === "parkedDestination";
         const parkedAtSource = executionTruckState.phase === "parkedSource";
         const movingOutbound = executionTruckState.phase === "movingOutbound";
         const movingReturn = executionTruckState.phase === "movingReturn";
+        const returnStartedConfirmed = roadHoldState.returnStartedConfirmed || movingReturn || holdingAtSourceOnRoad;
 
         if (parkedAtSource) {
           currentWorld = sourceSiteParking.position.clone();

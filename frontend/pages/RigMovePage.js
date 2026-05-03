@@ -7,7 +7,7 @@ import { Field, TextInput } from "../components/ui/Field.js";
 import { Modal } from "../components/ui/Modal.js";
 import { formatLocationLabel, formatMinutes } from "../lib/format.js";
 import { translate } from "../lib/language.js";
-import { buildScenarioPlans } from "../features/rigMoves/simulation.js";
+import { buildScenarioPlans, fallbackRouteData } from "../features/rigMoves/simulation.js";
 import { buildOperatingSnapshot, buildStartupTransferSchedule } from "../features/rigMoves/operations.js";
 import { persistMoveSession } from "../features/rigMoves/storage.js";
 
@@ -901,11 +901,46 @@ function getPlannerTaskTypeCode(task) {
   return task?.sourceKind === "startup" ? "RU_SU" : "RU";
 }
 
+function getPlannerTaskPhaseLabel(task) {
+  if (task?.activityLabel) {
+    return String(task.activityLabel);
+  }
+  if (task?.phase === "rig_down") {
+    return "Rig Down";
+  }
+  if (task?.phase === "pickup_load") {
+    return "Pickup Load";
+  }
+  if (task?.phase === "haul" || task?.phase === "move") {
+    return "Rig Move";
+  }
+  if (task?.phase === "unload_drop") {
+    return "Unload Drop";
+  }
+  if (task?.phase === "rig_up") {
+    return task?.sourceKind === "startup" ? "Support Rig Up" : "Rig Up";
+  }
+  return String(task?.phase || "Task")
+    .replace(/_/g, " ")
+    .replace(/\b\w/g, (character) => character.toUpperCase());
+}
+
+function getPlannerTaskPhaseGroup(task) {
+  if (task?.phase === "rig_down") {
+    return "rigDown";
+  }
+  if (task?.phase === "pickup_load" || task?.phase === "haul" || task?.phase === "move" || task?.phase === "unload_drop") {
+    return "move";
+  }
+  return "rigUp";
+}
+
 function getPlaybackTasks(playback) {
   const directTasks = playback?.tasks || [];
   if (directTasks.length) {
     return directTasks.map((task) => ({
       ...task,
+      phaseCode: task.phaseCode || getPlannerTaskTypeCode(task),
       predecessorIds: [...(task.criticalPredecessorIds || task.predecessorIds || [])],
       earliestStart: task.earliestStart ?? task.startMinute ?? 0,
       earliestFinish: task.earliestFinish ?? task.endMinute ?? 0,
@@ -938,6 +973,7 @@ function getPlaybackTasks(playback) {
         loadCode,
         description,
         phase: "rig_down",
+        phaseCode: "RD",
         predecessorIds: [],
         startMinute: rigDownStart,
         endMinute: rigDownFinish,
@@ -954,6 +990,7 @@ function getPlaybackTasks(playback) {
         loadCode,
         description,
         phase: "pickup_load",
+        phaseCode: "RM",
         predecessorIds: [`${trip.loadId}:rig_down`],
         startMinute: pickupLoadStart,
         endMinute: pickupLoadFinish,
@@ -970,6 +1007,7 @@ function getPlaybackTasks(playback) {
         loadCode,
         description,
         phase: "haul",
+        phaseCode: "RM",
         predecessorIds: [`${trip.loadId}:pickup_load`],
         startMinute: moveStart,
         endMinute: arrivalAtDestination,
@@ -986,6 +1024,7 @@ function getPlaybackTasks(playback) {
         loadCode,
         description,
         phase: "unload_drop",
+        phaseCode: "RM",
         predecessorIds: [`${trip.loadId}:haul`],
         startMinute: unloadDropStart,
         endMinute: unloadDropFinish,
@@ -1002,6 +1041,7 @@ function getPlaybackTasks(playback) {
         loadCode,
         description,
         phase: "rig_up",
+        phaseCode: "RU",
         predecessorIds: [`${trip.loadId}:unload_drop`],
         startMinute: rigUpStart,
         endMinute: rigUpFinish,
@@ -1014,6 +1054,98 @@ function getPlaybackTasks(playback) {
       },
     ];
   });
+}
+
+function getPlannerTimelineTasks(playback) {
+  return getPlaybackTasks(playback)
+    .filter((task) => task.phase !== "start" && task.phase !== "finish")
+    .map((task) => ({
+      ...task,
+      phaseCode: task.phaseCode || getPlannerTaskTypeCode(task),
+      loadCode: task.loadCode || `#${task.loadId}`,
+      description: task.description || getPlannerTaskPhaseLabel(task),
+      sourceKind: task.sourceKind || "rig",
+      critical: Boolean(task.critical || task.isCritical),
+    }));
+}
+
+function buildDayShiftSegments(startMinute, endMinute) {
+  const safeStart = Math.max(0, Number(startMinute) || 0);
+  const safeEnd = Math.max(safeStart, Number(endMinute) || 0);
+  const totalDuration = safeEnd - safeStart;
+  if (totalDuration <= 0) {
+    return [];
+  }
+
+  const segments = [];
+  let candidate = safeStart;
+  let remaining = totalDuration;
+
+  while (remaining > 0) {
+    const dayIndex = Math.floor(candidate / (24 * 60));
+    const windowStart = (dayIndex * 24 * 60) + (6 * 60);
+    const windowEnd = (dayIndex * 24 * 60) + (18 * 60);
+
+    if (candidate < windowStart) {
+      candidate = windowStart;
+      continue;
+    }
+    if (candidate >= windowEnd) {
+      candidate = windowStart + (24 * 60);
+      continue;
+    }
+
+    const workedMinutes = Math.min(remaining, windowEnd - candidate);
+    const segmentEnd = candidate + workedMinutes;
+    segments.push({
+      startMinute: candidate,
+      endMinute: segmentEnd,
+    });
+    remaining -= workedMinutes;
+    candidate = remaining > 0 ? windowStart + (24 * 60) : segmentEnd;
+  }
+
+  return segments;
+}
+
+function getTaskWorkSegments(task) {
+  const shouldForceDayShift =
+    Boolean(task?.isCritical || task?.critical) &&
+    (task?.phaseCode === "RD" || task?.phaseCode === "RU" || task?.phase === "rig_down" || task?.phase === "rig_up");
+  const rawSegments = Array.isArray(task?.workSegments) ? task.workSegments : [];
+  const normalizedSegments = rawSegments
+    .map((segment, index) => ({
+      key: `${task.id || task.loadId || "task"}-segment-${index}`,
+      startMinute: segment?.startMinute ?? task?.startMinute ?? 0,
+      endMinute: segment?.endMinute ?? task?.endMinute ?? 0,
+    }))
+    .filter((segment) => (segment.endMinute ?? 0) > (segment.startMinute ?? 0));
+
+  if (normalizedSegments.length) {
+    return shouldForceDayShift
+      ? buildDayShiftSegments(
+          normalizedSegments[0].startMinute,
+          normalizedSegments[normalizedSegments.length - 1].endMinute,
+        ).map((segment, index) => ({
+          key: `${task.id || task.loadId || "task"}-segment-${index}`,
+          ...segment,
+        }))
+      : normalizedSegments;
+  }
+
+  const fallbackSegments = shouldForceDayShift
+    ? buildDayShiftSegments(task?.startMinute ?? 0, task?.endMinute ?? 0)
+    : [{
+        startMinute: task?.startMinute ?? 0,
+        endMinute: task?.endMinute ?? 0,
+      }];
+
+  return fallbackSegments
+    .map((segment, index) => ({
+      key: `${task?.id || task?.loadId || "task"}-segment-${index}`,
+      ...segment,
+    }))
+    .filter((segment) => (segment.endMinute ?? 0) > (segment.startMinute ?? 0));
 }
 
 function getEffectiveCriticalTasks(playback) {
@@ -1552,6 +1684,7 @@ function buildScenarioSupportRouteSchedule(playback, fallbackDestinationLabel = 
           destinationLabel: trip.destinationLabel || fallbackDestinationLabel,
           truckLabel: trip.truckType || "Assigned truck",
           geometry: trip.routeGeometry || null,
+          pickupGeometry: trip.pickupRouteGeometry || null,
         });
       }
 
@@ -1559,6 +1692,81 @@ function buildScenarioSupportRouteSchedule(playback, fallbackDestinationLabel = 
     });
 
   return [...grouped.values()];
+}
+
+function attachSupportRouteSiteGeometry(routes = [], startPoint = null, endPoint = null, startLabel = "Source", endLabel = "Destination") {
+  return (routes || []).map((route) => {
+    if (!route?.sourcePoint) {
+      return route;
+    }
+
+    const sourceRouteData = startPoint
+      ? fallbackRouteData(startPoint, route.sourcePoint)
+      : null;
+    const pickupRouteData = endPoint
+      ? fallbackRouteData(endPoint, route.sourcePoint)
+      : null;
+    const loadedRouteData = endPoint
+      ? fallbackRouteData(route.sourcePoint, endPoint)
+      : null;
+
+    return {
+      ...route,
+      startLabel: route.startLabel || startLabel,
+      startPoint: route.startPoint || startPoint || null,
+      destinationLabel: route.destinationLabel || endLabel,
+      geometry: route.geometry?.length ? route.geometry : loadedRouteData?.geometry || [],
+      routeMinutes: route.routeMinutes || loadedRouteData?.minutes || null,
+      routeDistanceKm: route.routeDistanceKm || loadedRouteData?.distanceKm || null,
+      pickupGeometry: route.pickupGeometry?.length ? route.pickupGeometry : pickupRouteData?.geometry || [],
+      pickupRouteMinutes: route.pickupRouteMinutes || pickupRouteData?.minutes || null,
+      pickupRouteDistanceKm: route.pickupRouteDistanceKm || pickupRouteData?.distanceKm || null,
+      sourceGeometry: route.sourceGeometry?.length ? route.sourceGeometry : sourceRouteData?.geometry || [],
+      sourceRouteMinutes: route.sourceRouteMinutes || sourceRouteData?.minutes || null,
+      sourceRouteDistanceKm: route.sourceRouteDistanceKm || sourceRouteData?.distanceKm || null,
+    };
+  });
+}
+
+function buildReservationSupportRouteSchedule(sourceReservations = [], donorRigs = [], fallbackDestinationLabel = "Destination") {
+  if (!sourceReservations?.length || !donorRigs?.length) {
+    return [];
+  }
+
+  function normalizeKey(value) {
+    return String(value || "").trim().toLowerCase();
+  }
+
+  const donorLookup = new Map();
+  (donorRigs || []).forEach((rig) => {
+    if (!rig?.rigPoint) {
+      return;
+    }
+    donorLookup.set(normalizeKey(rig.rigId), rig);
+    donorLookup.set(normalizeKey(rig.rigLabel), rig);
+    donorLookup.set(normalizeKey(rig.moveName), rig);
+  });
+
+  return (sourceReservations || [])
+    .map((reservation, index) => {
+      const donorRig =
+        donorLookup.get(normalizeKey(reservation?.sourceId)) ||
+        donorLookup.get(normalizeKey(reservation?.sourceLabel)) ||
+        null;
+      if (!donorRig?.rigPoint) {
+        return null;
+      }
+      return {
+        key: `reservation-${reservation.sourceId || reservation.sourceLabel || index}-${reservation.familyId || reservation.loadCode || index}`,
+        loadLabel: reservation.description || reservation.loadCode || "Startup transfer",
+        quantity: Math.max(0, Number.parseInt(reservation.unitsReserved, 10) || 0),
+        sourceLabel: donorRig.rigLabel || reservation.sourceLabel || reservation.sourceId,
+        sourcePoint: donorRig.rigPoint,
+        destinationLabel: fallbackDestinationLabel,
+        truckLabel: "Assigned truck",
+      };
+    })
+    .filter((item) => item && item.quantity > 0);
 }
 
 function getRigSiteStats({ side, move, playback, currentMinute, totalMinutes }) {
@@ -1660,7 +1868,7 @@ function getCriticalLiftLoadIds(playback, logicalLoads = []) {
 }
 
 function buildTruckScheduleRows(playback, logicalLoads = []) {
-  const journeys = playback?.journeys?.length ? playback.journeys : (playback?.trips || []);
+  const plannerTasks = getPlannerTimelineTasks(playback);
   const totalMinutes = Math.max(playback?.totalMinutes || 1, 1);
   const criticalLoadIds = getCriticalLiftLoadIds(playback, logicalLoads);
 
@@ -1675,6 +1883,82 @@ function buildTruckScheduleRows(playback, logicalLoads = []) {
     return "scene-timeline-segment-truck-heavyhaul";
   }
 
+  const scheduledMoveTasks = plannerTasks.filter((task) => task.phaseCode === "RM" && task.truckId);
+  if (scheduledMoveTasks.length) {
+    const usedTruckIds = [...new Set(scheduledMoveTasks.map((task) => task.truckId).filter(Boolean))].sort((left, right) => String(left).localeCompare(String(right)));
+
+    return usedTruckIds.map((truckId) => {
+      let rowToneClass = "scene-timeline-segment-truck-heavyhaul";
+      const truckMoveTasks = scheduledMoveTasks.filter((task) => task.truckId === truckId);
+      const truckTypeLabel = truckMoveTasks[0]?.truckType || "Truck";
+      const rawTruckItems = truckMoveTasks
+        .map((task, taskIndex) => {
+          const toneClass = getTruckToneClass(task.truckType);
+          return {
+            key: `${truckId}-${task.id || taskIndex}-move`,
+            loadId: task.loadId,
+            loadCode: task.loadCode,
+            description: task.description,
+            startMinute: task.startMinute ?? 0,
+            endMinute: task.endMinute ?? 0,
+            left: (((task.startMinute ?? 0) / totalMinutes) * 100),
+            width: ((((task.endMinute ?? 0) - (task.startMinute ?? 0)) / totalMinutes) * 100),
+            toneClass,
+            label: task.loadCode || `#${task.loadId}`,
+            phase: task.phase,
+            activityLabel: task.activityLabel,
+            typeCode: task.phaseCode || "RM",
+            truckId: task.truckId,
+            truckType: task.truckType,
+            critical: Boolean(task.isCritical),
+            isCriticalLoad: criticalLoadIds.has(task.loadId) || Boolean(task.isCritical || task.isCriticalLift || task.is_critical),
+            isCriticalLift: false,
+          };
+        })
+        .filter((item) => item.endMinute > item.startMinute)
+        .sort((left, right) => left.startMinute - right.startMinute);
+
+      const laneEndMinutes = [];
+      let overlapConflictCount = 0;
+      const truckItems = rawTruckItems.map((item) => {
+        const nextLane = laneEndMinutes.findIndex((endMinute) => endMinute <= (item.startMinute ?? 0));
+        const stackLane = nextLane >= 0 ? nextLane : laneEndMinutes.length;
+        if (stackLane > 0) {
+          overlapConflictCount += 1;
+        }
+        laneEndMinutes[stackLane] = item.endMinute ?? item.startMinute ?? 0;
+        return {
+          ...item,
+          stackLane,
+          overlapConflict: stackLane > 0,
+        };
+      });
+
+      if (truckItems[0]?.toneClass) {
+        rowToneClass = truckItems[0].toneClass;
+      }
+
+      return {
+        key: `truck-${truckId}`,
+        truckId,
+        label: String(truckId),
+        toneClass: rowToneClass,
+        subLabel: overlapConflictCount
+          ? `${truckTypeLabel} | planner conflict: ${overlapConflictCount + 1} overlapping move segments`
+          : `${truckTypeLabel} | ${truckItems.length} move${truckItems.length === 1 ? "" : "s"}`,
+        items: truckItems,
+        laneCount: Math.max(laneEndMinutes.length, 1),
+        hasOverlapConflict: overlapConflictCount > 0,
+        loadCount: truckMoveTasks.length,
+      };
+    }).sort((left, right) => {
+      const leftStart = left.items[0]?.startMinute ?? Number.MAX_SAFE_INTEGER;
+      const rightStart = right.items[0]?.startMinute ?? Number.MAX_SAFE_INTEGER;
+      return leftStart - rightStart || String(left.truckId).localeCompare(String(right.truckId));
+    });
+  }
+
+  const journeys = playback?.journeys?.length ? playback.journeys : (playback?.trips || []);
   const usedTruckIds = [...new Set(journeys.map((trip) => trip.truckId).filter(Boolean))].sort((left, right) => String(left).localeCompare(String(right)));
 
   return usedTruckIds.map((truckId) => {
@@ -1697,7 +1981,8 @@ function buildTruckScheduleRows(playback, logicalLoads = []) {
             width: (((trip.arrivalAtDestination - (trip.moveStart ?? trip.pickupLoadFinish ?? trip.rigDownFinish)) / totalMinutes) * 100),
             toneClass,
             label: trip.description || getLoadDisplayLabel(trip),
-            isCriticalLift: criticalLoadIds.has(trip.loadIds?.[0] ?? trip.loadId),
+            isCriticalLoad: criticalLoadIds.has(trip.loadIds?.[0] ?? trip.loadId),
+            isCriticalLift: false,
           });
         }
 
@@ -1763,16 +2048,74 @@ function buildTruckScheduleRows(playback, logicalLoads = []) {
 }
 
 function buildLoadScheduleRows(playback, logicalLoads = []) {
-  const trips = playback?.trips || [];
+  const plannerTasks = getPlannerTimelineTasks(playback);
   const totalMinutes = Math.max(playback?.totalMinutes || 1, 1);
   const criticalLoadIds = getCriticalLiftLoadIds(playback, logicalLoads);
+  const hasPlannerTasks = plannerTasks.length > 0;
+
+  if (hasPlannerTasks) {
+    const rowsByLoad = new Map();
+
+    plannerTasks.forEach((task, index) => {
+      const loadId = task.loadId ?? `task-load-${index}`;
+      if (!rowsByLoad.has(loadId)) {
+        rowsByLoad.set(loadId, {
+          key: `load-row-${loadId}`,
+          loadId,
+          label: task.loadCode || `#${loadId}`,
+          subLabel: getSourceKindLabel(task.sourceKind),
+          sourceKind: task.sourceKind || "rig",
+          items: [],
+        });
+      }
+
+      const isCriticalLoad = criticalLoadIds.has(task.loadId) || Boolean(task.isCritical || task.isCriticalLift || task.is_critical);
+      getTaskWorkSegments(task).forEach((segment) => {
+        rowsByLoad.get(loadId).items.push({
+          key: `${task.id || `${loadId}-${index}`}-${segment.key}`,
+          loadId: task.loadId,
+          loadCode: task.loadCode || `#${loadId}`,
+          description: task.description || getPlannerTaskPhaseLabel(task),
+          startMinute: segment.startMinute,
+          endMinute: segment.endMinute,
+          left: ((segment.startMinute / totalMinutes) * 100),
+          width: (((segment.endMinute - segment.startMinute) / totalMinutes) * 100),
+          toneClass: getTaskToneClass(task),
+          label: task.loadCode || `#${loadId}`,
+          typeCode: getPlannerTaskTypeCode(task),
+          phase: task.phase,
+          activityLabel: task.activityLabel,
+          sourceKind: task.sourceKind || "rig",
+          critical: Boolean(task.isCritical),
+          isCriticalLoad,
+          isCriticalLift: task.phase === "rig_down" || task.phase === "rig_up" ? isCriticalLoad : false,
+        });
+      });
+    });
+
+    return [...rowsByLoad.values()]
+      .map((row) => ({
+        ...row,
+        items: row.items
+          .filter((item) => (item.endMinute ?? 0) > (item.startMinute ?? 0))
+          .sort((left, right) => left.startMinute - right.startMinute || left.endMinute - right.endMinute),
+      }))
+      .filter((row) => row.items.length > 0)
+      .sort((left, right) => {
+        const leftStart = left.items[0]?.startMinute ?? Number.MAX_SAFE_INTEGER;
+        const rightStart = right.items[0]?.startMinute ?? Number.MAX_SAFE_INTEGER;
+        return leftStart - rightStart || String(left.label).localeCompare(String(right.label));
+      });
+  }
+
+  const trips = playback?.trips || [];
 
   return trips
     .map((trip, index) => {
       const items = [];
       const sourceKind = trip.sourceKind || "rig";
       const loadLabel = getLoadDisplayLabel(trip) || `Load ${index + 1}`;
-      const isCriticalLift = criticalLoadIds.has(trip.loadId) || Boolean(trip.isCriticalLift || trip.is_critical);
+      const isCriticalLoad = criticalLoadIds.has(trip.loadId) || Boolean(trip.isCriticalLift || trip.is_critical);
 
       if ((trip.rigDownFinish ?? 0) > (trip.rigDownStart ?? trip.loadStart ?? 0)) {
         items.push({
@@ -1785,7 +2128,8 @@ function buildLoadScheduleRows(playback, logicalLoads = []) {
           width: (((trip.rigDownFinish || 0) - (trip.rigDownStart ?? trip.loadStart ?? 0)) / totalMinutes) * 100,
           toneClass: "scene-timeline-segment-down",
           label: "RD",
-          isCriticalLift,
+          isCriticalLoad,
+          isCriticalLift: isCriticalLoad,
         });
       }
 
@@ -1800,7 +2144,8 @@ function buildLoadScheduleRows(playback, logicalLoads = []) {
           width: (((trip.arrivalAtDestination || 0) - (trip.moveStart ?? trip.pickupLoadFinish ?? trip.rigDownFinish ?? 0)) / totalMinutes) * 100,
           toneClass: "scene-timeline-segment-move",
           label: "RM",
-          isCriticalLift,
+          isCriticalLoad,
+          isCriticalLift: false,
         });
       }
 
@@ -1815,7 +2160,8 @@ function buildLoadScheduleRows(playback, logicalLoads = []) {
           width: (((trip.rigUpFinish || 0) - (trip.rigUpStart ?? trip.arrivalAtDestination ?? 0)) / totalMinutes) * 100,
           toneClass: "scene-timeline-segment-up",
           label: "RU",
-          isCriticalLift,
+          isCriticalLoad,
+          isCriticalLift: isCriticalLoad,
         });
       }
 
@@ -2082,6 +2428,36 @@ function normalizeScenePlayback(playback) {
     return playback;
   }
 
+  function normalizeTripShape(trip) {
+    const moveStart = Number(trip?.moveStart ?? trip?.dispatchStart ?? trip?.arrivalAtDestination ?? 0) || 0;
+    const arrivalAtDestination = Number(trip?.arrivalAtDestination ?? trip?.moveFinish ?? moveStart) || moveStart;
+    const rigDownStart = Number(trip?.rigDownStart ?? trip?.loadStart ?? moveStart) || moveStart;
+    const rigDownFinish = Number(trip?.rigDownFinish ?? trip?.pickupLoadFinish ?? moveStart) || moveStart;
+    const rigUpStart = Number(trip?.rigUpStart ?? trip?.unloadDropFinish ?? arrivalAtDestination) || arrivalAtDestination;
+    const rigUpFinish = Number(trip?.rigUpFinish ?? rigUpStart) || rigUpStart;
+    const returnStart = trip?.returnStart != null ? Number(trip.returnStart) : null;
+    const returnToSource = trip?.returnToSource != null ? Number(trip.returnToSource) : null;
+
+    return {
+      ...trip,
+      loadStart: Number(trip?.loadStart ?? rigDownStart) || rigDownStart,
+      dispatchStart: Number(trip?.dispatchStart ?? moveStart) || moveStart,
+      rigDownStart,
+      rigDownFinish,
+      pickupLoadStart: Number(trip?.pickupLoadStart ?? rigDownStart) || rigDownStart,
+      pickupLoadFinish: Number(trip?.pickupLoadFinish ?? rigDownFinish) || rigDownFinish,
+      moveStart,
+      moveFinish: Number(trip?.moveFinish ?? arrivalAtDestination) || arrivalAtDestination,
+      arrivalAtDestination,
+      unloadDropStart: Number(trip?.unloadDropStart ?? arrivalAtDestination) || arrivalAtDestination,
+      unloadDropFinish: Number(trip?.unloadDropFinish ?? arrivalAtDestination) || arrivalAtDestination,
+      rigUpStart,
+      rigUpFinish,
+      returnStart,
+      returnToSource,
+    };
+  }
+
   const truckIdMap = new Map();
   const normalizedTrips = playback.trips.map((trip) => {
     const rawTruckId = String(trip?.truckId ?? "").trim() || "truck-1";
@@ -2089,7 +2465,7 @@ function normalizeScenePlayback(playback) {
       truckIdMap.set(rawTruckId, truckIdMap.size + 1);
     }
     return {
-      ...trip,
+      ...normalizeTripShape(trip),
       truckId: truckIdMap.get(rawTruckId) || 1,
       originalTruckId: trip?.truckId ?? null,
     };
@@ -2101,7 +2477,7 @@ function normalizeScenePlayback(playback) {
       truckIdMap.set(rawTruckId, truckIdMap.size + 1);
     }
     return {
-      ...trip,
+      ...normalizeTripShape(trip),
       truckId: truckIdMap.get(rawTruckId) || 1,
       originalTruckId: trip?.truckId ?? null,
     };
@@ -2115,8 +2491,188 @@ function normalizeScenePlayback(playback) {
   };
 }
 
+function enrichPlaybackWithSupportRoutes(playback, supportRoutes = [], destinationPoint = null, startPoint = null) {
+  if (!playback?.trips?.length || !supportRoutes?.length || !destinationPoint) {
+    return playback;
+  }
+
+  function normalizeMatchText(value) {
+    return String(value || "")
+      .trim()
+      .toLowerCase()
+      .replace(/\s+/g, " ");
+  }
+
+  const supportGeometryByKey = new Map();
+  (supportRoutes || []).forEach((route) => {
+    if (!route?.sourcePoint) {
+      return;
+    }
+
+    const loadKey = normalizeMatchText(route.loadLabel);
+    const sourceKey = normalizeMatchText(route.sourceLabel);
+    const quantity = Math.max(1, Number.parseInt(route.quantity, 10) || 1);
+    const routeGeometry = route.geometry?.length ? route.geometry : fallbackRouteData(route.sourcePoint, destinationPoint).geometry;
+    const routeMinutes = route.pickupRouteMinutes || route.routeMinutes || fallbackRouteData(route.sourcePoint, destinationPoint).minutes;
+    const routeDistanceKm = route.routeDistanceKm || fallbackRouteData(route.sourcePoint, destinationPoint).distanceKm;
+    const payload = {
+      sourcePoint: route.sourcePoint,
+      sourceLabel: route.sourceLabel,
+      destinationLabel: route.destinationLabel,
+      routeGeometry,
+      routeMinutes,
+      routeDistanceKm,
+    };
+
+    const exactKey = `${sourceKey}::${loadKey}`;
+    if (!supportGeometryByKey.has(exactKey)) {
+      supportGeometryByKey.set(exactKey, []);
+    }
+    if (!supportGeometryByKey.has(sourceKey)) {
+      supportGeometryByKey.set(sourceKey, []);
+    }
+    for (let index = 0; index < quantity; index += 1) {
+      supportGeometryByKey.get(exactKey).push(payload);
+      supportGeometryByKey.get(sourceKey).push(payload);
+    }
+  });
+
+  const usedRouteCounts = new Map();
+  function takeRoute(sourceLabel, description) {
+    const sourceKey = normalizeMatchText(sourceLabel);
+    const descriptionKey = normalizeMatchText(description);
+    const allSourceOptions = [...supportGeometryByKey.keys()].filter((key) => key.startsWith(`${sourceKey}::`) || key === sourceKey);
+    const candidateKeys = [`${sourceKey}::${descriptionKey}`, sourceKey, ...allSourceOptions];
+
+    for (const key of candidateKeys) {
+      const options = supportGeometryByKey.get(key) || [];
+      const nextIndex = usedRouteCounts.get(key) || 0;
+      if (options[nextIndex]) {
+        usedRouteCounts.set(key, nextIndex + 1);
+        return options[nextIndex];
+      }
+    }
+
+    return null;
+  }
+
+  function pointsMatch(left, right) {
+      return Boolean(
+      left && right &&
+      Math.abs(Number(left.lat) - Number(right.lat)) < 0.00001 &&
+      Math.abs(Number(left.lng) - Number(right.lng)) < 0.00001,
+    );
+  }
+
+  function getTripSourcePoint(trip) {
+    if (trip?.sourcePoint?.lat != null && trip?.sourcePoint?.lng != null) {
+      return trip.sourcePoint;
+    }
+    if ((trip?.sourceKind || "rig") === "startup") {
+      return null;
+    }
+    return startPoint || null;
+  }
+
+  const tripsByTruck = new Map();
+  (playback.trips || []).forEach((trip) => {
+    const truckKey = String(trip?.truckId ?? "");
+    if (!tripsByTruck.has(truckKey)) {
+      tripsByTruck.set(truckKey, []);
+    }
+    tripsByTruck.get(truckKey).push(trip);
+  });
+
+  const enrichedTrips = [];
+  tripsByTruck.forEach((truckTrips) => {
+    const orderedTrips = [...truckTrips].sort(
+      (left, right) =>
+        (left.dispatchStart ?? left.moveStart ?? left.loadStart ?? 0) - (right.dispatchStart ?? right.moveStart ?? right.loadStart ?? 0) ||
+        (left.loadId ?? 0) - (right.loadId ?? 0),
+    );
+
+    orderedTrips.forEach((trip, index) => {
+      const matchedRoute = takeRoute(trip.sourceLabel, trip.description || trip.loadCode);
+      if (!matchedRoute?.sourcePoint) {
+        enrichedTrips.push(trip);
+        return;
+      }
+
+      const previousTrip = orderedTrips[index - 1] || null;
+      const previousTripEndedAtDestination = previousTrip && !Number.isFinite(Number(previousTrip?.returnToSource));
+      const pickupOriginPoint = previousTrip
+        ? (
+            previousTripEndedAtDestination
+              ? (destinationPoint || startPoint || matchedRoute.sourcePoint)
+              : (getTripSourcePoint(previousTrip) || startPoint || destinationPoint || matchedRoute.sourcePoint)
+          )
+        : (startPoint || destinationPoint || matchedRoute.sourcePoint);
+      const loadedRouteGeometry = trip.routeGeometry?.length ? trip.routeGeometry : matchedRoute.routeGeometry;
+      const loadedRouteMinutes = trip.routeMinutes || matchedRoute.routeMinutes;
+      const loadedRouteDistanceKm = trip.routeDistanceKm || matchedRoute.routeDistanceKm;
+      const pickupRouteData = trip.pickupRouteGeometry?.length
+        ? {
+            geometry: trip.pickupRouteGeometry,
+            minutes: trip.pickupRouteMinutes || 0,
+          }
+        : (
+            pointsMatch(pickupOriginPoint, destinationPoint)
+              ? {
+                  geometry: [...loadedRouteGeometry].reverse(),
+                  minutes: loadedRouteMinutes,
+                }
+              : fallbackRouteData(pickupOriginPoint, matchedRoute.sourcePoint)
+          );
+      const pickupRouteMinutes = Math.max(1, Number(pickupRouteData?.minutes) || loadedRouteMinutes || 1);
+      const moveStartMinute = Number(trip.moveStart ?? trip.pickupLoadFinish ?? trip.rigDownFinish ?? 0) || 0;
+      const dispatchStartMinute = Number(trip.dispatchStart ?? moveStartMinute) || moveStartMinute;
+      const effectiveDispatchStart = Math.min(dispatchStartMinute, Math.max(0, moveStartMinute - pickupRouteMinutes));
+
+      enrichedTrips.push({
+        ...trip,
+        sourceKind: trip.sourceKind || "startup",
+        sourcePoint: trip.sourcePoint || matchedRoute.sourcePoint,
+        sourceLabel: trip.sourceLabel || matchedRoute.sourceLabel,
+        destinationLabel: trip.destinationLabel || matchedRoute.destinationLabel,
+        dispatchStart: effectiveDispatchStart,
+        pickupRouteGeometry: pickupRouteData?.geometry?.length ? pickupRouteData.geometry : trip.pickupRouteGeometry,
+        pickupRouteMinutes: trip.pickupRouteMinutes || pickupRouteMinutes,
+        pickupLoadStart: trip.pickupLoadStart ?? moveStartMinute,
+        pickupLoadFinish: trip.pickupLoadFinish ?? moveStartMinute,
+        routeGeometry: loadedRouteGeometry,
+        routeMinutes: loadedRouteMinutes,
+        routeDistanceKm: loadedRouteDistanceKm,
+      });
+    });
+  });
+
+  const trips = enrichedTrips.sort(
+    (left, right) =>
+      (left.dispatchStart ?? left.moveStart ?? left.loadStart ?? 0) - (right.dispatchStart ?? right.moveStart ?? right.loadStart ?? 0) ||
+      String(left.truckId ?? "").localeCompare(String(right.truckId ?? "")) ||
+      String(left.loadId ?? "").localeCompare(String(right.loadId ?? "")),
+  );
+
+  return {
+    ...playback,
+    trips,
+    journeys: (playback.journeys || []).map((journey) => {
+      const journeyTrips = trips.filter((trip) => trip.journeyId === journey.id);
+      const representativeTrip = journeyTrips[0] || null;
+      return representativeTrip
+        ? {
+            ...journey,
+            routeGeometry: journey.routeGeometry?.length ? journey.routeGeometry : representativeTrip.routeGeometry,
+            routeMinutes: journey.routeMinutes || representativeTrip.routeMinutes,
+            routeDistanceKm: journey.routeDistanceKm || representativeTrip.routeDistanceKm,
+          }
+        : journey;
+    }),
+  };
+}
+
 function buildPhaseScheduleRows(playback, logicalLoads = []) {
-  const trips = playback?.trips || [];
+  const plannerTasks = getPlannerTimelineTasks(playback);
   const totalMinutes = Math.max(playback?.totalMinutes || 1, 1);
   const criticalLoadIds = getCriticalLiftLoadIds(playback, logicalLoads);
   const phaseBuckets = new Map([
@@ -2125,139 +2681,190 @@ function buildPhaseScheduleRows(playback, logicalLoads = []) {
     ["rigUp", []],
   ]);
 
-  trips.forEach((trip, index) => {
-    const loadLabel = getLoadDisplayLabel(trip);
-    const description = trip.description || `Load ${loadLabel}`;
-    const isCriticalLift = criticalLoadIds.has(trip.loadId) || Boolean(trip.isCriticalLift || trip.is_critical);
+  if (plannerTasks.length > 0) {
+    plannerTasks.forEach((task, index) => {
+      const phaseKey = getPlannerTaskPhaseGroup(task);
+      const loadLabel = task.loadCode || `#${task.loadId ?? index + 1}`;
+      const description = task.description || `Load ${loadLabel}`;
+      const isCriticalLoad = criticalLoadIds.has(task.loadId) || Boolean(task.isCritical || task.isCriticalLift || task.is_critical);
 
-    if ((trip.rigDownFinish ?? 0) > (trip.rigDownStart ?? trip.loadStart ?? 0)) {
-      phaseBuckets.get("rigDown").push({
-        key: `phase-rd-item-${trip.loadId}-${index}`,
-        loadId: trip.loadId,
-        description: `${description} rig down`,
-        startMinute: trip.rigDownStart ?? trip.loadStart ?? 0,
-        endMinute: trip.rigDownFinish ?? 0,
-        left: (((trip.rigDownStart ?? trip.loadStart ?? 0) / totalMinutes) * 100),
-        width: (((trip.rigDownFinish || 0) - (trip.rigDownStart ?? trip.loadStart ?? 0)) / totalMinutes) * 100,
-        toneClass: "scene-timeline-segment-down",
-        label: loadLabel,
-        typeCode: "RD",
-        subLabel: description,
-        isCriticalLift,
+      getTaskWorkSegments(task).forEach((segment) => {
+        phaseBuckets.get(phaseKey).push({
+          key: `phase-${phaseKey}-${task.id || `${task.loadId}-${index}`}-${segment.key}`,
+          loadId: task.loadId,
+          loadCode: loadLabel,
+          description,
+          startMinute: segment.startMinute,
+          endMinute: segment.endMinute,
+          left: ((segment.startMinute / totalMinutes) * 100),
+          width: (((segment.endMinute - segment.startMinute) / totalMinutes) * 100),
+          toneClass: getTaskToneClass(task),
+          label: loadLabel,
+          typeCode: getPlannerTaskTypeCode(task),
+          activityLabel: task.activityLabel,
+          phase: task.phase,
+          subLabel: description,
+          truckId: task.truckId,
+          truckType: task.truckType,
+          critical: Boolean(task.isCritical),
+          isCriticalLoad,
+          isCriticalLift: phaseKey === "rigDown" || phaseKey === "rigUp" ? isCriticalLoad : false,
+        });
       });
-    }
+    });
+  } else {
+    const trips = playback?.trips || [];
+    trips.forEach((trip, index) => {
+      const loadLabel = getLoadDisplayLabel(trip);
+      const description = trip.description || `Load ${loadLabel}`;
+      const isCriticalLoad = criticalLoadIds.has(trip.loadId) || Boolean(trip.isCriticalLift || trip.is_critical);
 
-    if ((trip.arrivalAtDestination ?? 0) > (trip.moveStart ?? trip.pickupLoadFinish ?? trip.rigDownFinish ?? 0)) {
-      phaseBuckets.get("move").push({
-        key: `phase-rm-item-${trip.loadId}-${index}`,
-        loadId: trip.loadId,
-        description: `${description} move`,
-        startMinute: trip.moveStart ?? trip.pickupLoadFinish ?? trip.rigDownFinish ?? 0,
-        endMinute: trip.arrivalAtDestination ?? 0,
-        left: (((trip.moveStart ?? trip.pickupLoadFinish ?? trip.rigDownFinish ?? 0) / totalMinutes) * 100),
-        width: (((trip.arrivalAtDestination || 0) - (trip.moveStart ?? trip.pickupLoadFinish ?? trip.rigDownFinish ?? 0)) / totalMinutes) * 100,
-        toneClass: "scene-timeline-segment-move",
-        label: loadLabel,
-        typeCode: "RM",
-        truckId: trip.truckId,
-        truckType: trip.truckType,
-        subLabel: trip.truckType || "Truck",
-        isCriticalLift,
-      });
-    }
+      if ((trip.rigDownFinish ?? 0) > (trip.rigDownStart ?? trip.loadStart ?? 0)) {
+        phaseBuckets.get("rigDown").push({
+          key: `phase-rd-item-${trip.loadId}-${index}`,
+          loadId: trip.loadId,
+          description: `${description} rig down`,
+          startMinute: trip.rigDownStart ?? trip.loadStart ?? 0,
+          endMinute: trip.rigDownFinish ?? 0,
+          left: (((trip.rigDownStart ?? trip.loadStart ?? 0) / totalMinutes) * 100),
+          width: (((trip.rigDownFinish || 0) - (trip.rigDownStart ?? trip.loadStart ?? 0)) / totalMinutes) * 100,
+          toneClass: "scene-timeline-segment-down",
+          label: loadLabel,
+          typeCode: "RD",
+          subLabel: description,
+          isCriticalLoad,
+          isCriticalLift: isCriticalLoad,
+        });
+      }
 
-    if ((trip.rigUpFinish ?? 0) > (trip.rigUpStart ?? trip.arrivalAtDestination ?? 0)) {
-      phaseBuckets.get("rigUp").push({
-        key: `phase-ru-item-${trip.loadId}-${index}`,
-        loadId: trip.loadId,
-        description: `${description} rig up`,
-        startMinute: trip.rigUpStart ?? trip.arrivalAtDestination ?? 0,
-        endMinute: trip.rigUpFinish ?? 0,
-        left: (((trip.rigUpStart ?? trip.arrivalAtDestination ?? 0) / totalMinutes) * 100),
-        width: (((trip.rigUpFinish || 0) - (trip.rigUpStart ?? trip.arrivalAtDestination ?? 0)) / totalMinutes) * 100,
-        toneClass: "scene-timeline-segment-up",
-        label: loadLabel,
-        typeCode: "RU",
-        subLabel: description,
-        isCriticalLift,
-      });
-    }
-  });
+      if ((trip.arrivalAtDestination ?? 0) > (trip.moveStart ?? trip.pickupLoadFinish ?? trip.rigDownFinish ?? 0)) {
+        phaseBuckets.get("move").push({
+          key: `phase-rm-item-${trip.loadId}-${index}`,
+          loadId: trip.loadId,
+          description: `${description} move`,
+          startMinute: trip.moveStart ?? trip.pickupLoadFinish ?? trip.rigDownFinish ?? 0,
+          endMinute: trip.arrivalAtDestination ?? 0,
+          left: (((trip.moveStart ?? trip.pickupLoadFinish ?? trip.rigDownFinish ?? 0) / totalMinutes) * 100),
+          width: (((trip.arrivalAtDestination || 0) - (trip.moveStart ?? trip.pickupLoadFinish ?? trip.rigDownFinish ?? 0)) / totalMinutes) * 100,
+          toneClass: "scene-timeline-segment-move",
+          label: loadLabel,
+          typeCode: "RM",
+          truckId: trip.truckId,
+          truckType: trip.truckType,
+          subLabel: trip.truckType || "Truck",
+          isCriticalLoad,
+          isCriticalLift: false,
+        });
+      }
+
+      if ((trip.rigUpFinish ?? 0) > (trip.rigUpStart ?? trip.arrivalAtDestination ?? 0)) {
+        phaseBuckets.get("rigUp").push({
+          key: `phase-ru-item-${trip.loadId}-${index}`,
+          loadId: trip.loadId,
+          description: `${description} rig up`,
+          startMinute: trip.rigUpStart ?? trip.arrivalAtDestination ?? 0,
+          endMinute: trip.rigUpFinish ?? 0,
+          left: (((trip.rigUpStart ?? trip.arrivalAtDestination ?? 0) / totalMinutes) * 100),
+          width: (((trip.rigUpFinish || 0) - (trip.rigUpStart ?? trip.arrivalAtDestination ?? 0)) / totalMinutes) * 100,
+          toneClass: "scene-timeline-segment-up",
+          label: loadLabel,
+          typeCode: "RU",
+          subLabel: description,
+          isCriticalLoad,
+          isCriticalLift: isCriticalLoad,
+        });
+      }
+    });
+  }
 
   const phaseLabels = {
     rigDown: "Rig Down",
     move: "Move",
     rigUp: "Rig Up",
   };
-  return ["rigDown", "move", "rigUp"].map((phaseKey) => {
+  const phaseRows = [];
+
+  ["rigDown", "rigUp"].forEach((phaseKey) => {
     const items = [...(phaseBuckets.get(phaseKey) || [])].sort((left, right) => {
       const leftStart = left.startMinute ?? Number.MAX_SAFE_INTEGER;
       const rightStart = right.startMinute ?? Number.MAX_SAFE_INTEGER;
       return leftStart - rightStart || String(left.label).localeCompare(String(right.label));
     });
-    let stackedItems = [];
-    let laneCount = 1;
-
-    if (phaseKey === "move") {
-      const truckLaneMap = new Map();
-      items.forEach((item) => {
-        const truckKey = `${item.truckType || "Truck"}::${item.truckId ?? "0"}`;
-        if (!truckLaneMap.has(truckKey)) {
-          truckLaneMap.set(truckKey, truckLaneMap.size);
-        }
-      });
-      stackedItems = items.map((item) => {
-        const truckKey = `${item.truckType || "Truck"}::${item.truckId ?? "0"}`;
-        return {
-          ...item,
-          stackLane: truckLaneMap.get(truckKey) || 0,
-        };
-      });
-      laneCount = Math.max(truckLaneMap.size, 1);
-    } else {
-      const laneEndMinutes = [0, 0, 0];
-      stackedItems = items.map((item) => {
-        const startMinute = item.startMinute ?? 0;
-        let nextLane = laneEndMinutes.findIndex((endMinute) => endMinute <= startMinute);
-        if (nextLane < 0) {
-          nextLane = 0;
-          for (let index = 1; index < laneEndMinutes.length; index += 1) {
-            if (laneEndMinutes[index] <= laneEndMinutes[nextLane]) {
-              nextLane = index;
-            }
+    const laneEndMinutes = [0, 0, 0];
+    const stackedItems = items.map((item) => {
+      const startMinute = item.startMinute ?? 0;
+      let nextLane = laneEndMinutes.findIndex((endMinute) => endMinute <= startMinute);
+      if (nextLane < 0) {
+        nextLane = 0;
+        for (let index = 1; index < laneEndMinutes.length; index += 1) {
+          if (laneEndMinutes[index] <= laneEndMinutes[nextLane]) {
+            nextLane = index;
           }
         }
-        laneEndMinutes[nextLane] = item.endMinute ?? startMinute;
-        return {
-          ...item,
-          stackLane: nextLane,
-        };
-      });
-      laneCount = 3;
-    }
+      }
+      laneEndMinutes[nextLane] = item.endMinute ?? startMinute;
+      return {
+        ...item,
+        stackLane: nextLane,
+      };
+    });
 
-    return {
+    phaseRows.push({
       key: `phase-row-${phaseKey}`,
       phaseKey,
       label: phaseLabels[phaseKey],
       subLabel: "",
       items: stackedItems,
-      laneCount,
-    };
+      laneCount: 3,
+    });
   });
+
+  const moveItems = [...(phaseBuckets.get("move") || [])].sort((left, right) => {
+    const leftTruck = `${left.truckType || "Truck"} ${left.truckId ?? ""}`.trim();
+    const rightTruck = `${right.truckType || "Truck"} ${right.truckId ?? ""}`.trim();
+    const leftStart = left.startMinute ?? Number.MAX_SAFE_INTEGER;
+    const rightStart = right.startMinute ?? Number.MAX_SAFE_INTEGER;
+    return leftTruck.localeCompare(rightTruck) || leftStart - rightStart || String(left.label).localeCompare(String(right.label));
+  });
+  const moveItemsByTruck = new Map();
+  moveItems.forEach((item) => {
+    const truckKey = `${item.truckType || "Truck"}::${item.truckId ?? "0"}`;
+    if (!moveItemsByTruck.has(truckKey)) {
+      moveItemsByTruck.set(truckKey, []);
+    }
+    moveItemsByTruck.get(truckKey).push({
+      ...item,
+      stackLane: 0,
+    });
+  });
+  [...moveItemsByTruck.entries()]
+    .sort((left, right) => left[0].localeCompare(right[0]))
+    .forEach(([truckKey, items], index) => {
+      const firstItem = items[0] || {};
+      phaseRows.splice(Math.min(1 + index, phaseRows.length), 0, {
+        key: `phase-row-move-${truckKey}`,
+        phaseKey: "move",
+        label: phaseLabels.move,
+        subLabel: `${firstItem.truckType || "Truck"} ${firstItem.truckId ?? ""}`.trim(),
+        items,
+        laneCount: 1,
+      });
+    });
+
+  return phaseRows;
 }
 
 function getTimelineBarLabel(rowType, row, trip) {
   if (rowType === "load") {
-    return `${row.label} ${trip.label || ""}`.trim();
+    return row.label || getLoadDisplayLabel(trip);
   }
   if (rowType === "truck") {
     return getLoadDisplayLabel(trip);
   }
   if (rowType === "phase") {
-    return `${trip.label || ""}${trip.subLabel ? ` | ${trip.subLabel}` : ""}`.trim();
+    return trip.label || getLoadDisplayLabel(trip);
   }
-  return trip.label || trip.description || row.label || "";
+  return getLoadDisplayLabel(trip) || trip.label || trip.description || row.label || "";
 }
 
 function getExecutionAssignmentStage(stageStatus = {}) {
@@ -2326,13 +2933,14 @@ function getExecutionStageTitle(stage) {
   return "Task";
 }
 
-function buildTimelineHoverCard(rowType, row, trip, startMinute, endMinute) {
+function buildTimelineHoverCard(rowType, row, trip, startMinute, endMinute, planningStartDate, planningStartTime) {
+  const timeRange = `${formatTimelineAbsoluteTime(startMinute, planningStartDate, planningStartTime)} -> ${formatTimelineAbsoluteTime(endMinute, planningStartDate, planningStartTime)}`;
   if (rowType === "phase") {
     return {
       title: row.label,
       lines: [
-        `${trip.label || ""}${trip.subLabel ? ` | ${trip.subLabel}` : ""}`.trim(),
-        `${formatTimelineWindowLabel(startMinute)} -> ${formatTimelineWindowLabel(endMinute)}`,
+        trip.subLabel || trip.label || "",
+        timeRange,
       ].filter(Boolean),
     };
   }
@@ -2342,7 +2950,7 @@ function buildTimelineHoverCard(rowType, row, trip, startMinute, endMinute) {
       title: row.label || getLoadDisplayLabel(trip),
       lines: [
         trip.description || row.subLabel || "Load segment",
-        `${trip.label || "Task"} | ${formatTimelineWindowLabel(startMinute)} -> ${formatTimelineWindowLabel(endMinute)}`,
+        `${getPlannerTaskPhaseLabel(trip)} | ${timeRange}`,
       ],
     };
   }
@@ -2353,7 +2961,7 @@ function buildTimelineHoverCard(rowType, row, trip, startMinute, endMinute) {
       lines: [
         `${trip.description || getLoadDisplayLabel(trip)} | ${row.subLabel || "Truck move"}`,
         trip.overlapConflict ? "Planner conflict: overlaps another move on the same truck" : null,
-        `${formatTimelineWindowLabel(startMinute)} -> ${formatTimelineWindowLabel(endMinute)}`,
+        timeRange,
       ].filter(Boolean),
     };
   }
@@ -2362,7 +2970,7 @@ function buildTimelineHoverCard(rowType, row, trip, startMinute, endMinute) {
     title: row.label || trip.label || "Timeline item",
     lines: [
       trip.description || trip.label || "",
-      `${trip.critical ? "Critical path | " : ""}${formatTimelineWindowLabel(startMinute)} -> ${formatTimelineWindowLabel(endMinute)}`,
+      `${trip.critical ? "Critical path | " : ""}${timeRange}`,
     ].filter(Boolean),
   };
 }
@@ -2865,10 +3473,11 @@ function FullScreenTimeline({
   windowMinutes = null,
   tickMinutes = null,
   cpOnly = false,
-  showRD = true,
-  showRM = true,
-  showRU = true,
+  showCriticalLoadsOnly = false,
   showFloatBar = true,
+  rowSearchQuery = "",
+  planningStartDate = null,
+  planningStartTime = "06:00",
   hideFixedColumn = false,
 }) {
   const headerScrollRef = useRef(null);
@@ -2886,17 +3495,38 @@ function FullScreenTimeline({
     if (!trip) {
       return false;
     }
-    if ((trip.typeCode === "RD" || trip.label === "RD") && !showRD) {
-      return false;
-    }
-    if ((trip.typeCode === "RM" || trip.label === "RM") && !showRM) {
-      return false;
-    }
-    if ((trip.typeCode === "RU" || trip.typeCode === "RU_SU" || trip.label === "RU") && !showRU) {
+    if (showCriticalLoadsOnly && !(trip.isCriticalLoad || trip.isCriticalLift || trip.is_critical || trip.critical)) {
       return false;
     }
     return true;
-  }, [showRD, showRM, showRU]);
+  }, [showCriticalLoadsOnly]);
+  const normalizedRowSearchQuery = String(rowSearchQuery || "").trim().toLowerCase();
+  const doesRowMatchSearch = useCallback((row) => {
+    if (!normalizedRowSearchQuery) {
+      return true;
+    }
+
+    const searchFields = [
+      row?.key,
+      row?.label,
+      row?.subLabel,
+      row?.truckType,
+      row?.truckId,
+      ...(row?.items || []).flatMap((item) => [
+        item?.key,
+        item?.label,
+        item?.subLabel,
+        item?.description,
+        item?.typeCode,
+        item?.truckType,
+        item?.truckId,
+        item?.loadCode,
+        item?.loadId,
+      ]),
+    ];
+
+    return searchFields.some((value) => String(value || "").toLowerCase().includes(normalizedRowSearchQuery));
+  }, [normalizedRowSearchQuery]);
   const rows = useMemo(() => {
     const baseRows =
       rowType === "phase"
@@ -2919,6 +3549,12 @@ function FullScreenTimeline({
         };
       })
       .filter((row) => {
+        if (!doesRowMatchSearch(row)) {
+          return false;
+        }
+        if (showCriticalLoadsOnly && !row.items?.length) {
+          return false;
+        }
         if (rowType === "phase") {
           return true;
         }
@@ -2934,22 +3570,24 @@ function FullScreenTimeline({
         return true;
       });
     return filteredRows;
-  }, [playback, logicalLoads, rowType, cpOnly, shouldShowTrip, visibleStartMinute, visibleEndMinute]);
+  }, [playback, logicalLoads, rowType, cpOnly, shouldShowTrip, visibleStartMinute, visibleEndMinute, doesRowMatchSearch, showCriticalLoadsOnly]);
   const tickStepMinutes = Math.max(60, tickMinutes || (visibleRangeMinutes <= 12 * 60 ? 2 * 60 : 4 * 60));
   const tickCount = Math.max(1, Math.ceil(visibleRangeMinutes / tickStepMinutes));
   const ticks = useMemo(
     () => Array.from({ length: tickCount + 1 }, (_, index) => {
       const minute = Math.min(visibleEndMinute, visibleStartMinute + (index * tickStepMinutes));
+      const align = index === 0 ? "start" : index === tickCount ? "end" : "center";
       return {
         key: `timeline-tick-${index}`,
         left: `${((minute - visibleStartMinute) / visibleRangeMinutes) * 100}%`,
-        label: formatTimelineWindowLabel(minute),
+        label: formatTimelineAbsoluteLabel(minute, planningStartDate, planningStartTime),
+        align,
       };
     }),
-    [tickCount, tickStepMinutes, visibleStartMinute, visibleEndMinute, visibleRangeMinutes],
+    [tickCount, tickStepMinutes, visibleStartMinute, visibleEndMinute, visibleRangeMinutes, planningStartDate, planningStartTime],
   );
   const currentX = `${((Math.min(Math.max(currentMinute, visibleStartMinute), visibleEndMinute) - visibleStartMinute) / visibleRangeMinutes) * 100}%`;
-  const pixelsPerTick = 112;
+  const pixelsPerTick = 84;
   const timelineWidth = Math.max(Math.round(tickCount * pixelsPerTick), 1);
 
   function handleHeaderScroll(event) {
@@ -3100,7 +3738,7 @@ function FullScreenTimeline({
       h(
         "div",
         { className: "scene-timeline-window-banner" },
-        h("strong", null, formatTimelineWindowRange(visibleStartMinute, visibleEndMinute)),
+        h("strong", null, formatTimelineAbsoluteRange(visibleStartMinute, visibleEndMinute, planningStartDate, planningStartTime)),
         h("span", null, visibleDurationMinutes === (12 * 60) ? "12-hour shift window" : "24-hour day window"),
       ),
       h(
@@ -3124,7 +3762,7 @@ function FullScreenTimeline({
                   "span",
                   {
                     key: tick.key,
-                    className: "scene-timeline-tick",
+                    className: `scene-timeline-tick${tick.align === "start" ? " is-start" : tick.align === "end" ? " is-end" : ""}`,
                     style: { left: tick.left },
                   },
                   tick.label,
@@ -3197,13 +3835,14 @@ function FullScreenTimeline({
                   : (((Math.min(tripEndMinute, visibleEndMinute) - Math.max(tripStartMinute, visibleStartMinute)) / visibleRangeMinutes) * 100);
               const tripWidthPx = (tripWidthPercent / 100) * timelineWidth;
               const tripSizeClass = tripWidthPx < 18 ? " is-micro" : tripWidthPx < 44 ? " is-compact" : "";
+              const shouldShowBarLabel = tripWidthPx >= 72;
               const visibleDuration = Math.max(0, Math.min(currentMinute, tripEndMinute) - Math.max(tripStartMinute, visibleStartMinute));
               const activeFillPercent = tripEndMinute > tripStartMinute
                 ? Math.max(0, Math.min(100, (visibleDuration / (tripEndMinute - tripStartMinute)) * 100))
                 : 0;
               const toneClass = trip.toneClass || row.toneClass || "scene-timeline-segment-truck-heavyhaul";
               const leftPercent = ((Math.max(tripStartMinute, visibleStartMinute) - visibleStartMinute) / visibleRangeMinutes) * 100;
-              const hoverCardData = buildTimelineHoverCard(rowType, row, trip, tripStartMinute, tripEndMinute);
+              const hoverCardData = buildTimelineHoverCard(rowType, row, trip, tripStartMinute, tripEndMinute, planningStartDate, planningStartTime);
               const barLabel = getTimelineBarLabel(rowType, row, trip);
 
               return [
@@ -3253,7 +3892,7 @@ function FullScreenTimeline({
                           width: `${activeFillPercent}%`,
                         },
                       }),
-                      !tripSizeClass
+                      shouldShowBarLabel && barLabel
                         ? h("span", { key: `${trip.key}-label`, className: "scene-timeline-trip-label" }, barLabel)
                         : null,
                     ],
@@ -3734,6 +4373,308 @@ function renderProjectSummaryDashboard({ model, radarModel }) {
   );
 }
 
+function DashboardDonutChart({ segments = [], centerValue, centerLabel }) {
+  const total = Math.max(segments.reduce((sum, item) => sum + Math.max(0, Number(item?.value) || 0), 0), 1);
+  let start = 0;
+  const gradientStops = segments.map((segment) => {
+    const share = (Math.max(0, Number(segment?.value) || 0) / total) * 100;
+    const stop = `${segment.color} ${start}% ${Math.min(100, start + share)}%`;
+    start += share;
+    return stop;
+  });
+
+  return h(
+    "div",
+    { className: "scene-analytics-donut-wrap" },
+    h(
+      "div",
+      {
+        className: "scene-analytics-donut",
+        style: {
+          background: `conic-gradient(${gradientStops.join(", ")})`,
+        },
+      },
+      h(
+        "div",
+        { className: "scene-analytics-donut-core" },
+        h("strong", null, centerValue),
+        h("span", null, centerLabel),
+      ),
+    ),
+    h(
+      "div",
+      { className: "scene-analytics-donut-legend" },
+      segments.map((segment) =>
+        h(
+          "div",
+          { key: segment.key, className: "scene-analytics-donut-legend-item" },
+          h("i", { style: { background: segment.color } }),
+          h("span", null, segment.label),
+          h("strong", null, segment.valueLabel || formatCurrency(segment.value)),
+        ),
+      ),
+    ),
+  );
+}
+
+function buildPhaseAnalyticsRows(playback) {
+  const phaseDefinitions = [
+    { key: "rig_down", label: "Rig Down", color: "#6fb3ff" },
+    { key: "haul", label: "Move", color: "#f0b34a" },
+    { key: "rig_up", label: "Rig Up", color: "#62c98a" },
+  ];
+  const totals = new Map(phaseDefinitions.map((item) => [item.key, { ...item, minutes: 0, criticalMinutes: 0, taskCount: 0 }]));
+
+  getPlaybackTasks(playback)
+    .filter((task) => task.phase !== "start" && task.phase !== "finish")
+    .forEach((task) => {
+      const phaseKey = task.phase === "pickup_load" || task.phase === "move" || task.phase === "unload_drop"
+        ? "haul"
+        : task.phase === "rig_down"
+          ? "rig_down"
+          : "rig_up";
+      const phase = totals.get(phaseKey);
+      if (!phase) {
+        return;
+      }
+
+      const duration = Math.max(0, (task.endMinute || 0) - (task.startMinute || 0));
+      phase.minutes += duration;
+      phase.taskCount += 1;
+      if (task.isCritical) {
+        phase.criticalMinutes += duration;
+      }
+    });
+
+  const rows = [...totals.values()];
+  const maxMinutes = Math.max(...rows.map((row) => row.minutes), 1);
+  return rows.map((row) => ({
+    ...row,
+    hoursLabel: `${formatHoursNumber(row.minutes, 1)}h`,
+    criticalShareLabel: `${Math.round((row.criticalMinutes / Math.max(row.minutes, 1)) * 100)}% critical`,
+    widthPercent: Math.max(8, Math.round((row.minutes / maxMinutes) * 100)),
+  }));
+}
+
+function buildDecisionInsightRows({
+  activityRows,
+  transportRows,
+  truckTripRows,
+  costBreakdownRows,
+  activePlanDashboard,
+  drillingReadinessPercent,
+}) {
+  const criticalActivities = activityRows.filter((row) => row.critical);
+  const longestCriticalTask = criticalActivities.reduce((best, row) => {
+    const duration = Number.parseFloat(row.durationHours) || 0;
+    const bestDuration = Number.parseFloat(best?.durationHours) || 0;
+    return duration > bestDuration ? row : best;
+  }, null);
+  const topTruck = (truckTripRows || [])[0] || null;
+  const topCostLane = (costBreakdownRows || []).slice().sort((left, right) => right.tripCost - left.tripCost)[0] || null;
+  const reserveFleet = Math.max(
+    0,
+    Math.max(0, Number(activePlanDashboard?.allocatedTruckCount) || 0) - Math.max(0, Number(activePlanDashboard?.usedTruckCount) || 0),
+  );
+
+  return [
+    {
+      key: "critical",
+      label: "Primary Bottleneck",
+      value: longestCriticalTask ? longestCriticalTask.description : "No critical activity",
+      meta: longestCriticalTask ? `${longestCriticalTask.durationHours}h on load ${longestCriticalTask.loadCode}` : "Critical path is clear",
+      tone: "red",
+    },
+    {
+      key: "truck",
+      label: "Most Loaded Truck",
+      value: topTruck ? `${normalizeTruckTypeLabel(topTruck.truckType)} ${topTruck.truckId}` : "No truck assignments",
+      meta: topTruck ? `${topTruck.loadCount} loads · ${topTruck.utilizationPercent}% utilization` : "Awaiting dispatch",
+      tone: "amber",
+    },
+    {
+      key: "cost",
+      label: "Highest Cost Lane",
+      value: topCostLane ? topCostLane.label : "No transport cost",
+      meta: topCostLane ? `${formatCurrency(topCostLane.tripCost)} across ${topCostLane.tripCount} trips` : "Awaiting trip model",
+      tone: "blue",
+    },
+    {
+      key: "reserve",
+      label: "Fleet Reserve",
+      value: `${reserveFleet} trucks`,
+      meta: `${transportRows.length} transport legs modeled · readiness ${drillingReadinessPercent}%`,
+      tone: reserveFleet === 0 ? "red" : "green",
+    },
+  ];
+}
+
+function getMinuteOfDay(totalMinutes) {
+  return ((Math.max(0, Math.round(Number(totalMinutes) || 0)) % 1440) + 1440) % 1440;
+}
+
+function isMorningShiftSegment(startMinute, endMinute) {
+  const start = getMinuteOfDay(startMinute);
+  const end = getMinuteOfDay(endMinute);
+  return start >= 360 && end <= 1080 && end >= start;
+}
+
+function buildTimelineComplianceModel(playback, logicalLoads = []) {
+  const tasks = getPlannerTimelineTasks(playback);
+  const criticalLoadIds = new Set(
+    (logicalLoads || [])
+      .filter((load) => load?.is_critical)
+      .map((load) => load.id),
+  );
+  const criticalRigTasks = tasks.filter((task) =>
+    (task.phase === "rig_down" || task.phase === "rig_up") &&
+    (Boolean(task.isCritical) || Boolean(task.load?.is_critical) || criticalLoadIds.has(task.loadId)),
+  );
+  const criticalShiftViolations = criticalRigTasks.filter((task) =>
+    getTaskWorkSegments(task).some((segment) => !isMorningShiftSegment(segment.startMinute, segment.endMinute)),
+  );
+  const rigSiteSegments = tasks
+    .filter((task) => task.phase === "rig_down" || task.phase === "rig_up")
+    .flatMap((task) =>
+      getTaskWorkSegments(task).map((segment) => ({
+        task,
+        startMinute: segment.startMinute,
+        endMinute: segment.endMinute,
+      })),
+    );
+  const concurrencyEvents = rigSiteSegments.flatMap((segment) => ([
+    { minute: segment.startMinute, type: "start", segment },
+    { minute: segment.endMinute, type: "end", segment },
+  ])).sort((left, right) =>
+    left.minute - right.minute ||
+    (left.type === "end" ? -1 : 1) - (right.type === "end" ? -1 : 1),
+  );
+  const activeSegmentKeys = new Set();
+  const concurrencyViolations = [];
+  let maxConcurrentRigWork = 0;
+
+  concurrencyEvents.forEach((event) => {
+    const segmentKey = `${event.segment.task.id}:${event.segment.startMinute}:${event.segment.endMinute}`;
+    if (event.type === "end") {
+      activeSegmentKeys.delete(segmentKey);
+      return;
+    }
+
+    activeSegmentKeys.add(segmentKey);
+    maxConcurrentRigWork = Math.max(maxConcurrentRigWork, activeSegmentKeys.size);
+    if (activeSegmentKeys.size > 3) {
+      concurrencyViolations.push({
+        minute: event.minute,
+        activeCount: activeSegmentKeys.size,
+      });
+    }
+  });
+
+  const journeyGroups = new Map();
+  (playback?.journeys || []).forEach((journey) => {
+    const key = String(journey?.truckId || "truck");
+    if (!journeyGroups.has(key)) {
+      journeyGroups.set(key, []);
+    }
+    journeyGroups.get(key).push(journey);
+  });
+
+  let truckOverlapCount = 0;
+  journeyGroups.forEach((journeys) => {
+    const ordered = journeys
+      .slice()
+      .sort((left, right) => (left.dispatchStart || 0) - (right.dispatchStart || 0));
+    for (let index = 1; index < ordered.length; index += 1) {
+      const previous = ordered[index - 1];
+      const current = ordered[index];
+      if ((current.dispatchStart || 0) < (previous.returnToSource || previous.arrivalAtDestination || 0)) {
+        truckOverlapCount += 1;
+      }
+    }
+  });
+
+  return {
+    criticalTaskCount: criticalRigTasks.length,
+    criticalShiftViolations,
+    maxConcurrentRigWork,
+    concurrencyViolations,
+    truckOverlapCount,
+    rows: [
+      {
+        key: "critical-shift",
+        label: "Critical rig up/down in morning shift only",
+        value: criticalShiftViolations.length ? "Violation" : "Compliant",
+        meta: criticalShiftViolations.length
+          ? `${criticalShiftViolations.length} critical tasks leave the 06:00-18:00 window`
+          : `${criticalRigTasks.length} critical rig tasks stay inside the 06:00-18:00 window`,
+        tone: criticalShiftViolations.length ? "red" : "green",
+      },
+      {
+        key: "concurrency",
+        label: "Rig up/down concurrency cap",
+        value: `${maxConcurrentRigWork}/3`,
+        meta: concurrencyViolations.length
+          ? `${concurrencyViolations.length} moments exceed the 3-task limit`
+          : "No rig up/down overlap exceeds 3 simultaneous tasks",
+        tone: concurrencyViolations.length ? "red" : "green",
+      },
+      {
+        key: "truck-conflicts",
+        label: "Truck timeline conflicts",
+        value: truckOverlapCount ? String(truckOverlapCount) : "0",
+        meta: truckOverlapCount
+          ? "Truck dispatch windows overlap and need replanning"
+          : "Truck dispatch windows are conflict-free",
+        tone: truckOverlapCount ? "red" : "green",
+      },
+    ],
+  };
+}
+
+function buildEconomicSignalRows(projectSummaryModel, activePlanDashboard, scenario) {
+  const scenarioRows = projectSummaryModel?.scenarioRows || [];
+  const selectedPlan = scenarioRows.find((item) => item.isSelected) || scenarioRows[0] || null;
+  const fastestPlan = scenarioRows.reduce((best, item) => (!best || item.totalMinutes < best.totalMinutes ? item : best), null);
+  const cheapestPlan = scenarioRows.reduce((best, item) => (!best || item.costEstimate < best.costEstimate ? item : best), null);
+  const baselineCost = Math.max(0, Number(scenario?.manualBaseline?.costEstimate) || 0);
+  const selectedCost = Math.max(0, Number(selectedPlan?.costEstimate) || Number(activePlanDashboard?.rawCostEstimate) || 0);
+  const selectedDays = Math.max(0, Number(selectedPlan?.totalMinutes) || Number(scenario?.totalMinutes) || 0) / (24 * 60);
+  const fastestDeltaDays = fastestPlan ? Math.max(0, selectedDays - (fastestPlan.totalMinutes / (24 * 60))) : 0;
+  const cheapestPremium = cheapestPlan && cheapestPlan.costEstimate > 0
+    ? Math.max(0, ((selectedCost - cheapestPlan.costEstimate) / cheapestPlan.costEstimate) * 100)
+    : 0;
+
+  return [
+    {
+      key: "duration",
+      label: "Selected plan duration",
+      value: `${selectedDays.toFixed(1)} days`,
+      meta: fastestDeltaDays > 0.1
+        ? `${fastestDeltaDays.toFixed(1)} days longer than ${fastestPlan?.name || "the fastest plan"}`
+        : "This is the shortest available plan",
+      tone: fastestDeltaDays > 0.1 ? "amber" : "green",
+    },
+    {
+      key: "cost-gap",
+      label: "Selected plan cost pressure",
+      value: formatCurrency(selectedCost),
+      meta: cheapestPremium > 0.1
+        ? `${formatPercentLabel(cheapestPremium)} above the cheapest option`
+        : "At or near the lowest available cost",
+      tone: cheapestPremium > 0.1 ? "amber" : "green",
+    },
+    {
+      key: "baseline",
+      label: "Manual baseline check",
+      value: baselineCost > 0 ? formatCurrency(baselineCost) : "N/A",
+      meta: baselineCost > 0
+        ? `Current plan delta ${formatCurrency(Math.abs(baselineCost - selectedCost))}`
+        : "No manual baseline attached to this move",
+      tone: baselineCost > 0 && selectedCost > baselineCost ? "red" : "blue",
+    },
+  ];
+}
+
 function buildTruckTypeCostBreakdown(scenario, playback, move) {
   const journeys = playback?.journeys?.length ? playback.journeys : (playback?.trips || []);
   const configuredRates = new Map(
@@ -3883,15 +4824,14 @@ function PlannerCanvas({
   timelineGapMinutes = 180,
 }) {
   const [activitySearch, setActivitySearch] = useState("");
+  const [ganttSearch, setGanttSearch] = useState("");
   const [ganttWindowHours, setGanttWindowHours] = useState(24);
   const [ganttWindowIndex, setGanttWindowIndex] = useState(0);
   const [ganttFilters, setGanttFilters] = useState({
     cpOnly: false,
-    showRD: true,
-    showRM: true,
-    showRU: true,
     showDays: true,
     showFloatBar: true,
+    showCriticalLoadsOnly: false,
   });
   const [ganttView, setGanttView] = useState("load");
   const projectSummaryModel = useMemo(
@@ -3933,11 +4873,93 @@ function PlannerCanvas({
   const totalTransportCost = costBreakdownRows.reduce((sum, row) => sum + row.tripCost, 0);
   const totalTransportDistance = costBreakdownRows.reduce((sum, row) => sum + row.distanceKm, 0);
   const criticalPathRows = criticalPathChain.map((task) => `${task.loadCode}`).filter((value, index, values) => values.indexOf(value) === index);
+  const decisionInsightRows = useMemo(
+    () => buildDecisionInsightRows({
+      activityRows,
+      transportRows,
+      truckTripRows: projectSummaryModel.truckTripRows,
+      costBreakdownRows,
+      activePlanDashboard,
+      drillingReadinessPercent,
+    }),
+    [activityRows, transportRows, projectSummaryModel.truckTripRows, costBreakdownRows, activePlanDashboard, drillingReadinessPercent],
+  );
+  const timelineComplianceModel = useMemo(
+    () => buildTimelineComplianceModel(playback, logicalLoads),
+    [playback, logicalLoads],
+  );
+  const economicSignalRows = useMemo(
+    () => buildEconomicSignalRows(projectSummaryModel, activePlanDashboard, scenario),
+    [projectSummaryModel, activePlanDashboard, scenario],
+  );
+  const phaseAnalyticsRows = timelineComplianceModel.rows.map((row, index) => ({
+    key: row.key,
+    label: row.label,
+    hoursLabel: row.value,
+    taskCount: index === 0 ? timelineComplianceModel.criticalTaskCount : (index === 1 ? timelineComplianceModel.maxConcurrentRigWork : timelineComplianceModel.truckOverlapCount),
+    widthPercent: row.tone === "red" ? 100 : row.tone === "amber" ? 72 : 44,
+    color: row.tone === "red" ? "#ff8b8b" : row.tone === "amber" ? "#f0b34a" : "#62c98a",
+    criticalShareLabel: row.meta,
+  }));
+  const topTruckRows = projectSummaryModel.truckTripRows.slice(0, 4);
   const ganttWindowMinutes = ganttWindowHours * 60;
   const ganttWindowCount = Math.max(1, Math.ceil(Math.max(playback?.totalMinutes || 0, 1) / ganttWindowMinutes));
   const boundedGanttWindowIndex = Math.max(0, Math.min(ganttWindowIndex, ganttWindowCount - 1));
   const ganttWindowStartMinute = boundedGanttWindowIndex * ganttWindowMinutes;
+  const ganttWindowEndMinute = Math.min((playback?.totalMinutes || 0), ganttWindowStartMinute + ganttWindowMinutes);
   const ganttTickMinutes = ganttWindowHours === 12 ? 60 : 120;
+  const plannerTimelineTasks = useMemo(() => getPlannerTimelineTasks(playback), [playback]);
+  const selectedWindowTaskRows = useMemo(() => {
+    const normalizedTaskQuery = ganttSearch.trim().toLowerCase();
+    const plannerTasks = plannerTimelineTasks
+      .filter((task) => (task.endMinute ?? 0) > ganttWindowStartMinute && (task.startMinute ?? 0) < ganttWindowEndMinute)
+      .filter((task) => {
+        if (!normalizedTaskQuery) {
+          return true;
+        }
+
+        const phaseLabel = getPlannerTaskPhaseLabel(task);
+        const searchFields = [
+          task.id,
+          task.loadCode,
+          task.description,
+          task.activityLabel,
+          task.activityCode,
+          task.phase,
+          phaseLabel,
+          getPlannerTaskTypeCode(task),
+          task.loadId,
+        ];
+
+        return searchFields.some((value) => String(value || "").toLowerCase().includes(normalizedTaskQuery));
+      })
+      .sort((left, right) =>
+        (left.startMinute - right.startMinute) ||
+        (left.endMinute - right.endMinute) ||
+        String(left.loadCode || "").localeCompare(String(right.loadCode || "")) ||
+        String(left.id || "").localeCompare(String(right.id || "")),
+      );
+
+    return plannerTasks.map((task, index) => {
+      const durationMinutes = Math.max(0, (task.endMinute ?? 0) - (task.startMinute ?? 0));
+      const selectedSource = task.load?.selected_source || null;
+      return {
+        key: task.id || `selected-task-${index}`,
+        sequence: index + 1,
+        loadCode: task.loadCode || `#${task.loadId}`,
+        description: task.description || `Load ${task.loadCode || task.loadId}`,
+        sourceLabel: task.sourceKind === "startup"
+          ? (selectedSource?.source_label || selectedSource?.source_id || task.load?.sourceLabel || task.sourceLabel || "Unconfirmed source")
+          : (task.load?.sourceLabel || task.sourceLabel || "Rig"),
+        phaseLabel: getPlannerTaskPhaseLabel(task),
+        typeCode: getPlannerTaskTypeCode(task),
+        startLabel: formatTimelineAbsoluteDateTime(task.startMinute, planningStartDate, planningStartTime),
+        endLabel: formatTimelineAbsoluteDateTime(task.endMinute, planningStartDate, planningStartTime),
+        durationLabel: formatMinutes(durationMinutes),
+        critical: Boolean(task.isCritical),
+      };
+    });
+  }, [plannerTimelineTasks, ganttWindowStartMinute, ganttWindowEndMinute, ganttSearch, planningStartDate, planningStartTime]);
 
   useEffect(() => {
     if (ganttWindowIndex !== boundedGanttWindowIndex) {
@@ -3951,21 +4973,31 @@ function PlannerCanvas({
 
   return h(
     "section",
-    { className: "scene-planner-canvas" },
+    { className: "scene-planner-canvas scene-analytics-dashboard" },
     h(
       Card,
-      { className: "scene-planner-canvas-card scene-planner-summary-card" },
-      h("span", { className: "scene-panel-kicker" }, "Project Summary"),
+      { className: "scene-planner-canvas-card scene-planner-summary-card manager-dashboard-panel" },
+      h("span", { className: "scene-panel-kicker" }, "Move Dashboard"),
       renderProjectSummaryDashboard({ model: projectSummaryModel, radarModel: planRadarModel }),
     ),
     h(
       "div",
-      { className: "scene-planner-grid" },
+      { className: "scene-planner-grid rig-move-manager-grid" },
       h(
         Card,
-        { className: "scene-planner-canvas-card" },
+        { className: "scene-planner-canvas-card scene-analytics-card manager-dashboard-panel" },
         h("span", { className: "scene-panel-kicker" }, "Cost Breakdown"),
         h("div", { className: "scene-planner-section-note" }, (scenario?.name || "Plan").toUpperCase()),
+        h(DashboardDonutChart, {
+          segments: costBreakdownRows.map((row) => ({
+            key: row.key,
+            label: row.label,
+            value: row.tripCost,
+            color: row.tone === "red" ? "#ff8b8b" : row.tone === "green" ? "#62c98a" : row.tone === "blue" ? "#6fb3ff" : "#f0b34a",
+          })),
+          centerValue: formatCurrency(totalTransportCost),
+          centerLabel: "Transport cost",
+        }),
         h(
           "div",
           { className: "scene-planner-cost-grid" },
@@ -3981,7 +5013,7 @@ function PlannerCanvas({
           h(
             "article",
             { className: "scene-planner-cost-card is-total" },
-            h("span", { className: "scene-planner-cost-label" }, "TOTAL PROJECT"),
+            h("span", { className: "scene-planner-cost-label" }, "TOTAL TRANSPORT"),
             h("strong", { className: "scene-planner-cost-value" }, formatCurrency(totalTransportCost)),
             h("span", { className: "scene-planner-cost-meta" }, `${transportRows.length} trips · ${totalTransportDistance} km total`),
           ),
@@ -3989,10 +5021,32 @@ function PlannerCanvas({
       ),
       h(
         Card,
-        { className: "scene-planner-canvas-card" },
-        h("span", { className: "scene-panel-kicker" }, "Critical Path"),
-        h("div", { className: "scene-planner-section-note" }, `${criticalPathChain.length} activities`),
-        h("p", { className: "muted-copy scene-planner-critical-copy" }, "Float = 0. Any delay on these activities delays the entire project."),
+        { className: "scene-planner-canvas-card scene-analytics-card manager-dashboard-panel" },
+        h("span", { className: "scene-panel-kicker" }, "Timeline Governance"),
+        h("div", { className: "scene-planner-section-note" }, `${timelineComplianceModel.criticalTaskCount} critical rig tasks checked`),
+        h("p", { className: "muted-copy scene-planner-critical-copy" }, "This panel validates the real scheduling rules before the plan goes to execution."),
+        h(
+          "div",
+          { className: "scene-analytics-phase-list" },
+          phaseAnalyticsRows.map((row) =>
+            h(
+              "article",
+              { key: row.key, className: "scene-analytics-phase-row" },
+              h(
+                "div",
+                { className: "scene-analytics-phase-head" },
+                h("strong", null, row.label),
+                h("span", null, `${row.hoursLabel} · ${row.taskCount} tasks`),
+              ),
+              h(
+                "div",
+                { className: "scene-analytics-phase-bar" },
+                h("span", { style: { width: `${row.widthPercent}%`, background: row.color } }),
+              ),
+              h("span", { className: "scene-analytics-phase-meta" }, row.criticalShareLabel),
+            ),
+          ),
+        ),
         h(
           "div",
           { className: "scene-cpm-chain" },
@@ -4013,14 +5067,51 @@ function PlannerCanvas({
     ),
     h(
       Card,
-      { className: "scene-planner-canvas-card scene-planner-network-card" },
-      h("span", { className: "scene-panel-kicker" }, "CP Network"),
-      h("div", { className: "scene-planner-section-note" }, `${criticalPathChain.length} activities`),
-      h(CPMNetworkDiagram, { playback, zoom: 0.6 }),
+      { className: "scene-planner-canvas-card scene-planner-network-card scene-analytics-card manager-dashboard-panel" },
+      h("span", { className: "scene-panel-kicker" }, "Dispatch Pressure"),
+      h("div", { className: "scene-planner-section-note" }, `${topTruckRows.length} live truck signals`),
+      h("p", { className: "muted-copy scene-planner-critical-copy" }, "Dispatch leaders can see the heaviest truck lanes first and compare them against the selected plan economics."),
+      h(
+        "div",
+        { className: "rig-move-signal-list" },
+        [...economicSignalRows, ...decisionInsightRows].map((row) =>
+          h(
+            "article",
+            { key: row.key, className: `rig-move-signal-row is-${row.tone}` },
+            h(
+              "div",
+              { className: "rig-move-signal-head" },
+              h("strong", null, row.label),
+              h("span", null, row.value),
+            ),
+            h("p", { className: "muted-copy" }, row.meta),
+          ),
+        ),
+      ),
+      h(
+        "div",
+        { className: "scene-analytics-truck-list" },
+        topTruckRows.length
+          ? topTruckRows.map((truck) =>
+              h(
+                "article",
+                { key: truck.key, className: "scene-analytics-truck-row" },
+                h(
+                  "div",
+                  { className: "scene-analytics-truck-head" },
+                  h("strong", null, `${normalizeTruckTypeLabel(truck.truckType)} ${truck.truckId}`),
+                  h("span", null, `${truck.loadCount} loads`),
+                ),
+                h("div", { className: "scene-analytics-truck-bar" }, h("span", { style: { width: `${Math.max(8, truck.utilizationPercent)}%` } })),
+                h("span", { className: "scene-analytics-truck-meta" }, `${truck.utilizationPercent}% route utilization`),
+              ),
+            )
+          : h("p", { className: "muted-copy" }, "No truck assignments available."),
+      ),
     ),
     h(
       Card,
-      { className: "scene-planner-canvas-card" },
+      { className: "scene-planner-canvas-card manager-dashboard-panel" },
       h("span", { className: "scene-panel-kicker" }, "Transport Table"),
       h(
         "div",
@@ -4067,7 +5158,7 @@ function PlannerCanvas({
     ),
     h(
       Card,
-      { className: "scene-planner-canvas-card" },
+      { className: "scene-planner-canvas-card manager-dashboard-panel" },
       h("div", { className: "scene-planner-card-head" }, h("span", { className: "scene-panel-kicker" }, "Activity Table"), h("span", { className: "scene-planner-section-note" }, `${filteredActivityRows.length} rows`)),
       h(TextInput, {
         type: "text",
@@ -4131,13 +5222,50 @@ function PlannerCanvas({
     ),
     h(
       Card,
-      { className: "scene-planner-canvas-card scene-planner-gantt-card" },
-      h("span", { className: "scene-panel-kicker" }, "Gantt"),
+      { className: "scene-planner-canvas-card scene-planner-gantt-card manager-dashboard-panel" },
+      h("span", { className: "scene-panel-kicker" }, "Gantt Timeline"),
       h(
         "div",
         { className: "scene-gantt-toolbar" },
-        h("span", { className: "scene-planner-section-note" }, `${ganttWindowHours === 12 ? "Shift" : "Day"} ${boundedGanttWindowIndex + 1}/${ganttWindowCount}`),
-        h("span", { className: "scene-planner-section-note is-plain" }, formatTimelineWindowRange(ganttWindowStartMinute, Math.min((playback?.totalMinutes || 0), ganttWindowStartMinute + ganttWindowMinutes))),
+        h("input", {
+          className: "input scene-gantt-search-input",
+          type: "search",
+          value: ganttSearch,
+          placeholder: ganttView === "truck" ? "Search truck or load" : ganttView === "phase" ? "Search phase or load" : "Search load or truck",
+          onInput: (event) => setGanttSearch(event.target.value),
+        }),
+        h(
+          "div",
+          { className: "scene-gantt-filter-group" },
+          h("button", {
+            type: "button",
+            className: `scene-gantt-filter-button${ganttView === "load" ? " is-active" : ""}`,
+            onClick: () => setGanttView("load"),
+            children: "Loads",
+          }),
+          h("button", {
+            type: "button",
+            className: `scene-gantt-filter-button${ganttView === "truck" ? " is-active" : ""}`,
+            onClick: () => setGanttView("truck"),
+            children: "Trucks",
+          }),
+          h("button", {
+            type: "button",
+            className: `scene-gantt-filter-button${ganttView === "phase" ? " is-active" : ""}`,
+            onClick: () => setGanttView("phase"),
+            children: "Phases",
+          }),
+          h("button", {
+            type: "button",
+            className: `scene-gantt-filter-button${ganttFilters.showCriticalLoadsOnly ? " is-active" : ""}`,
+            onClick: () => setGanttFilters((current) => ({ ...current, showCriticalLoadsOnly: !current.showCriticalLoadsOnly })),
+            children: "Critical Loads",
+          }),
+        ),
+      ),
+      h(
+        "div",
+        { className: "scene-gantt-toolbar scene-gantt-toolbar-secondary" },
         h("button", {
           type: "button",
           className: "scene-timeline-back-button",
@@ -4166,53 +5294,8 @@ function PlannerCanvas({
           onClick: () => setGanttWindowIndex((value) => Math.min(ganttWindowCount - 1, value + 1)),
           children: "Next",
         }),
-      ),
-      h(
-        "div",
-        { className: "scene-gantt-toolbar" },
-        h("label", { className: "scene-gantt-check" }, h("input", {
-          type: "checkbox",
-          checked: ganttView === "load",
-          onChange: () => setGanttView("load"),
-        }), h("span", null, "Loads")),
-        h("label", { className: "scene-gantt-check" }, h("input", {
-          type: "checkbox",
-          checked: ganttView === "truck",
-          onChange: () => setGanttView("truck"),
-        }), h("span", null, "Trucks")),
-        h("label", { className: "scene-gantt-check" }, h("input", {
-          type: "checkbox",
-          checked: ganttView === "phase",
-          onChange: () => setGanttView("phase"),
-        }), h("span", null, "Phases")),
-        h("label", { className: "scene-gantt-check" }, h("input", {
-          type: "checkbox",
-          checked: ganttFilters.showRD,
-          disabled: ganttView === "truck",
-          onChange: (event) => setGanttFilters((current) => ({ ...current, showRD: event.target.checked })),
-        }), h("span", null, "RD")),
-        h("label", { className: "scene-gantt-check" }, h("input", {
-          type: "checkbox",
-          checked: ganttFilters.showRM,
-          onChange: (event) => setGanttFilters((current) => ({ ...current, showRM: event.target.checked })),
-        }), h("span", null, "RM")),
-        h("label", { className: "scene-gantt-check" }, h("input", {
-          type: "checkbox",
-          checked: ganttFilters.showRU,
-          disabled: ganttView === "truck",
-          onChange: (event) => setGanttFilters((current) => ({ ...current, showRU: event.target.checked })),
-        }), h("span", null, "RU")),
-        h("label", { className: "scene-gantt-check" }, h("input", {
-          type: "checkbox",
-          checked: true,
-          disabled: true,
-          readOnly: true,
-        }), h("span", null, ganttWindowHours === 12 ? "Shift view" : "Day view")),
-        h("label", { className: "scene-gantt-check" }, h("input", {
-          type: "checkbox",
-          checked: ganttFilters.showFloatBar,
-          onChange: (event) => setGanttFilters((current) => ({ ...current, showFloatBar: event.target.checked })),
-        }), h("span", null, "Float bar")),
+        h("span", { className: "scene-planner-section-note" }, `${ganttWindowHours === 12 ? "Shift" : "Day"} ${boundedGanttWindowIndex + 1}/${ganttWindowCount}`),
+        h("span", { className: "scene-planner-section-note is-plain" }, formatTimelineWindowRange(ganttWindowStartMinute, Math.min((playback?.totalMinutes || 0), ganttWindowStartMinute + ganttWindowMinutes))),
       ),
       h(
         "div",
@@ -4236,12 +5319,106 @@ function PlannerCanvas({
         windowMinutes: ganttWindowMinutes,
         tickMinutes: ganttTickMinutes,
         gapMinutes: timelineGapMinutes,
-        showRD: ganttView === "truck" ? false : ganttFilters.showRD,
-        showRM: ganttFilters.showRM,
-        showRU: ganttView === "truck" ? false : ganttFilters.showRU,
+        showCriticalLoadsOnly: ganttFilters.showCriticalLoadsOnly,
         showFloatBar: ganttView === "load" ? ganttFilters.showFloatBar : false,
+        rowSearchQuery: ganttSearch,
+        planningStartDate,
+        planningStartTime,
         hideFixedColumn: false,
       }),
+      h(
+        "div",
+        { className: "scene-planner-card-head" },
+        h("span", { className: "scene-panel-kicker" }, "Selected Window Tasks"),
+        h("span", { className: "scene-planner-section-note" }, `${selectedWindowTaskRows.length} task${selectedWindowTaskRows.length === 1 ? "" : "s"}`),
+      ),
+      h(
+        "div",
+        { className: "scene-planner-section-note is-plain" },
+        `${ganttWindowHours === 12 ? "Shift" : "Day"} ${boundedGanttWindowIndex + 1} | ${formatTimelineAbsoluteRange(ganttWindowStartMinute, ganttWindowEndMinute, planningStartDate, planningStartTime)}`,
+      ),
+      h(
+        "div",
+        { className: "scene-planner-table-wrap is-medium" },
+        h(
+          "table",
+          { className: "scene-planner-table" },
+          h(
+            "thead",
+            null,
+            h(
+              "tr",
+              null,
+              h("th", null, "Task"),
+              h("th", null, "Load"),
+              h("th", null, "Description"),
+              h("th", null, "Source"),
+              h("th", null, "Phase"),
+              h("th", null, "Type"),
+              h("th", null, "Start At"),
+              h("th", null, "End At"),
+              h("th", null, "Duration"),
+              h("th", null, "CP"),
+            ),
+          ),
+          h(
+            "tbody",
+            null,
+            selectedWindowTaskRows.length
+              ? selectedWindowTaskRows.map((row) =>
+                  h(
+                    "tr",
+                    { key: row.key, className: row.critical ? "is-critical" : "" },
+                    h("td", { className: "scene-planner-code" }, `Task ${row.sequence}`),
+                    h("td", { className: "scene-planner-code" }, row.loadCode),
+                    h("td", null, row.description),
+                    h("td", null, row.sourceLabel),
+                    h("td", null, row.phaseLabel),
+                    h("td", { className: "scene-planner-code" }, row.typeCode),
+                    h("td", null, row.startLabel),
+                    h("td", null, row.endLabel),
+                    h("td", { className: "scene-planner-number" }, row.durationLabel),
+                    h("td", { className: "scene-planner-number is-accent" }, row.critical ? "CP" : ""),
+                  ),
+                )
+              : h("tr", null, h("td", { colSpan: 10, className: "scene-cpm-table-empty muted-copy" }, `No tasks scheduled in this ${ganttWindowHours === 12 ? "shift" : "day"} window.`)),
+          ),
+        ),
+      ),
+      h("span", { className: "scene-panel-kicker" }, "Decision Signals"),
+      h("div", { className: "scene-planner-section-note" }, `${decisionInsightRows.length} live recommendations`),
+      h(
+        "div",
+        { className: "scene-analytics-insight-grid" },
+        decisionInsightRows.map((item) =>
+          h(
+            "article",
+            { key: item.key, className: `scene-analytics-insight-card is-${item.tone}` },
+            h("span", { className: "scene-analytics-insight-label" }, item.label),
+            h("strong", { className: "scene-analytics-insight-value" }, item.value),
+            h("p", { className: "muted-copy" }, item.meta),
+          ),
+        ),
+      ),
+      h(
+        "div",
+        { className: "scene-project-plan-list" },
+        projectSummaryModel.scenarioRows.map((plan) =>
+          h(
+            "div",
+            { key: plan.key, className: `scene-project-plan-row${plan.isSelected ? " is-selected" : ""}` },
+            h("div", { className: "scene-project-plan-head" }, h("strong", null, plan.name), h("span", null, `${plan.costLabel} · ${plan.durationLabel} · ${plan.utilizationLabel}`)),
+            h(
+              "div",
+              { className: "scene-project-plan-bars" },
+              h("span", { className: "scene-project-plan-bar is-time", style: { width: plan.timeWidth } }),
+              h("span", { className: "scene-project-plan-bar is-cost", style: { width: plan.costWidth } }),
+              h("span", { className: "scene-project-plan-bar is-utilization", style: { width: plan.utilizationWidth } }),
+            ),
+            h("div", { className: "scene-project-plan-meta" }, h("span", null, `Baseline savings ${plan.savingsLabel}`)),
+          ),
+        ),
+      ),
     ),
   );
 }
@@ -4275,6 +5452,59 @@ function formatTimelineWindowRange(startMinute, endMinute) {
     return `Day ${startDay}`;
   }
   return `Day view | D${startDay} ${formatTimelineClock(startDayMinute)} - D${endDay} ${formatTimelineClock(endDayMinute)}`;
+}
+
+function formatTimelineAbsoluteLabel(minute, planningStartDate, planningStartTime = "06:00") {
+  const normalizedDate = normalizePlanningDate(planningStartDate);
+  const baseDate = new Date(`${normalizedDate}T00:00:00`);
+  if (Number.isNaN(baseDate.getTime())) {
+    return formatTimelineWindowLabel(minute);
+  }
+
+  baseDate.setMinutes(parsePlanningTimeMinutes(planningStartTime) + Math.max(0, Math.round(minute || 0)));
+  return new Intl.DateTimeFormat("en-US", {
+    hour: "numeric",
+  }).format(baseDate).replace(/\s/g, "").toLowerCase();
+}
+
+function formatTimelineAbsoluteTime(minute, planningStartDate, planningStartTime = "06:00") {
+  const normalizedDate = normalizePlanningDate(planningStartDate);
+  const baseDate = new Date(`${normalizedDate}T00:00:00`);
+  if (Number.isNaN(baseDate.getTime())) {
+    return formatTimelineClock(minute);
+  }
+
+  baseDate.setMinutes(parsePlanningTimeMinutes(planningStartTime) + Math.max(0, Math.round(minute || 0)));
+  return new Intl.DateTimeFormat("en-US", {
+    hour: "numeric",
+    minute: "2-digit",
+  }).format(baseDate).replace(/\s/g, "").toLowerCase();
+}
+
+function formatTimelineAbsoluteDateTime(minute, planningStartDate, planningStartTime = "06:00") {
+  const normalizedDate = normalizePlanningDate(planningStartDate);
+  const baseDate = new Date(`${normalizedDate}T00:00:00`);
+  if (Number.isNaN(baseDate.getTime())) {
+    return formatTimelineWindowLabel(minute);
+  }
+
+  baseDate.setMinutes(parsePlanningTimeMinutes(planningStartTime) + Math.max(0, Math.round(minute || 0)));
+  return new Intl.DateTimeFormat("en-US", {
+    month: "short",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+  }).format(baseDate);
+}
+
+function formatTimelineAbsoluteRange(startMinute, endMinute, planningStartDate, planningStartTime = "06:00") {
+  const safeStart = Math.max(0, Math.round(startMinute || 0));
+  const safeEnd = Math.max(safeStart, Math.round(endMinute || 0));
+  const startLabel = formatTimelineAbsoluteLabel(safeStart, planningStartDate, planningStartTime);
+  const endLabel = formatTimelineAbsoluteLabel(safeEnd, planningStartDate, planningStartTime);
+  return safeEnd - safeStart <= 12 * 60
+    ? `Shift view | ${startLabel} - ${endLabel}`
+    : `Day view | ${startLabel} - ${endLabel}`;
 }
 
 function getTimelineWorkingMinutes(playback, rowType) {
@@ -4902,6 +6132,8 @@ export function RigMovePage({
     setHasSceneInitialized(Boolean(sceneAssetsReady));
     if (isNewMove) {
       setTruckSetup(normalizeTruckSetup(move, availableFleet));
+    } else {
+      setTruckSetup((current) => normalizeTruckSetup({ truckSetup: current, simulation: { truckSetup: current } }, availableFleet));
     }
     if (isNewMove) {
       setActiveScenarioName(move?.simulation?.preferredScenarioName || "");
@@ -5184,7 +6416,10 @@ export function RigMovePage({
       }));
 
   const displaySimulation = useMemo(() => {
-    const rawBestPlan = selectedScenario?.bestVariant || safeMove.simulation?.bestPlan || fallbackScenario.bestVariant;
+    const selectedScenarioPlan = selectedScenario?.bestVariant?.playback
+      ? selectedScenario.bestVariant
+      : null;
+    const rawBestPlan = selectedScenarioPlan || safeMove.simulation?.bestPlan || selectedScenario?.bestVariant || fallbackScenario.bestVariant;
     const normalizedBestPlanPlayback = normalizeScenePlayback(rawBestPlan?.playback || fallbackPlayback);
     const playbackTruckCount =
       Math.max(
@@ -5409,15 +6644,30 @@ export function RigMovePage({
         selectedScenario?.bestVariant?.playback || activePlayback,
         formatLocationLabel(safeMove?.endLabel, "Destination"),
       );
+      const decorateRoutes = (routes) => attachSupportRouteSiteGeometry(
+        routes,
+        safeMove?.startPoint || null,
+        safeMove?.endPoint || null,
+        formatLocationLabel(safeMove?.startLabel, "Source"),
+        formatLocationLabel(safeMove?.endLabel, "Destination"),
+      );
       if (scenarioRoutes.length) {
-        return scenarioRoutes;
+        return decorateRoutes(scenarioRoutes);
       }
       if (safeMove?.simulation?.supportRoutes?.length) {
-        return safeMove.simulation.supportRoutes;
+        return decorateRoutes(safeMove.simulation.supportRoutes);
       }
-      return buildStartupTransferSchedule(operatingSnapshot.startupLoads, formatLocationLabel(safeMove?.endLabel, "Destination"));
+      const reservationRoutes = buildReservationSupportRouteSchedule(
+        selectedScenario?.sourceReservations || [],
+        operatingSnapshot?.donorRigs || [],
+        formatLocationLabel(safeMove?.endLabel, "Destination"),
+      );
+      if (reservationRoutes.length) {
+        return decorateRoutes(reservationRoutes);
+      }
+      return decorateRoutes(buildStartupTransferSchedule(operatingSnapshot.startupLoads, formatLocationLabel(safeMove?.endLabel, "Destination")));
     },
-    [selectedScenario, activePlayback, safeMove?.simulation?.supportRoutes, operatingSnapshot, safeMove?.endLabel],
+    [selectedScenario, activePlayback, safeMove?.simulation?.supportRoutes, operatingSnapshot, safeMove?.endLabel, safeMove?.startPoint, safeMove?.endPoint, safeMove?.startLabel],
   );
 
   function updateTruckCount(truckId, nextCountValue) {
@@ -5558,21 +6808,81 @@ export function RigMovePage({
     : isLiveDemoTracking
       ? activePlayback
       : timelinePlayback;
+  const scenePlaybackWithSupportRoutes = useMemo(
+    () => enrichPlaybackWithSupportRoutes(scenePlayback, startupTransferSchedule, safeMove?.endPoint || null, safeMove?.startPoint || null),
+    [scenePlayback, startupTransferSchedule, safeMove?.endPoint, safeMove?.startPoint],
+  );
   const sceneSimulation = useMemo(
     () => (
       executionState === "planning"
-        ? displaySimulation
+        ? {
+            ...displaySimulation,
+            bestPlan: {
+              ...(displaySimulation.bestPlan || {}),
+              playback: scenePlaybackWithSupportRoutes,
+              totalMinutes: scenePlaybackWithSupportRoutes?.totalMinutes || displaySimulation.bestPlan?.totalMinutes || 0,
+            },
+          }
         : {
             ...displaySimulation,
             bestPlan: {
               ...(displaySimulation.bestPlan || {}),
-              playback: scenePlayback,
-              totalMinutes: scenePlayback?.totalMinutes || displaySimulation.bestPlan?.totalMinutes || 0,
+              playback: scenePlaybackWithSupportRoutes,
+              totalMinutes: scenePlaybackWithSupportRoutes?.totalMinutes || displaySimulation.bestPlan?.totalMinutes || 0,
             },
           }
     ),
-    [displaySimulation, executionState, scenePlayback],
+    [displaySimulation, executionState, scenePlaybackWithSupportRoutes],
   );
+  const needsRouteHydrationPersistence = useMemo(() => {
+    if (!move?.id) {
+      return false;
+    }
+
+    const storedMainRouteCount = safeMove?.simulation?.routeGeometry?.length || 0;
+    const sceneMainRouteCount = sceneSimulation?.routeGeometry?.length || 0;
+    if (sceneMainRouteCount > storedMainRouteCount) {
+      return true;
+    }
+
+    const storedSupportRoutes = safeMove?.simulation?.supportRoutes || [];
+    const sceneSupportRoutes = startupTransferSchedule || [];
+    if (sceneSupportRoutes.some((route, index) => {
+      const storedRoute = storedSupportRoutes[index] || {};
+      return (route?.geometry?.length || 0) > (storedRoute?.geometry?.length || 0) ||
+        (route?.pickupGeometry?.length || 0) > (storedRoute?.pickupGeometry?.length || 0);
+    })) {
+      return true;
+    }
+
+    const storedTrips = safeMove?.simulation?.bestPlan?.playback?.trips || [];
+    const sceneTrips = sceneSimulation?.bestPlan?.playback?.trips || [];
+    return sceneTrips.some((trip, index) => {
+      const storedTrip = storedTrips[index] || {};
+      return (trip?.routeGeometry?.length || 0) > (storedTrip?.routeGeometry?.length || 0) ||
+        (trip?.pickupRouteGeometry?.length || 0) > (storedTrip?.pickupRouteGeometry?.length || 0);
+    });
+  }, [move?.id, safeMove?.simulation, sceneSimulation, startupTransferSchedule]);
+
+  useEffect(() => {
+    if (!move?.id || !needsRouteHydrationPersistence) {
+      return undefined;
+    }
+
+    const timeoutId = window.setTimeout(() => {
+      void persistMoveSession(move.id, {
+        simulation: {
+          ...(sceneSimulation || {}),
+          supportRoutes: startupTransferSchedule,
+          preferredScenarioName: selectedScenario?.name || sceneSimulation?.preferredScenarioName || "",
+        },
+      }).catch(() => {});
+    }, 800);
+
+    return () => {
+      window.clearTimeout(timeoutId);
+    };
+  }, [move?.id, needsRouteHydrationPersistence, sceneSimulation, startupTransferSchedule, selectedScenario?.name]);
   const focusedRigStats = useMemo(
     () =>
       getRigInsightStats({
@@ -6152,7 +7462,7 @@ export function RigMovePage({
                   variant: "ghost",
                   className: "scene-top-action-button",
                   onClick: () => handleSceneModeChange("timeline"),
-                  children: "Timeline",
+                  children: "Dashboard",
                 }),
               ),
               h(
@@ -6886,27 +8196,53 @@ export function RigMovePage({
               h(
                 "div",
                 { className: "scene-plan-kpis" },
-                h(
-                  "div",
-                  { className: "scene-plan-kpi-card" },
-                  h("span", { className: "scene-dashboard-label" }, t("totalTime", "Total Time")),
-                  h("strong", { className: "scene-plan-kpi-value" }, formatDaysHours(previewPlanCard?.totalMinutes || 0)),
-                  h("span", { className: "scene-plan-kpi-meta" }, `${previewRoundTrips} round trips - ETA ${previewPlanEtaLabel}`),
-                ),
-                h(
-                  "div",
-                  { className: "scene-plan-kpi-card" },
-                  h("span", { className: "scene-dashboard-label" }, "Total Cost"),
-                  h("strong", { className: "scene-plan-kpi-value" }, formatCurrency(previewPlanCard?.totalCost || 0)),
-                  h("span", { className: "scene-plan-kpi-meta" }, `${previewCostPerLoad} per load`),
-                ),
-                h(
-                  "div",
-                  { className: "scene-plan-kpi-card" },
-                  h("span", { className: "scene-dashboard-label" }, "Utilization"),
-                  h("strong", { className: "scene-plan-kpi-value" }, `${previewPlanCard?.utilization || 0}%`),
-                  h("span", { className: "scene-plan-kpi-meta" }, `${previewTruckUsageLabel} trucks used`),
-                ),
+                isPlaybackActiveState
+                  ? [
+                      h(
+                        "div",
+                        { className: "scene-plan-kpi-card", key: "playback-completion" },
+                        h("span", { className: "scene-dashboard-label" }, "Completion"),
+                        h("strong", { className: "scene-plan-kpi-value" }, `${completion}%`),
+                        h("span", { className: "scene-plan-kpi-meta" }, `${visibleMinute > 0 ? renderElapsedTimeValue(visibleMinute) : "0m"} elapsed`),
+                      ),
+                      h(
+                        "div",
+                        { className: "scene-plan-kpi-card", key: "playback-time-left" },
+                        h("span", { className: "scene-dashboard-label" }, "Time Left"),
+                        h("strong", { className: "scene-plan-kpi-value" }, timeLeftLabel),
+                        h("span", { className: "scene-plan-kpi-meta" }, isPlaybackPaused ? "Playback paused" : "Playback running"),
+                      ),
+                      h(
+                        "div",
+                        { className: "scene-plan-kpi-card", key: "playback-total-duration" },
+                        h("span", { className: "scene-dashboard-label" }, "Total Duration"),
+                        h("strong", { className: "scene-plan-kpi-value" }, formatDaysHours(previewPlanCard?.totalMinutes || 0)),
+                        h("span", { className: "scene-plan-kpi-meta" }, `${previewRoundTrips} round trips`),
+                      ),
+                    ]
+                  : [
+                      h(
+                        "div",
+                        { className: "scene-plan-kpi-card", key: "plan-total-time" },
+                        h("span", { className: "scene-dashboard-label" }, t("totalTime", "Total Time")),
+                        h("strong", { className: "scene-plan-kpi-value" }, formatDaysHours(previewPlanCard?.totalMinutes || 0)),
+                        h("span", { className: "scene-plan-kpi-meta" }, `${previewRoundTrips} round trips - ETA ${previewPlanEtaLabel}`),
+                      ),
+                      h(
+                        "div",
+                        { className: "scene-plan-kpi-card", key: "plan-total-cost" },
+                        h("span", { className: "scene-dashboard-label" }, "Total Cost"),
+                        h("strong", { className: "scene-plan-kpi-value" }, formatCurrency(previewPlanCard?.totalCost || 0)),
+                        h("span", { className: "scene-plan-kpi-meta" }, `${previewCostPerLoad} per load`),
+                      ),
+                      h(
+                        "div",
+                        { className: "scene-plan-kpi-card", key: "plan-utilization" },
+                        h("span", { className: "scene-dashboard-label" }, "Utilization"),
+                        h("strong", { className: "scene-plan-kpi-value" }, `${previewPlanCard?.utilization || 0}%`),
+                        h("span", { className: "scene-plan-kpi-meta" }, `${previewTruckUsageLabel} trucks used`),
+                      ),
+                    ],
               ),
               h(
                 "div",

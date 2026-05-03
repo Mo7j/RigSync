@@ -11,6 +11,14 @@ import { fetchLocationLabel } from "../features/rigMoves/api.js";
 
 const { useRef, useState } = React;
 
+function toDateInputValue(value) {
+  const date = value instanceof Date ? value : new Date(value || Date.now());
+  if (Number.isNaN(date.getTime())) {
+    return new Date().toISOString().slice(0, 10);
+  }
+  return date.toISOString().slice(0, 10);
+}
+
 function countActiveLoads(startupLoads = []) {
   return startupLoads.reduce((sum, item) => sum + (item.coveredCount || 0), 0);
 }
@@ -139,6 +147,7 @@ export function DashboardPage({
 }) {
   const [endPoint, setEndPoint] = useState(null);
   const [endLabel, setEndLabel] = useState("");
+  const [planningStartDate, setPlanningStartDate] = useState(() => toDateInputValue(currentDate));
   const [fieldError, setFieldError] = useState("");
   const [isPickerOpen, setIsPickerOpen] = useState(false);
   const [isEditingLoads, setIsEditingLoads] = useState(false);
@@ -192,6 +201,7 @@ export function DashboardPage({
       endPoint,
       startLabel: rig?.currentLabel || formatCoordinate(rig?.currentPoint),
       endLabel: endLabel || formatCoordinate(endPoint),
+      planningStartDate,
     });
   }
 
@@ -610,6 +620,18 @@ export function DashboardPage({
                   type: "text",
                   value: rig?.currentLabel || formatCoordinate(rig?.currentPoint),
                   readOnly: true,
+                }),
+              ),
+              h(
+                Field,
+                {
+                  label: "Start Day",
+                  hint: "Planning will start at 06:00 on this day.",
+                },
+                h(TextInput, {
+                  type: "date",
+                  value: planningStartDate,
+                  onChange: (event) => setPlanningStartDate(event.target.value || toDateInputValue(currentDate)),
                 }),
               ),
               h(

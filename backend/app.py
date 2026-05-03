@@ -13,6 +13,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import selectinload
 
 from database import SessionLocal
+from import_dataset import import_dataset
 from models import (
     LoadDependency,
     LoadRoleRequirement,
@@ -279,11 +280,19 @@ def read_db_dataset():
         session.close()
 
 
+def ensure_planning_dataset_loaded():
+    try:
+        return read_db_dataset()
+    except RuntimeError:
+        import_dataset(rebuild_app_state=False)
+        return read_db_dataset()
+
+
 def get_active_dataset():
     try:
-        return load_planning_dataset()
+        return ensure_planning_dataset_loaded()
     except Exception:
-        return read_db_dataset()
+        return load_planning_dataset()
 
 
 def ensure_state_tables():
@@ -358,11 +367,43 @@ def build_move_summary(payload):
     }
 
 
-def ensure_record_summary(record):
-    if record.summary_payload:
-        return record.summary_payload
+def coerce_json_container(value):
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+            return parsed
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
+    return value
 
-    summary_payload = build_move_summary(record.payload or {})
+
+def is_valid_move_payload(payload):
+    payload = coerce_json_container(payload)
+    if not isinstance(payload, dict):
+        return False
+
+    has_name = bool(str(payload.get("name") or "").strip())
+    has_route = bool(payload.get("startPoint")) and bool(payload.get("endPoint"))
+    has_loads = max(0, int(payload.get("loadCount") or 0)) > 0
+    simulation = payload.get("simulation")
+    has_simulation = isinstance(simulation, dict) and (
+        bool(simulation.get("bestPlan")) or
+        bool(simulation.get("scenarioPlans")) or
+        bool(simulation.get("truckSetup")) or
+        max(0, int(simulation.get("truckCount") or 0)) > 0 or
+        simulation.get("routeMinutes") is not None
+    )
+
+    return has_name or has_route or has_loads or has_simulation
+
+
+def ensure_record_summary(record):
+    summary_payload = coerce_json_container(record.summary_payload)
+    if isinstance(summary_payload, dict):
+        return summary_payload
+
+    payload = coerce_json_container(record.payload) or {}
+    summary_payload = build_move_summary(payload)
     record.summary_payload = summary_payload
     return summary_payload
 
@@ -756,21 +797,37 @@ def get_moves():
             query = query.filter(MoveRecord.manager_id == manager_id)
         if summary:
             summary_rows = query.with_entities(MoveRecord.id, MoveRecord.summary_payload).all()
-            missing_ids = [move_id for move_id, summary_payload in summary_rows if not summary_payload]
-            summary_by_id = {move_id: summary_payload for move_id, summary_payload in summary_rows if summary_payload}
+            missing_ids = [move_id for move_id, summary_payload in summary_rows if not coerce_json_container(summary_payload)]
+            summary_by_id = {
+                move_id: coerce_json_container(summary_payload)
+                for move_id, summary_payload in summary_rows
+                if isinstance(coerce_json_container(summary_payload), dict)
+            }
 
             if missing_ids:
                 missing_records = session.query(MoveRecord).filter(MoveRecord.id.in_(missing_ids)).all()
                 for record in missing_records:
-                    summary_by_id[record.id] = ensure_record_summary(record)
+                    summary = ensure_record_summary(record)
+                    if is_valid_move_payload(summary):
+                        summary_by_id[record.id] = summary
                 session.commit()
 
-            response = jsonify([summary_by_id.get(move_id) for move_id, _ in summary_rows if summary_by_id.get(move_id)])
+            response = jsonify([
+                summary
+                for move_id, _ in summary_rows
+                for summary in [summary_by_id.get(move_id)]
+                if is_valid_move_payload(summary)
+            ])
             log_timing("/api/moves", started_at, manager_id=manager_id, summary=1, records=len(summary_rows))
             return response
 
         records = query.all()
-        response = jsonify([record.payload for record in records])
+        response = jsonify([
+            payload
+            for record in records
+            for payload in [coerce_json_container(record.payload)]
+            if is_valid_move_payload(payload)
+        ])
         log_timing("/api/moves", started_at, manager_id=manager_id, summary=0, records=len(records))
         return response
     finally:
@@ -786,7 +843,11 @@ def get_move(move_id):
         if not record:
             log_timing("/api/moves/<move_id>", started_at, move_id=move_id, found=0)
             return jsonify({"error": "move not found"}), 404
-        response = jsonify(record.payload)
+        payload = coerce_json_container(record.payload)
+        if not is_valid_move_payload(payload):
+            log_timing("/api/moves/<move_id>", started_at, move_id=move_id, found=0, invalid=1)
+            return jsonify({"error": "move not found"}), 404
+        response = jsonify(payload)
         log_timing("/api/moves/<move_id>", started_at, move_id=move_id, found=1)
         return response
     finally:

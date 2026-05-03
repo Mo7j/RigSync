@@ -514,6 +514,36 @@ def fit_to_day_window(start_minute, duration_minutes, day_start, day_end):
     raise RuntimeError("Could not fit critical task into daylight window.")
 
 
+def requires_day_shift(task):
+    return bool(task.get("isCritical")) and task.get("phaseCode") in {"RD", "RU"}
+
+
+def build_day_shift_segments(start_minute, duration_minutes, day_start, day_end):
+    remaining = max(0, parse_int(duration_minutes))
+    candidate = max(0, parse_int(start_minute))
+    segments = []
+
+    while remaining > 0:
+        window_start, window_end = get_day_window(candidate, day_start, day_end)
+        if candidate < window_start:
+            candidate = window_start
+            continue
+        if candidate >= window_end:
+            candidate = window_start + (24 * 60)
+            continue
+
+        worked_minutes = min(remaining, window_end - candidate)
+        segment_end = candidate + worked_minutes
+        segments.append({
+            "startMinute": candidate,
+            "endMinute": segment_end,
+        })
+        remaining -= worked_minutes
+        candidate = segment_end if remaining <= 0 else window_start + (24 * 60)
+
+    return segments, (segments[-1]["endMinute"] if segments else max(0, parse_int(start_minute)))
+
+
 def interval_load(intervals, start, end, field, phase_code=None):
     total = 0
     for interval in intervals:
@@ -524,40 +554,62 @@ def interval_load(intervals, start, end, field, phase_code=None):
     return total
 
 
+def interval_load_for_segments(intervals, segments, field, phase_code=None):
+    total = 0
+    for interval in intervals:
+        if phase_code and interval.get("phaseCode") != phase_code:
+            continue
+        if any(overlaps(segment["startMinute"], segment["endMinute"], interval["startMinute"], interval["endMinute"]) for segment in segments):
+            total += interval.get(field, 0)
+    return total
+
+
 def find_site_start(task, earliest_start, site_intervals, constraints):
     day_start = parse_int(constraints.get("criticalWindowStartHour"), 6) * 60
     day_end = parse_int(constraints.get("criticalWindowEndHour"), 18) * 60
     max_concurrent = max(1, parse_int(constraints.get("maxConcurrentActivities"), 3))
+    max_concurrent_rd = max(1, parse_int(constraints.get("maxConcurrentRigDownLoads"), 3))
+    max_concurrent_ru = max(1, parse_int(constraints.get("maxConcurrentRigUpLoads"), 3))
     max_rd_workers = max(1, parse_int(constraints.get("maxRigDownWorkers"), 30))
     max_ru_workers = max(1, parse_int(constraints.get("maxRigUpWorkers"), 30))
 
     candidate = max(0, earliest_start)
-    if task["isCritical"]:
-        candidate = fit_to_day_window(candidate, task["durationMinutes"], day_start, day_end)
+    if requires_day_shift(task):
+        candidate = fit_to_day_window(candidate, min(task["durationMinutes"], day_end - day_start), day_start, day_end)
 
     for _ in range(40000):
-        end_minute = candidate + task["durationMinutes"]
-        if task["isCritical"]:
-            candidate = fit_to_day_window(candidate, task["durationMinutes"], day_start, day_end)
+        if requires_day_shift(task):
+            candidate = fit_to_day_window(candidate, min(task["durationMinutes"], day_end - day_start), day_start, day_end)
+            work_segments, end_minute = build_day_shift_segments(candidate, task["durationMinutes"], day_start, day_end)
+        else:
             end_minute = candidate + task["durationMinutes"]
+            work_segments = [{"startMinute": candidate, "endMinute": end_minute}]
 
-        active_tasks = interval_load(site_intervals, candidate, end_minute, "activityLoad")
+        active_tasks = interval_load_for_segments(site_intervals, work_segments, "activityLoad")
         if active_tasks >= max_concurrent:
             candidate += TIME_STEP_MINUTES
             continue
 
         if task["phaseCode"] == "RD":
-            worker_load = interval_load(site_intervals, candidate, end_minute, "workerLoad", "RD")
+            phase_load = interval_load_for_segments(site_intervals, work_segments, "activityLoad", "RD")
+            if phase_load >= max_concurrent_rd:
+                candidate += TIME_STEP_MINUTES
+                continue
+            worker_load = interval_load_for_segments(site_intervals, work_segments, "workerLoad", "RD")
             if worker_load + task["siteWorkers"] > max_rd_workers:
                 candidate += TIME_STEP_MINUTES
                 continue
         elif task["phaseCode"] == "RU":
-            worker_load = interval_load(site_intervals, candidate, end_minute, "workerLoad", "RU")
+            phase_load = interval_load_for_segments(site_intervals, work_segments, "activityLoad", "RU")
+            if phase_load >= max_concurrent_ru:
+                candidate += TIME_STEP_MINUTES
+                continue
+            worker_load = interval_load_for_segments(site_intervals, work_segments, "workerLoad", "RU")
             if worker_load + task["siteWorkers"] > max_ru_workers:
                 candidate += TIME_STEP_MINUTES
                 continue
 
-        return candidate
+        return candidate, end_minute, work_segments
 
     raise RuntimeError(f"Could not place site task {task['id']} within resource limits.")
 
@@ -621,13 +673,13 @@ def schedule_tasks(tasks, fleet, constraints, objective):
                     ),
                 }
             else:
-                start_minute = find_site_start(task, earliest_start, site_intervals, constraints)
-                end_minute = start_minute + task["durationMinutes"]
-                load_balance_score = interval_load(site_intervals, start_minute, end_minute, "workerLoad", task["phaseCode"])
+                start_minute, end_minute, work_segments = find_site_start(task, earliest_start, site_intervals, constraints)
+                load_balance_score = interval_load_for_segments(site_intervals, work_segments, "workerLoad", task["phaseCode"])
                 evaluation = {
                     "task": task,
                     "startMinute": start_minute,
                     "endMinute": end_minute,
+                    "workSegments": work_segments,
                     "truckOption": None,
                     "score": (
                         load_balance_score,
@@ -665,21 +717,121 @@ def schedule_tasks(tasks, fleet, constraints, objective):
             )
             truck_state[truck_option["truckId"]] = scheduled_task["returnEndMinute"]
         else:
-            site_intervals.append(
-                {
+            scheduled_task["workSegments"] = best_candidate.get("workSegments") or [{
+                "startMinute": start_minute,
+                "endMinute": end_minute,
+            }]
+            for segment in scheduled_task["workSegments"]:
+                site_intervals.append(
+                    {
                     "taskId": task["id"],
                     "phaseCode": task["phaseCode"],
-                    "startMinute": start_minute,
-                    "endMinute": end_minute,
+                    "startMinute": segment["startMinute"],
+                    "endMinute": segment["endMinute"],
                     "activityLoad": 1,
                     "workerLoad": task["siteWorkers"],
                 }
-            )
+                )
 
         scheduled[task["id"]] = scheduled_task
         remaining.remove(task["id"])
 
     return [scheduled[task["id"]] for task in tasks]
+
+
+def validate_scheduled_tasks(tasks, constraints, fleet):
+    max_concurrent = max(1, parse_int(constraints.get("maxConcurrentActivities"), 3))
+    max_concurrent_rd = max(1, parse_int(constraints.get("maxConcurrentRigDownLoads"), 3))
+    max_concurrent_ru = max(1, parse_int(constraints.get("maxConcurrentRigUpLoads"), 3))
+    max_rd_workers = max(1, parse_int(constraints.get("maxRigDownWorkers"), 30))
+    max_ru_workers = max(1, parse_int(constraints.get("maxRigUpWorkers"), 30))
+    task_map = {task["id"]: task for task in tasks}
+
+    for task in tasks:
+        for predecessor_id in task.get("predecessorIds", []):
+            predecessor = task_map.get(predecessor_id)
+            if predecessor and predecessor["endMinute"] > task["startMinute"]:
+                raise RuntimeError(f"Precedence violation: {predecessor_id} overlaps {task['id']}.")
+
+    timeline = []
+    for task in tasks:
+        work_segments = task.get("workSegments") or [{
+            "startMinute": task["startMinute"],
+            "endMinute": task["endMinute"],
+        }]
+        for index, segment in enumerate(work_segments):
+            timeline.append({"minute": segment["startMinute"], "type": "start", "task": task, "segmentKey": f"{task['id']}::{index}"})
+            timeline.append({"minute": segment["endMinute"], "type": "end", "task": task, "segmentKey": f"{task['id']}::{index}"})
+
+    timeline.sort(
+        key=lambda event: (
+            event["minute"],
+            0 if event["type"] == "end" else 1,
+            event["task"]["id"],
+        )
+    )
+
+    active_task_ids = set()
+    active_rd_count = 0
+    active_ru_count = 0
+    active_rd_workers = 0
+    active_ru_workers = 0
+
+    for event in timeline:
+        task = event["task"]
+        segment_key = event["segmentKey"]
+        if event["type"] == "end":
+            active_task_ids.discard(segment_key)
+            if task["phaseCode"] == "RD":
+                active_rd_count = max(0, active_rd_count - 1)
+                active_rd_workers = max(0, active_rd_workers - parse_int(task.get("siteWorkers")))
+            elif task["phaseCode"] == "RU":
+                active_ru_count = max(0, active_ru_count - 1)
+                active_ru_workers = max(0, active_ru_workers - parse_int(task.get("siteWorkers")))
+            continue
+
+        active_task_ids.add(segment_key)
+        if task["phaseCode"] == "RD":
+            active_rd_count += 1
+            active_rd_workers += parse_int(task.get("siteWorkers"))
+        elif task["phaseCode"] == "RU":
+            active_ru_count += 1
+            active_ru_workers += parse_int(task.get("siteWorkers"))
+
+        if len(active_task_ids) > max_concurrent:
+            raise RuntimeError(f"Concurrent activity cap exceeded while scheduling {task['id']}.")
+        if active_rd_count > max_concurrent_rd:
+            raise RuntimeError(f"Concurrent rig-down task cap exceeded while scheduling {task['id']}.")
+        if active_ru_count > max_concurrent_ru:
+            raise RuntimeError(f"Concurrent rig-up task cap exceeded while scheduling {task['id']}.")
+        if active_rd_workers > max_rd_workers:
+            raise RuntimeError(f"Rig-down worker cap exceeded while scheduling {task['id']}.")
+        if active_ru_workers > max_ru_workers:
+            raise RuntimeError(f"Rig-up worker cap exceeded while scheduling {task['id']}.")
+
+    truck_tasks = defaultdict(list)
+    for task in tasks:
+        if task.get("phaseCode") == "RM" and normalize_text(task.get("truckId")):
+            truck_tasks[task["truckId"]].append(task)
+
+    for truck in fleet or []:
+        truck_id = truck.get("id")
+        intervals = sorted(
+            truck_tasks.get(truck_id, []),
+            key=lambda item: (item["startMinute"], item["endMinute"], item["id"]),
+        )
+        for index in range(1, len(intervals)):
+            previous = intervals[index - 1]
+            current = intervals[index]
+            if overlaps(
+                previous["startMinute"],
+                previous.get("returnEndMinute", previous["endMinute"]),
+                current["startMinute"],
+                current["endMinute"],
+            ):
+                raise RuntimeError(
+                    f"Truck assignment conflict on {truck_id} between {previous['id']} and {current['id']}."
+                )
 
 
 def build_critical_path(tasks):
@@ -740,14 +892,21 @@ def summarize_metrics(tasks, fleet, worker_rates, constraints):
         if task["phaseCode"] == "RM"
     )
     worker_active_minutes = sum(task["siteWorkers"] * task["durationMinutes"] for task in tasks if task["phaseCode"] != "RM")
+    used_truck_ids = {
+        normalize_text(task.get("truckId"))
+        for task in tasks
+        if task["phaseCode"] == "RM" and normalize_text(task.get("truckId"))
+    }
     allocated_trucks = max(1, len(fleet))
-    truck_utilization = min(100, int(round((truck_active_minutes / max(1, allocated_trucks * max(1, total_minutes))) * 100)))
+    used_trucks = len(used_truck_ids)
+    truck_capacity_minutes = allocated_trucks * max(1, total_minutes)
+    truck_utilization = min(100, int(round((truck_active_minutes / max(1, truck_capacity_minutes)) * 100)))
     worker_capacity_minutes = (
         max(1, parse_int(constraints.get("maxRigDownWorkers"), 30)) +
         max(1, parse_int(constraints.get("maxRigUpWorkers"), 30))
     ) * max(1, total_minutes)
     worker_utilization = min(100, int(round((worker_active_minutes / max(1, worker_capacity_minutes)) * 100)))
-    utilization = int(round((truck_utilization + worker_utilization) / 2))
+    utilization = truck_utilization
     return {
         "totalMinutes": total_minutes,
         "transportCost": int(round(transport_cost)),
@@ -758,6 +917,9 @@ def summarize_metrics(tasks, fleet, worker_rates, constraints):
         "workerUtilization": worker_utilization,
         "utilization": utilization,
         "utilizationEfficiency": utilization,
+        "idleMinutes": max(0, truck_capacity_minutes - truck_active_minutes),
+        "allocatedTruckCountForUtilization": allocated_trucks,
+        "usedTruckCount": used_trucks,
     }
 
 
@@ -774,11 +936,25 @@ def count_used_trucks(tasks):
 
 
 def build_playback(tasks, route_data, fleet):
+    task_lookup = {
+        (normalize_text(task.get("loadId")), task["phaseCode"]): task
+        for task in tasks
+    }
     trips = []
     for task in tasks:
         if task["phaseCode"] != "RM":
             continue
         load = task["load"]
+        load_id = normalize_text(task.get("loadId"))
+        rig_down_task = task_lookup.get((load_id, "RD"))
+        rig_up_task = task_lookup.get((load_id, "RU"))
+        move_start = task["startMinute"]
+        move_finish = task["endMinute"]
+        rig_down_start = rig_down_task["startMinute"] if rig_down_task else move_start
+        rig_down_finish = rig_down_task["endMinute"] if rig_down_task else move_start
+        rig_up_start = rig_up_task["startMinute"] if rig_up_task else move_finish
+        rig_up_finish = rig_up_task["endMinute"] if rig_up_task else move_finish
+        route_geometry = route_data.get("geometry")
         trips.append(
             {
                 "taskId": task["id"],
@@ -787,13 +963,27 @@ def build_playback(tasks, route_data, fleet):
                 "description": task["description"],
                 "truckId": task.get("truckId"),
                 "truckType": task.get("truckType"),
-                "moveStart": task["startMinute"],
-                "arrivalAtDestination": task["endMinute"],
+                "loadStart": rig_down_start,
+                "dispatchStart": move_start,
+                "rigDownStart": rig_down_start,
+                "rigDownFinish": rig_down_finish,
+                "pickupLoadStart": rig_down_start,
+                "pickupLoadFinish": rig_down_finish,
+                "moveStart": move_start,
+                "moveFinish": move_finish,
+                "arrivalAtDestination": move_finish,
+                "unloadDropStart": move_finish,
+                "unloadDropFinish": move_finish,
+                "rigUpStart": rig_up_start,
+                "rigUpFinish": rig_up_finish,
                 "returnStart": task.get("returnStartMinute"),
                 "returnToSource": task.get("returnEndMinute"),
                 "routeDistanceKm": get_load_distance_km(load, route_data, load.get("selected_source")),
+                "routeGeometry": route_geometry,
                 "sourceLabel": load.get("sourceLabel") or route_data.get("startLabel") or "Source",
                 "destinationLabel": route_data.get("endLabel") or "Destination",
+                "sourceKind": task.get("sourceKind"),
+                "isCriticalLift": bool(load.get("is_critical") or load.get("critical_lift")),
             }
         )
 
@@ -853,9 +1043,19 @@ def score_scenario(result, objective, references):
         cheapest = references.get("cheapest")
         fastest_minutes = max(1, parse_int(fastest.get("totalMinutes") if fastest else result["totalMinutes"], result["totalMinutes"]))
         cheapest_cost = max(1, parse_int(cheapest.get("costEstimate") if cheapest else result["costEstimate"], result["costEstimate"]))
-        time_penalty = max(0, result["totalMinutes"] - int(round(fastest_minutes * 1.15)))
-        cost_penalty = max(0, result["costEstimate"] - int(round(cheapest_cost * 1.10)))
-        return (-result["utilization"], time_penalty, cost_penalty, result["totalMinutes"], result["costEstimate"])
+        allowed_minutes = int(round(fastest_minutes * 1.15))
+        allowed_cost = int(round(cheapest_cost * 1.10))
+        time_penalty = max(0, result["totalMinutes"] - allowed_minutes)
+        cost_penalty = max(0, result["costEstimate"] - allowed_cost)
+        is_within_targets = 1 if time_penalty == 0 and cost_penalty == 0 else 0
+        return (
+            -is_within_targets,
+            time_penalty + cost_penalty,
+            -result["truckUtilization"],
+            result["totalMinutes"],
+            result["costEstimate"],
+            result["truckCount"],
+        )
     return (result["totalMinutes"], result["costEstimate"], result["truckCount"])
 
 
@@ -911,6 +1111,7 @@ def build_single_scenario(name, objective, crew_mode, loads, route_data, truck_s
     snapshot_loads = build_load_snapshot(loads, route_data, objective, source_options, source_inventory, source_nodes)
     tasks = build_task_graph(snapshot_loads, route_data, fleet, crew_mode, worker_rate_map, constraints)
     scheduled_tasks = schedule_tasks(tasks, fleet, constraints, objective)
+    validate_scheduled_tasks(scheduled_tasks, constraints, fleet)
     playback = build_playback(scheduled_tasks, route_data, fleet)
     metrics = summarize_metrics(scheduled_tasks, fleet, worker_rate_map, constraints)
     variant = {
@@ -1022,6 +1223,8 @@ def build_scenario_plans(
 ):
     constraints = {
         "maxConcurrentActivities": worker_shift_config.get("maxConcurrentActivities") if worker_shift_config else inputs.get("max_concurrent_site_activities", 3),
+        "maxConcurrentRigDownLoads": worker_shift_config.get("maxConcurrentRigDownLoads") if worker_shift_config else inputs.get("max_concurrent_rig_down_loads", 3),
+        "maxConcurrentRigUpLoads": worker_shift_config.get("maxConcurrentRigUpLoads") if worker_shift_config else inputs.get("max_concurrent_rig_up_loads", 3),
         "maxRigDownWorkers": worker_shift_config.get("maxRigDownWorkers") if worker_shift_config else inputs.get("max_rd_workers", 30),
         "maxRigUpWorkers": worker_shift_config.get("maxRigUpWorkers") if worker_shift_config else inputs.get("max_ru_workers", 30),
         "criticalWindowStartHour": inputs.get("critical_window_start_hour", 6),

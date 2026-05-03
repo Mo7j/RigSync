@@ -401,6 +401,7 @@ export function ManagerDashboardPage({
   foremen,
   managerResources,
   managerFleet,
+  dashboardError,
   onOpenMove,
   onCreateTruck,
   onCreateForeman,
@@ -1689,6 +1690,15 @@ export function ManagerDashboardPage({
     h(
       "div",
       { className: "manager-dashboard-shell" },
+      dashboardError
+        ? h(
+            Card,
+            { className: "dashboard-section-card manager-dashboard-panel" },
+            h("div", { className: "section-heading" }, h("h2", null, "Data issue")),
+            h("p", { className: "field-error" }, dashboardError),
+            h("p", { className: "muted-copy" }, "The dashboard now depends on live Firestore data only. Create or repair the missing document instead of relying on repo defaults."),
+          )
+        : null,
       h(
         "div",
         { className: "manager-dashboard-hero manager-dashboard-hero-grid" },

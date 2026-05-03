@@ -102,14 +102,17 @@ def _validate_fit(load_template, compatible_types, truck_specs_by_type):
     return False
 
 
-def import_dataset():
+def import_dataset(rebuild_app_state=False):
     if not DATASET_PATH.exists():
         raise FileNotFoundError(f"Dataset not found: {DATASET_PATH}")
 
     dataset = load_planning_dataset()
     with engine.begin() as connection:
         is_sqlite = engine.dialect.name == "sqlite"
-        for table_name in [*PLANNING_TABLES, *APP_STATE_TABLES, "rig_loads", "startup_loads"]:
+        tables_to_drop = [*PLANNING_TABLES, "rig_loads", "startup_loads"]
+        if rebuild_app_state:
+            tables_to_drop.extend(APP_STATE_TABLES)
+        for table_name in tables_to_drop:
             drop_sql = f"DROP TABLE IF EXISTS {table_name}"
             if not is_sqlite:
                 drop_sql += " CASCADE"
@@ -127,6 +130,10 @@ def import_dataset():
 
     session = SessionLocal()
     try:
+        allowed_truck_type_count = 0
+        role_requirement_count = 0
+        dependency_count = 0
+
         for row in dataset["truck_specs"]:
             session.add(
                 TruckSpec(
@@ -170,6 +177,7 @@ def import_dataset():
                         truck_type=truck_type,
                     )
                 )
+                allowed_truck_type_count += 1
 
             role_requirement_sets = [
                 ("rig_down", "minimum", row.get("minimum_crew_down_roles") or {}),
@@ -188,6 +196,7 @@ def import_dataset():
                             required_count=max(0, int(required_count or 0)),
                         )
                     )
+                    role_requirement_count += 1
 
         session.flush()
 
@@ -220,6 +229,7 @@ def import_dataset():
                             predecessor_activity_code=dependency_ref,
                         )
                     )
+                    dependency_count += 1
 
         session.flush()
 
@@ -229,23 +239,20 @@ def import_dataset():
             if compatible_types and not _validate_fit(template, compatible_types, truck_specs_by_type):
                 invalid_codes.append(template.code)
 
-        if invalid_codes:
-            raise ValueError(
-                "The dataset contains infeasible load/truck mappings: "
-                + ", ".join(sorted(invalid_codes))
-            )
+        invalid_codes = sorted(set(invalid_codes))
 
         session.commit()
         return {
             "rig_loads": len(dataset["rig_loads"]),
             "startup_loads": len(dataset["startup_loads"]),
             "load_templates": len(templates_by_code),
-            "load_dependencies": session.query(LoadDependency).count(),
-            "load_allowed_truck_types": session.query(LoadAllowedTruckType).count(),
-            "load_role_requirements": session.query(LoadRoleRequirement).count(),
+            "load_dependencies": dependency_count,
+            "load_allowed_truck_types": allowed_truck_type_count,
+            "load_role_requirements": role_requirement_count,
             "truck_specs": len(truck_specs_by_type),
             "source": str(DATASET_PATH),
             "planning_tables": PLANNING_TABLES,
+            "invalid_load_truck_mappings": invalid_codes,
         }
     except Exception:
         session.rollback()
@@ -255,7 +262,7 @@ def import_dataset():
 
 
 if __name__ == "__main__":
-    result = import_dataset()
+    result = import_dataset(rebuild_app_state=False)
     print(
         "Planning dataset import completed.\n"
         f"Source workbook: {result['source']}\n"

@@ -6,6 +6,12 @@ import {
 
 export { DEFAULT_CENTER };
 
+const MAX_CONCURRENT_ACTIVITIES = 3;
+const SCHEDULER_TIME_STEP_MINUTES = 15;
+const PROJECT_OVERHEAD_SAR_PER_DAY = 5000;
+const TRUCK_STANDBY_COST_FACTOR = 0.35;
+const CREW_STANDBY_COST_FACTOR = 0.12;
+
 function yieldToBrowser() {
   return new Promise((resolve) => {
     window.setTimeout(resolve, 0);
@@ -584,6 +590,37 @@ function buildSchedules(loads, truckCapacity, workerCapacity, objective, truckCo
   return waves;
 }
 
+function overlaps(startA, endA, startB, endB) {
+  return startA < endB && startB < endA;
+}
+
+function normalizeTaskPhaseKey(phase) {
+  return String(phase || "").trim().toLowerCase().replace(/[^a-z]/g, "");
+}
+
+function countConcurrentTasks(tasks = [], startMinute = 0, endMinute = 0, phases = []) {
+  const allowedPhases = new Set((phases || []).map((phase) => normalizeTaskPhaseKey(phase)).filter(Boolean));
+  return (tasks || []).filter((task) =>
+    allowedPhases.has(normalizeTaskPhaseKey(task.phase)) &&
+    overlaps(startMinute, endMinute, task.startMinute, task.endMinute)
+  ).length;
+}
+
+function findNextConcurrencySlot(tasks = [], earliestStart = 0, durationMinutes = 0, phases = [], limit = MAX_CONCURRENT_ACTIVITIES) {
+  let candidate = Math.max(0, Math.floor(earliestStart || 0));
+  const safeDuration = Math.max(1, Math.round(durationMinutes || 1));
+
+  for (let iteration = 0; iteration < 20000; iteration += 1) {
+    const concurrentCount = countConcurrentTasks(tasks, candidate, candidate + safeDuration, phases);
+    if (concurrentCount < limit) {
+      return candidate;
+    }
+    candidate += SCHEDULER_TIME_STEP_MINUTES;
+  }
+
+  return candidate;
+}
+
 function estimateTravelMinutes(distanceKm, fallbackMinutes, load, truckSpec) {
   if (load.routeMinutesByTruck?.[truckSpec?.type]) {
     return load.routeMinutesByTruck[truckSpec.type];
@@ -847,7 +884,7 @@ function selectTruckForLoad(trucks, load, stageReadyAt, objective, routeDistance
   }, null);
 }
 
-function summarizePlaybackMetrics(playback, truckCostByType, workerCount, workerHourlyCost) {
+function summarizePlaybackMetrics(playback, truckCostByType, workerCount, workerHourlyCost, allocatedTruckCount = null) {
   const trips = playback?.trips || [];
   const journeys = playback?.journeys?.length ? playback.journeys : trips;
   const totalMinutes = Math.max(1, playback?.totalMinutes || 1);
@@ -896,28 +933,68 @@ function summarizePlaybackMetrics(playback, truckCostByType, workerCount, worker
     0,
   );
   const workerCost = (workerActiveMinutes * workerHourlyCost) / 60;
-  const truckCount = new Set(journeys.map((trip) => trip.truckId)).size || 1;
-  const truckCapacityMinutes = truckCount * totalMinutes;
-  const workerCapacityMinutes = Math.max(1, workerCount) * totalMinutes;
-  const truckUtilization = Math.min(100, Math.round((truckActiveMinutes / Math.max(truckCapacityMinutes, 1)) * 100));
-  const workerUtilization = Math.min(100, Math.round((workerActiveMinutes / Math.max(workerCapacityMinutes, 1)) * 100));
-  const utilization = Math.min(
-    100,
-    Math.round(((truckActiveMinutes + workerActiveMinutes) / Math.max(truckCapacityMinutes + workerCapacityMinutes, 1)) * 100),
+  const usedTruckCount = Math.max(1, new Set(journeys.map((trip) => trip.truckId)).size || 1);
+  const configuredTruckCount = Math.max(usedTruckCount, Number.parseInt(allocatedTruckCount, 10) || 0);
+  const utilizationWindowByTruck = new Map();
+  journeys.forEach((trip) => {
+    const truckId = trip.truckId;
+    const dispatchStart = trip.dispatchStart || trip.pickupLoadStart || trip.loadStart || 0;
+    const returnToSource = trip.returnToSource || trip.unloadDropFinish || trip.arrivalAtDestination || dispatchStart;
+    const current = utilizationWindowByTruck.get(truckId) || { startMinute: dispatchStart, endMinute: returnToSource };
+    current.startMinute = Math.min(current.startMinute, dispatchStart);
+    current.endMinute = Math.max(current.endMinute, returnToSource);
+    utilizationWindowByTruck.set(truckId, current);
+  });
+  const truckUtilizationWindowMinutes = [...utilizationWindowByTruck.values()].reduce(
+    (sum, window) => sum + Math.max(0, window.endMinute - window.startMinute),
+    0,
   );
-  const idleMinutes = Math.max(0, truckCapacityMinutes - truckActiveMinutes);
+  const truckCapacityMinutes = configuredTruckCount * totalMinutes;
+  const workerCapacityMinutes = Math.max(1, workerCount) * totalMinutes;
+  const truckWindowUtilization = Math.min(
+    100,
+    Math.round((truckActiveMinutes / Math.max(truckUtilizationWindowMinutes, 1)) * 100),
+  );
+  const fleetUtilization = Math.min(100, Math.round((truckActiveMinutes / Math.max(truckCapacityMinutes, 1)) * 100));
+  const workerUtilization = Math.min(100, Math.round((workerActiveMinutes / Math.max(workerCapacityMinutes, 1)) * 100));
+  const truckUtilization = Math.min(
+    100,
+    Math.round((truckWindowUtilization * 0.35) + (fleetUtilization * 0.65)),
+  );
+  const utilization = Math.min(100, Math.round((fleetUtilization * 0.7) + (workerUtilization * 0.3)));
+  const idleMinutes = Math.max(0, truckUtilizationWindowMinutes - truckActiveMinutes);
+  const fleetIdleMinutes = Math.max(0, truckCapacityMinutes - truckActiveMinutes);
   const workerIdleMinutes = Math.max(0, workerCapacityMinutes - workerActiveMinutes);
+  const averageTruckHourlyRate = configuredTruckCount > 0
+    ? ((usedTruckSetup || []).reduce((sum, truck) => {
+      const hourlyRate = truckCostByType.get(normalizeTruckTypeKey(truck.type)) || 0;
+      return sum + (hourlyRate * Math.max(0, Number(truck.count) || 0));
+    }, 0) / configuredTruckCount)
+    : 0;
+  const standbyTruckCost = (fleetIdleMinutes / 60) * averageTruckHourlyRate * TRUCK_STANDBY_COST_FACTOR;
+  const standbyCrewCost = (workerIdleMinutes / 60) * Math.max(0, workerHourlyCost) * CREW_STANDBY_COST_FACTOR;
+  const transportCost = Math.round(truckCost + standbyTruckCost);
+  const laborCost = Math.round(workerCost + standbyCrewCost);
+  const overheadCost = Math.round(Math.ceil(totalMinutes / (24 * 60)) * PROJECT_OVERHEAD_SAR_PER_DAY);
+  const totalCost = transportCost + laborCost + overheadCost;
 
   return {
     usedTruckCount: Math.max(1, usedTruckIds.length),
+    allocatedTruckCount: configuredTruckCount,
     usedTruckSetup,
+    truckWindowUtilization,
     truckUtilization,
+    fleetUtilization,
     workerUtilization,
     utilization,
     idleMinutes,
+    fleetIdleMinutes,
     workerIdleMinutes,
     workerActiveMinutes,
-    costEstimate: Math.round(truckCost + workerCost),
+    transportCost,
+    laborCost,
+    overheadCost,
+    costEstimate: totalCost,
   };
 }
 
@@ -1021,6 +1098,32 @@ function alignToDaytime(totalMinutes, startClockMinutes = 360) {
     minute += 30;
   }
   return minute;
+}
+
+function alignToShiftWindow(totalMinutes, shiftType = "day", startClockMinutes = 360) {
+  const window = getShiftWindow(shiftType, Math.max(0, Math.floor(totalMinutes || 0)), startClockMinutes);
+  if ((totalMinutes || 0) < window.start) {
+    return window.start;
+  }
+  if ((totalMinutes || 0) >= window.end) {
+    return getShiftWindow(shiftType, window.end + 1, startClockMinutes).start;
+  }
+  return Math.max(0, Math.floor(totalMinutes || 0));
+}
+
+function alignTaskStartWithinShift(totalMinutes, durationMinutes, shiftType = "day", startClockMinutes = 360) {
+  const safeDuration = Math.max(1, Math.round(durationMinutes || 1));
+  let candidate = alignToShiftWindow(totalMinutes, shiftType, startClockMinutes);
+
+  for (let iteration = 0; iteration < 16; iteration += 1) {
+    const window = getShiftWindow(shiftType, candidate, startClockMinutes);
+    if ((candidate + safeDuration) <= window.end) {
+      return candidate;
+    }
+    candidate = getShiftWindow(shiftType, window.end + 1, startClockMinutes).start;
+  }
+
+  return candidate;
 }
 
 function alignCriticalWindow(dispatchStart, pickupRouteMinutes, rigDownDuration, routeMinutes, rigUpDuration, startClockMinutes) {
@@ -1799,6 +1902,7 @@ function scheduleCrewTask({
   workerShiftConfig,
   startClockMinutes,
   allowedShiftTypes = null,
+  mustFinishWithinShift = false,
 }) {
   const hasRoleRoster = Object.keys(workerShiftConfig?.roles || {}).length > 0;
   const minimumRoleRequirements = hasRoleRoster
@@ -1818,8 +1922,16 @@ function scheduleCrewTask({
     : 1;
   const preferredWorkers = objective === "cheapest" ? minWorkers : maxPreferredWorkers;
   let attempt = Math.max(0, Math.floor(earliestStart || 0));
+  const constrainedShiftType = allowedShiftTypes?.length === 1 ? allowedShiftTypes[0] : null;
+  if (mustFinishWithinShift && constrainedShiftType) {
+    attempt = alignTaskStartWithinShift(attempt, averageMinutes, constrainedShiftType, startClockMinutes);
+  }
 
   for (let iteration = 0; iteration < 20000; iteration += 1) {
+    if (mustFinishWithinShift && constrainedShiftType) {
+      attempt = alignTaskStartWithinShift(attempt, averageMinutes, constrainedShiftType, startClockMinutes);
+    }
+
     const trialPool = workerPool.map((worker) => ({ ...worker }));
     const assignments = [];
     const aggregateRoleCounts = {};
@@ -1924,6 +2036,11 @@ function scheduleCrewTask({
       }
 
       const segmentEndLimit = Math.min(...selectedWorkers.map((worker) => getWorkerShiftEnd(worker, segmentStart, startClockMinutes)));
+      if (mustFinishWithinShift && constrainedShiftType && (segmentStart + Math.max(1, Math.round(averageMinutes || 1))) > segmentEndLimit) {
+        nextAttemptHint = getShiftWindow(constrainedShiftType, segmentEndLimit + 1, startClockMinutes).start;
+        madeProgress = false;
+        break;
+      }
       const minutesNeeded = Math.ceil(remainingWork / rate);
       const segmentEnd = Math.min(segmentEndLimit, segmentStart + minutesNeeded);
       const workedMinutes = segmentEnd - segmentStart;
@@ -1986,6 +2103,9 @@ function scheduleCrewTask({
     }
 
     attempt = Math.max(attempt + 15, nextAttemptHint || 0);
+    if (mustFinishWithinShift && constrainedShiftType) {
+      attempt = alignTaskStartWithinShift(attempt, averageMinutes, constrainedShiftType, startClockMinutes);
+    }
   }
 
   throw new Error(`No ${phase} worker crew could be scheduled for ${load?.description || "load"}.`);
@@ -2135,10 +2255,16 @@ export async function buildPlayback(
     const bestCandidate = eligibleTrucks.reduce((best, truck) => {
       try {
         const candidateWorkerPool = workerPool.map((worker) => ({ ...worker }));
+        const rigDownEarliestStart = findNextConcurrencySlot(
+          actualTasks,
+          dependencyReadyAt,
+          load.rig_down_duration,
+          ["rig_down", "rig_up"],
+        );
         const rigDownTask = scheduleCrewTask({
           phase: "rig-down",
           load,
-          earliestStart: dependencyReadyAt,
+          earliestStart: rigDownEarliestStart,
           averageMinutes: load.rig_down_duration,
           optimalMinutes: load.optimal_rig_down_duration,
           objective,
@@ -2146,6 +2272,7 @@ export async function buildPlayback(
           workerShiftConfig,
           startClockMinutes,
           allowedShiftTypes: criticalCrewShiftTypes,
+          mustFinishWithinShift: Boolean(load.is_critical),
         });
         const baseRouteMinutes = estimateTravelMinutes(plan.routeDistanceKm, plan.routeMinutes, load, truck.spec);
         const pickupRouteMinutes = Math.max(0, Number(load.pickupRouteMinutes) || 0);
@@ -2210,10 +2337,16 @@ export async function buildPlayback(
           startClockMinutes,
           allowedShiftTypes: null,
         });
+        const rigUpEarliestStart = findNextConcurrencySlot(
+          actualTasks,
+          Math.max(unloadDropTask.endMinute, rigUpDependencyReadyAt),
+          load.rig_up_duration,
+          ["rig_down", "rig_up"],
+        );
         const rigUpTask = scheduleCrewTask({
           phase: "rig-up",
           load,
-          earliestStart: Math.max(unloadDropTask.endMinute, rigUpDependencyReadyAt),
+          earliestStart: rigUpEarliestStart,
           averageMinutes: load.rig_up_duration,
           optimalMinutes: load.optimal_rig_up_duration,
           objective,
@@ -2221,6 +2354,7 @@ export async function buildPlayback(
           workerShiftConfig,
           startClockMinutes,
           allowedShiftTypes: load.is_critical ? ["day"] : null,
+          mustFinishWithinShift: Boolean(load.is_critical),
         });
 
         const returnStart = unloadDropTask.endMinute;
@@ -2737,7 +2871,7 @@ export async function buildScenarioPlans(
               totalEvaluations: totalScenarioEvaluations,
             },
           );
-        const metrics = summarizePlaybackMetrics(playback, truckCostByType, profileWorkerCount, workerHourlyCost);
+        const metrics = summarizePlaybackMetrics(playback, truckCostByType, profileWorkerCount, workerHourlyCost, scenarioTruckCount);
         const usedTruckSetup = buildUsedTruckSetup(metrics.usedTruckSetup, candidateTruckSetup);
         const usedTruckCount = usedTruckSetup.reduce((sum, truck) => sum + truck.count, 0) || metrics.usedTruckCount;
         const bestVariant = {
@@ -2754,15 +2888,15 @@ export async function buildScenarioPlans(
           objective: definition.objective,
           workerCount: scenarioWorkerCapacity,
           workerShifts: splitShiftCapacity(scenarioWorkerCapacity),
-          truckCount: usedTruckCount,
-          allocatedTruckCount: usedTruckCount,
-          capacity: usedTruckCount,
+          truckCount: scenarioTruckCount,
+          allocatedTruckCount: scenarioTruckCount,
+          capacity: scenarioTruckCount,
           routeMinutes: routeData.minutes,
           routeDistanceKm: routeData.distanceKm,
           routeSource: routeData.source,
           routeGeometry: routeData.geometry,
-          truckSetup: usedTruckSetup,
-          allocatedTruckSetup: usedTruckSetup,
+          truckSetup: candidateTruckSetup,
+          allocatedTruckSetup: candidateTruckSetup,
           usedTruckSetup,
           requestedTruckCount: scenarioTruckCount,
           requestedTruckSetup: candidateTruckSetup,
@@ -2775,8 +2909,10 @@ export async function buildScenarioPlans(
           waves,
           utilization: metrics.utilization,
           truckUtilization: metrics.truckUtilization,
+          fleetUtilization: metrics.fleetUtilization,
           workerUtilization: metrics.workerUtilization,
           idleMinutes: metrics.idleMinutes,
+          fleetIdleMinutes: metrics.fleetIdleMinutes,
           workerIdleMinutes: metrics.workerIdleMinutes,
           costEstimate: metrics.costEstimate,
         };
@@ -2819,6 +2955,67 @@ export async function buildScenarioPlans(
 
 function reverseGeometry(geometry) {
   return [...geometry].reverse();
+}
+
+function normalizeCoordinatePoint(point) {
+  if (Array.isArray(point)) {
+    const lat = Number(point[0]);
+    const lng = Number(point[1]);
+    return Number.isFinite(lat) && Number.isFinite(lng) ? { lat, lng } : null;
+  }
+
+  if (point && typeof point === "object") {
+    const lat = Number(point.lat);
+    const lng = Number(point.lng);
+    return Number.isFinite(lat) && Number.isFinite(lng) ? { lat, lng } : null;
+  }
+
+  return null;
+}
+
+function getTripPickupStartMinute(trip) {
+  return trip?.dispatchStart ?? trip?.pickupLoadStart ?? trip?.loadStart ?? 0;
+}
+
+function getTripPickupEndMinute(trip) {
+  return trip?.pickupLoadStart ?? trip?.loadStart ?? getTripPickupStartMinute(trip);
+}
+
+function getTripLoadedMoveStartMinute(trip) {
+  return trip?.moveStart ?? trip?.pickupLoadFinish ?? trip?.rigDownFinish ?? getTripPickupEndMinute(trip);
+}
+
+function shouldStageTruckAtDestination(trip) {
+  return (trip?.sourceKind || "rig") === "startup";
+}
+
+function getTripTerminalPoint(trip, fallbackGeometry = []) {
+  const tripGeometry = trip?.routeGeometry?.length ? trip.routeGeometry : fallbackGeometry;
+  if (!tripGeometry?.length) {
+    return null;
+  }
+
+  const endsAtDestination = trip?.returnToSource == null;
+  const target = endsAtDestination
+    ? tripGeometry[tripGeometry.length - 1]
+    : getTripBasePoint(trip, fallbackGeometry);
+  return normalizeCoordinatePoint(target);
+}
+
+function getTripBasePoint(trip, fallbackGeometry = []) {
+  const tripGeometry = trip?.routeGeometry?.length ? trip.routeGeometry : fallbackGeometry;
+  const pickupGeometry = trip?.pickupRouteGeometry?.length ? trip.pickupRouteGeometry : null;
+  const basePoint = shouldStageTruckAtDestination(trip)
+    ? (pickupGeometry?.[0] || tripGeometry?.[tripGeometry.length - 1] || fallbackGeometry?.[fallbackGeometry.length - 1] || tripGeometry?.[0] || fallbackGeometry?.[0])
+    : (pickupGeometry?.[0] || tripGeometry?.[0] || fallbackGeometry?.[0]);
+  return normalizeCoordinatePoint(basePoint);
+}
+
+function getTripOriginPoint(trip, fallbackGeometry = []) {
+  const tripGeometry = trip?.routeGeometry?.length ? trip.routeGeometry : fallbackGeometry;
+  const pickupGeometry = trip?.pickupRouteGeometry?.length ? trip.pickupRouteGeometry : null;
+  const origin = pickupGeometry?.[0] || tripGeometry?.[0] || fallbackGeometry?.[0];
+  return normalizeCoordinatePoint(origin);
 }
 
 function resolvePlaybackTruckId(playback, truckId) {
@@ -2907,6 +3104,136 @@ function getSourceAssignmentMoveState(sourceAssignment = null, returnAssignment 
   return "returned";
 }
 
+function getPlannedTruckExecutionState(truckTrips, currentMinute) {
+  let completedTrip = null;
+
+  for (const trip of truckTrips) {
+    const dispatchStartMinute = getTripPickupStartMinute(trip);
+    const pickupArrivalMinute = getTripPickupEndMinute(trip);
+    const moveStartMinute = getTripLoadedMoveStartMinute(trip);
+    const moveFinishMinute = trip.arrivalAtDestination ?? moveStartMinute;
+    const stageAtDestination = shouldStageTruckAtDestination(trip);
+    const returnStartMinute = trip.returnStart ?? trip.unloadDropFinish ?? trip.rigUpFinish ?? moveFinishMinute;
+    const returnFinishMinute = trip.returnToSource ?? returnStartMinute;
+
+    if (currentMinute < dispatchStartMinute) {
+      return {
+        phase: "parkedSource",
+        truckTrips,
+        trip,
+        completedTrip,
+        sourceAssignment: null,
+        returnAssignment: null,
+        moveState: "readyOutbound",
+        outboundRatio: 0,
+        inboundRatio: 0,
+      };
+    }
+
+    if (currentMinute < pickupArrivalMinute) {
+      return {
+        phase: "movingPickup",
+        truckTrips,
+        trip,
+        completedTrip,
+        sourceAssignment: null,
+        returnAssignment: null,
+        moveState: "movingPickup",
+        outboundRatio: 0,
+        inboundRatio: 0,
+      };
+    }
+
+    if (currentMinute < moveFinishMinute) {
+      return {
+        phase: currentMinute >= moveStartMinute ? "movingOutbound" : "parkedSource",
+        truckTrips,
+        trip,
+        completedTrip,
+        sourceAssignment: null,
+        returnAssignment: null,
+        moveState: currentMinute >= moveStartMinute ? "movingOutbound" : "readyOutbound",
+        outboundRatio: Math.max(0, Math.min(1, (currentMinute - moveStartMinute) / Math.max(moveFinishMinute - moveStartMinute, 1))),
+        inboundRatio: 0,
+      };
+    }
+
+    if (stageAtDestination) {
+      if (currentMinute < returnFinishMinute) {
+        return {
+          phase: "parkedDestination",
+          truckTrips,
+          trip,
+          completedTrip,
+          sourceAssignment: null,
+          returnAssignment: null,
+          moveState: "readyReturn",
+          outboundRatio: 1,
+          inboundRatio: 0,
+        };
+      }
+      completedTrip = trip;
+      continue;
+    }
+
+    if (trip.returnToSource == null) {
+      return {
+        phase: "parkedDestination",
+        truckTrips,
+        trip,
+        completedTrip,
+        sourceAssignment: null,
+        returnAssignment: null,
+        moveState: "readyReturn",
+        outboundRatio: 1,
+        inboundRatio: 0,
+      };
+    }
+
+    if (currentMinute < returnStartMinute) {
+      return {
+        phase: "parkedDestination",
+        truckTrips,
+        trip,
+        completedTrip,
+        sourceAssignment: null,
+        returnAssignment: null,
+        moveState: "readyReturn",
+        outboundRatio: 1,
+        inboundRatio: 0,
+      };
+    }
+
+    if (currentMinute < returnFinishMinute) {
+      return {
+        phase: "movingReturn",
+        truckTrips,
+        trip,
+        completedTrip,
+        sourceAssignment: null,
+        returnAssignment: null,
+        moveState: "movingReturn",
+        outboundRatio: 1,
+        inboundRatio: Math.max(0, Math.min(1, (currentMinute - returnStartMinute) / Math.max(returnFinishMinute - returnStartMinute, 1))),
+      };
+    }
+
+    completedTrip = trip;
+  }
+
+  return {
+    phase: "parkedSource",
+    truckTrips,
+    trip: null,
+    completedTrip: completedTrip || truckTrips[truckTrips.length - 1] || null,
+    sourceAssignment: null,
+    returnAssignment: null,
+    moveState: completedTrip ? "returned" : "readyOutbound",
+    outboundRatio: completedTrip ? 1 : 0,
+    inboundRatio: completedTrip ? 1 : 0,
+  };
+}
+
 export function getTruckExecutionState(playback, currentMinute, truckId, executionAssignments = []) {
   const resolvedTruckId = resolvePlaybackTruckId(playback, truckId);
   const truckTrips = (playback?.trips || [])
@@ -2930,10 +3257,20 @@ export function getTruckExecutionState(playback, currentMinute, truckId, executi
     };
   }
 
+  if (!(executionAssignments || []).length) {
+    return getPlannedTruckExecutionState(truckTrips, currentMinute);
+  }
+
   let completedTrip = null;
   for (const trip of truckTrips) {
     const { sourceAssignment, returnAssignment } = resolveTripExecutionAssignments(executionAssignments, trip);
     if (!sourceAssignment) {
+      const loadStartMinute = trip.loadStart ?? trip.rigDownStart ?? trip.dispatchStart ?? trip.moveStart ?? 0;
+      const tripEndMinute = trip.returnToSource ?? trip.unloadDropFinish ?? trip.rigUpFinish ?? trip.arrivalAtDestination ?? loadStartMinute;
+      if (currentMinute <= tripEndMinute) {
+        return getPlannedTruckExecutionState(truckTrips, currentMinute);
+      }
+      completedTrip = trip;
       continue;
     }
 
@@ -2947,6 +3284,7 @@ export function getTruckExecutionState(playback, currentMinute, truckId, executi
     const moveFinishMinute = trip.arrivalAtDestination ?? moveStartMinute;
     const returnStartMinute = trip.returnStart ?? trip.unloadDropFinish ?? trip.arrivalAtDestination ?? moveFinishMinute;
     const returnFinishMinute = trip.returnToSource ?? returnStartMinute;
+    const stageAtDestination = shouldStageTruckAtDestination(trip);
     const outboundRatio = Math.max(0, Math.min(1, (currentMinute - moveStartMinute) / Math.max(moveFinishMinute - moveStartMinute, 1)));
     const inboundRatio = Math.max(0, Math.min(1, (currentMinute - returnStartMinute) / Math.max(returnFinishMinute - returnStartMinute, 1)));
 
@@ -2958,7 +3296,9 @@ export function getTruckExecutionState(playback, currentMinute, truckId, executi
     } else if (moveState === "readyReturn") {
       phase = "parkedDestination";
     } else if (moveState === "movingReturn") {
-      phase = currentMinute >= returnFinishMinute ? "holdReturn" : "movingReturn";
+      phase = stageAtDestination
+        ? "parkedDestination"
+        : currentMinute >= returnFinishMinute ? "holdReturn" : "movingReturn";
     }
 
     return {
@@ -3045,6 +3385,7 @@ export function getTruckStatus(playback, currentMinute, truckId) {
   const executionState = getTruckExecutionState(playback, currentMinute, truckId, []);
   const activeTrip = executionState.trip;
   const truckTrips = executionState.truckTrips;
+  const pickupStartMinute = activeTrip ? getTripPickupStartMinute(activeTrip) : null;
 
   if (executionState.phase === "parkedDestination" || executionState.phase === "holdOutbound") {
     return activeTrip ? `Delivered #${activeTrip.loadId}` : "Delivered";
@@ -3061,7 +3402,10 @@ export function getTruckStatus(playback, currentMinute, truckId) {
     return "Waiting";
   }
 
-  if (activeTrip.dispatchStart != null && currentMinute < (activeTrip.pickupLoadStart ?? activeTrip.loadStart)) {
+  if (executionState.phase === "parkedSource" && pickupStartMinute != null && currentMinute < pickupStartMinute) {
+    return `Waiting for pickup #${activeTrip.loadId}`;
+  }
+  if (executionState.phase === "movingPickup") {
     return `Heading to pickup #${activeTrip.loadId}`;
   }
   if (currentMinute < (activeTrip.pickupLoadFinish ?? activeTrip.moveStart ?? activeTrip.rigDownFinish)) {
@@ -3137,7 +3481,7 @@ export function getTruckDelayState(playback, currentMinute, truckId, executionAs
 export function getTruckPosition(playback, geometry, currentMinute, truckId, executionAssignments = []) {
   const executionState = getTruckExecutionState(playback, currentMinute, truckId, executionAssignments);
   const activeTrip = executionState.trip;
-  const nextTrip = executionState.truckTrips.find((trip) => currentMinute < (trip.dispatchStart ?? trip.pickupLoadStart ?? trip.loadStart)) || null;
+  const nextTrip = executionState.truckTrips.find((trip) => currentMinute < getTripPickupStartMinute(trip)) || null;
   const deliveredTrip = executionState.completedTrip;
   const activeGeometry = activeTrip?.routeGeometry?.length ? activeTrip.routeGeometry : geometry;
   const pickupGeometry = activeTrip?.pickupRouteGeometry?.length ? activeTrip.pickupRouteGeometry : null;
@@ -3149,13 +3493,8 @@ export function getTruckPosition(playback, geometry, currentMinute, truckId, exe
   }
 
   if (!activeTrip) {
-    const nextGeometry =
-      nextTrip?.pickupRouteGeometry?.length
-        ? nextTrip.pickupRouteGeometry
-        : nextTrip?.routeGeometry?.length
-          ? nextTrip.routeGeometry
-          : geometry;
-    const deliveredGeometry = deliveredTrip?.routeGeometry?.length ? deliveredTrip.routeGeometry : geometry;
+    const deliveredPoint = deliveredTrip ? getTripTerminalPoint(deliveredTrip, geometry) : null;
+    const nextOriginPoint = nextTrip ? getTripBasePoint(nextTrip, geometry) : null;
     const { sourceAssignment, returnAssignment } = resolveTripExecutionAssignments(executionAssignments, deliveredTrip);
     const shouldHoldDeliveredAtDestination = Boolean(
       deliveredTrip &&
@@ -3163,41 +3502,57 @@ export function getTruckPosition(playback, geometry, currentMinute, truckId, exe
       !returnAssignment?.moveStartedAt &&
       !returnAssignment?.returnedToSourceAt,
     );
-    const target = deliveredTrip && !deliveredTrip.returnToSource
-      ? deliveredGeometry?.[deliveredGeometry.length - 1]
-      : shouldHoldDeliveredAtDestination
-        ? deliveredGeometry?.[deliveredGeometry.length - 1]
-      : nextTrip
-        ? nextGeometry?.[0]
-        : deliveredGeometry?.[0] || geometry?.[0];
-    if (!target) {
-      return null;
+    if (shouldHoldDeliveredAtDestination && deliveredPoint) {
+      return deliveredPoint;
     }
-    return { lat: target[0], lng: target[1] };
+    if (deliveredPoint) {
+      return deliveredPoint;
+    }
+    return nextOriginPoint;
+  }
+
+  if (executionState.phase === "movingPickup") {
+    if (pickupGeometry?.length) {
+      const pickupStartMinute = getTripPickupStartMinute(activeTrip);
+      const pickupEndMinute = getTripPickupEndMinute(activeTrip);
+      return interpolatePath(
+        pickupGeometry,
+        (currentMinute - pickupStartMinute) / Math.max(pickupEndMinute - pickupStartMinute, 1),
+      );
+    }
+    if (shouldStageTruckAtDestination(activeTrip) && outbound?.length) {
+      const pickupStartMinute = getTripPickupStartMinute(activeTrip);
+      const pickupEndMinute = getTripPickupEndMinute(activeTrip);
+      return interpolatePath(
+        inbound,
+        (currentMinute - pickupStartMinute) / Math.max(pickupEndMinute - pickupStartMinute, 1),
+      );
+    }
+    return getTripBasePoint(activeTrip, geometry);
   }
 
   if (executionState.phase === "parkedSource") {
-    return { lat: outbound[0][0], lng: outbound[0][1] };
+    if (currentMinute < getTripPickupStartMinute(activeTrip)) {
+      const completedTripPoint = executionState.completedTrip ? getTripTerminalPoint(executionState.completedTrip, geometry) : null;
+      if (completedTripPoint) {
+        return completedTripPoint;
+      }
+      const basePoint = getTripBasePoint(activeTrip, geometry);
+      if (basePoint) {
+        return basePoint;
+      }
+    }
+    return normalizeCoordinatePoint(outbound[0]);
   }
   if (executionState.phase === "parkedDestination" || executionState.phase === "holdOutbound") {
-    return { lat: outbound[outbound.length - 1][0], lng: outbound[outbound.length - 1][1] };
+    return normalizeCoordinatePoint(outbound[outbound.length - 1]);
   }
   if (executionState.phase === "holdReturn") {
-    return { lat: outbound[0][0], lng: outbound[0][1] };
+    return getTripBasePoint(activeTrip, geometry) || normalizeCoordinatePoint(outbound[0]);
   }
 
-  if (currentMinute < (activeTrip.pickupLoadStart ?? activeTrip.loadStart)) {
-    if (pickupGeometry?.length && currentMinute < (activeTrip.pickupLoadStart ?? activeTrip.loadStart)) {
-      return interpolatePath(
-        pickupGeometry,
-        (currentMinute - (activeTrip.dispatchStart ?? activeTrip.pickupLoadStart ?? activeTrip.loadStart)) /
-          (((activeTrip.pickupLoadStart ?? activeTrip.loadStart) - (activeTrip.dispatchStart ?? activeTrip.pickupLoadStart ?? activeTrip.loadStart)) || 1),
-      );
-    }
-    return { lat: outbound[0][0], lng: outbound[0][1] };
-  }
   if (currentMinute < (activeTrip.moveStart ?? activeTrip.pickupLoadFinish ?? activeTrip.rigDownFinish)) {
-    return { lat: outbound[0][0], lng: outbound[0][1] };
+    return normalizeCoordinatePoint(outbound[0]);
   }
   if (currentMinute < activeTrip.arrivalAtDestination) {
     return interpolatePath(
@@ -3211,5 +3566,5 @@ export function getTruckPosition(playback, geometry, currentMinute, truckId, exe
       executionState.inboundRatio,
     );
   }
-  return { lat: outbound[outbound.length - 1][0], lng: outbound[outbound.length - 1][1] };
+  return normalizeCoordinatePoint(outbound[outbound.length - 1]);
 }

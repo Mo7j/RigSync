@@ -1,6 +1,8 @@
 const SHIFT_MINUTES = 12 * 60;
 const OVERHEAD_SAR_PER_DAY = 5000;
 const MAX_CONCURRENT_ACTIVITIES = 3;
+const MAX_CONCURRENT_RIG_DOWN_LOADS = 3;
+const MAX_CONCURRENT_RIG_UP_LOADS = 3;
 const MAX_RIG_DOWN_WORKERS = 30;
 const MAX_RIG_UP_WORKERS = 30;
 const SCHEDULER_TIME_STEP_MINUTES = 15;
@@ -618,6 +620,8 @@ function findEarliestStartWithConstraints(task, earliestStartMinute, scheduledIn
   const maxConcurrentActivities = Number.isFinite(rawMaxConcurrentActivities) && rawMaxConcurrentActivities > 0
     ? Math.max(1, Math.round(rawMaxConcurrentActivities))
     : null;
+  const maxConcurrentRigDownLoads = Math.max(1, Number(constraints?.maxConcurrentRigDownLoads) || MAX_CONCURRENT_RIG_DOWN_LOADS);
+  const maxConcurrentRigUpLoads = Math.max(1, Number(constraints?.maxConcurrentRigUpLoads) || MAX_CONCURRENT_RIG_UP_LOADS);
   const maxRigDownWorkers = Math.max(1, Number(constraints?.maxRigDownWorkers) || MAX_RIG_DOWN_WORKERS);
   const maxRigUpWorkers = Math.max(1, Number(constraints?.maxRigUpWorkers) || MAX_RIG_UP_WORKERS);
   const startClockMinutes =
@@ -655,6 +659,11 @@ function findEarliestStartWithConstraints(task, earliestStartMinute, scheduledIn
         endMinute,
         (interval) => interval.phaseCode === "RD",
       );
+      if (blockingIntervals.length >= maxConcurrentRigDownLoads) {
+        lastBlockingTaskIds = collectBlockingTaskIds(blockingIntervals);
+        minute += SCHEDULER_TIME_STEP_MINUTES;
+        continue;
+      }
       const rdWorkers = blockingIntervals.reduce((sum, interval) => sum + (interval.load || 0), 0);
       if (rdWorkers + task.siteWorkers > maxRigDownWorkers) {
         lastBlockingTaskIds = collectBlockingTaskIds(blockingIntervals);
@@ -670,6 +679,11 @@ function findEarliestStartWithConstraints(task, earliestStartMinute, scheduledIn
         endMinute,
         (interval) => interval.phaseCode === "RU",
       );
+      if (blockingIntervals.length >= maxConcurrentRigUpLoads) {
+        lastBlockingTaskIds = collectBlockingTaskIds(blockingIntervals);
+        minute += SCHEDULER_TIME_STEP_MINUTES;
+        continue;
+      }
       const ruWorkers = blockingIntervals.reduce((sum, interval) => sum + (interval.load || 0), 0);
       if (ruWorkers + task.siteWorkers > maxRigUpWorkers) {
         lastBlockingTaskIds = collectBlockingTaskIds(blockingIntervals);
@@ -798,6 +812,8 @@ function chooseTruckAssignment(task, earliestStartMinute, scheduledIntervals, tr
 function scheduleTasks(taskGraph, fleet, constraints = null, objective = "fastest") {
   const safeConstraints = constraints || {};
   const maxConcurrentActivities = Math.max(1, Number(safeConstraints.maxConcurrentActivities) || MAX_CONCURRENT_ACTIVITIES);
+  const maxConcurrentRigDownLoads = Math.max(1, Number(safeConstraints.maxConcurrentRigDownLoads) || MAX_CONCURRENT_RIG_DOWN_LOADS);
+  const maxConcurrentRigUpLoads = Math.max(1, Number(safeConstraints.maxConcurrentRigUpLoads) || MAX_CONCURRENT_RIG_UP_LOADS);
   const maxRigDownWorkers = Math.max(1, Number(safeConstraints.maxRigDownWorkers) || MAX_RIG_DOWN_WORKERS);
   const maxRigUpWorkers = Math.max(1, Number(safeConstraints.maxRigUpWorkers) || MAX_RIG_UP_WORKERS);
   const taskById = new Map(taskGraph.map((task) => [task.id, task]));
@@ -860,6 +876,8 @@ function scheduleTasks(taskGraph, fleet, constraints = null, objective = "fastes
 
   for (let guard = 0; guard < 200000 && completedTasks.size < totalTaskCount; guard += 1) {
     const readyTasks = getReadyTasks();
+    let activeRigDownCount = [...activeTasks.values()].filter((task) => task.phaseCode === "RD").length;
+    let activeRigUpCount = [...activeTasks.values()].filter((task) => task.phaseCode === "RU").length;
     let rdWorkers = [...activeTasks.values()]
       .filter((task) => task.phaseCode === "RD")
       .reduce((sum, task) => sum + (task.siteWorkers || 0), 0);
@@ -885,6 +903,12 @@ function scheduleTasks(taskGraph, fleet, constraints = null, objective = "fastes
         continue;
       }
 
+      if (task.phaseCode === "RD" && activeRigDownCount >= maxConcurrentRigDownLoads) {
+        continue;
+      }
+      if (task.phaseCode === "RU" && activeRigUpCount >= maxConcurrentRigUpLoads) {
+        continue;
+      }
       if (task.phaseCode === "RD" && (rdWorkers + task.siteWorkers) > maxRigDownWorkers) {
         continue;
       }
@@ -933,9 +957,11 @@ function scheduleTasks(taskGraph, fleet, constraints = null, objective = "fastes
       startedAny = true;
 
       if (task.phaseCode === "RD") {
+        activeRigDownCount += 1;
         rdWorkers += task.siteWorkers || 0;
       }
       if (task.phaseCode === "RU") {
+        activeRigUpCount += 1;
         ruWorkers += task.siteWorkers || 0;
       }
     }
@@ -1076,6 +1102,8 @@ function buildResourceUsageSeries(tasks = [], fleet = [], totalMinutes = 0, cons
 
 function validateScheduledTasks(tasks, constraints, fleet) {
   const maxConcurrentActivities = Number(constraints?.maxConcurrentActivities) || MAX_CONCURRENT_ACTIVITIES;
+  const maxConcurrentRigDownLoads = Number(constraints?.maxConcurrentRigDownLoads) || MAX_CONCURRENT_RIG_DOWN_LOADS;
+  const maxConcurrentRigUpLoads = Number(constraints?.maxConcurrentRigUpLoads) || MAX_CONCURRENT_RIG_UP_LOADS;
   const maxRigDownWorkers = Number(constraints?.maxRigDownWorkers) || MAX_RIG_DOWN_WORKERS;
   const maxRigUpWorkers = Number(constraints?.maxRigUpWorkers) || MAX_RIG_UP_WORKERS;
   const taskById = new Map(tasks.map((task) => [task.id, task]));
@@ -1109,6 +1137,8 @@ function validateScheduledTasks(tasks, constraints, fleet) {
   );
 
   const activeTaskIds = new Set();
+  let activeRigDownCount = 0;
+  let activeRigUpCount = 0;
   let activeRigDownWorkers = 0;
   let activeRigUpWorkers = 0;
 
@@ -1117,9 +1147,11 @@ function validateScheduledTasks(tasks, constraints, fleet) {
     if (event.type === "end") {
       activeTaskIds.delete(task.id);
       if (task.phaseCode === "RD") {
+        activeRigDownCount -= 1;
         activeRigDownWorkers -= task.siteWorkers || 0;
       }
       if (task.phaseCode === "RU") {
+        activeRigUpCount -= 1;
         activeRigUpWorkers -= task.siteWorkers || 0;
       }
       return;
@@ -1127,14 +1159,22 @@ function validateScheduledTasks(tasks, constraints, fleet) {
 
     activeTaskIds.add(task.id);
     if (task.phaseCode === "RD") {
+      activeRigDownCount += 1;
       activeRigDownWorkers += task.siteWorkers || 0;
     }
     if (task.phaseCode === "RU") {
+      activeRigUpCount += 1;
       activeRigUpWorkers += task.siteWorkers || 0;
     }
 
     if (activeTaskIds.size > maxConcurrentActivities) {
       throw new Error(`Concurrent activity cap exceeded while scheduling ${task.id}.`);
+    }
+    if (activeRigDownCount > maxConcurrentRigDownLoads) {
+      throw new Error(`Concurrent rig-down task cap exceeded while scheduling ${task.id}.`);
+    }
+    if (activeRigUpCount > maxConcurrentRigUpLoads) {
+      throw new Error(`Concurrent rig-up task cap exceeded while scheduling ${task.id}.`);
     }
     if (activeRigDownWorkers > maxRigDownWorkers) {
       throw new Error(`Rig-down worker cap exceeded while scheduling ${task.id}.`);
@@ -1703,6 +1743,8 @@ function buildScenario(loads, routeData, truckSetup, truckSpecs, scenarioDefinit
   const taskGraph = buildTaskGraph(loads, routeData, fleet, truckSpecMap, scenarioDefinition.crewMode);
   const effectiveConstraints = constraints || {
     maxConcurrentActivities: MAX_CONCURRENT_ACTIVITIES,
+    maxConcurrentRigDownLoads: MAX_CONCURRENT_RIG_DOWN_LOADS,
+    maxConcurrentRigUpLoads: MAX_CONCURRENT_RIG_UP_LOADS,
     maxRigDownWorkers: MAX_RIG_DOWN_WORKERS,
     maxRigUpWorkers: MAX_RIG_UP_WORKERS,
     startHour: 6,
@@ -1777,6 +1819,8 @@ function buildManualBaselineScenario(loads, routeData, truckSetup, truckSpecs) {
     { name: "Manual Baseline", objective: "baseline", crewMode: "optimal" },
     {
       maxConcurrentActivities: 1,
+      maxConcurrentRigDownLoads: MAX_CONCURRENT_RIG_DOWN_LOADS,
+      maxConcurrentRigUpLoads: MAX_CONCURRENT_RIG_UP_LOADS,
       maxRigDownWorkers: MAX_RIG_DOWN_WORKERS,
       maxRigUpWorkers: MAX_RIG_UP_WORKERS,
     },
@@ -1805,6 +1849,8 @@ export async function buildScenarioPlans(
   const onProgress = typeof progressOptions.onProgress === "function" ? progressOptions.onProgress : null;
   const scenarioConstraints = {
     maxConcurrentActivities: Math.max(1, Number(workerShiftConfig?.maxConcurrentActivities) || MAX_CONCURRENT_ACTIVITIES),
+    maxConcurrentRigDownLoads: Math.max(1, Number(workerShiftConfig?.maxConcurrentRigDownLoads) || MAX_CONCURRENT_RIG_DOWN_LOADS),
+    maxConcurrentRigUpLoads: Math.max(1, Number(workerShiftConfig?.maxConcurrentRigUpLoads) || MAX_CONCURRENT_RIG_UP_LOADS),
     maxRigDownWorkers: Math.max(1, Number(workerShiftConfig?.maxRigDownWorkers) || MAX_RIG_DOWN_WORKERS),
     maxRigUpWorkers: Math.max(1, Number(workerShiftConfig?.maxRigUpWorkers) || MAX_RIG_UP_WORKERS),
     startHour: Number.parseInt(workerShiftConfig?.startHour, 10) || 6,

@@ -3,91 +3,11 @@ import {
   FIREBASE_USER_ROLES,
   createFirebaseUserAccount,
   deleteUserProfile,
-  ensureSeedUsers,
   getUserProfileByEmail,
   getUserProfileById,
   signInFirebaseUser,
   upsertUserProfile,
 } from "../../lib/firebaseOperations.js";
-
-export const TEST_USERS = [
-  {
-    id: "manager-nasser",
-    email: "manager@rigsync.com",
-    password: "123123",
-    name: "Nasser Al-Harbi",
-    role: "Manager",
-    teamForemanIds: ["foreman-fahad", "foreman-salem"],
-  },
-  {
-    id: "foreman-fahad",
-    email: "fahad@rigsync.com",
-    password: "123123",
-    name: "Fahad Al-Qahtani",
-    role: "Foreman",
-    managerId: "manager-nasser",
-    assignedRig: {
-      id: "rig-286",
-      name: "Rig 286",
-      field: "Shaybah",
-      currentWell: "SBH-411",
-      startPoint: { lat: 22.4862, lng: 53.9124 },
-      startLabel: "Shaybah Pad 411",
-      drillingCompletion: 64,
-      dailyTargetHours: 18,
-    },
-  },
-  {
-    id: "foreman-salem",
-    email: "salem@rigsync.com",
-    password: "123123",
-    name: "Salem Al-Mutairi",
-    role: "Foreman",
-    managerId: "manager-nasser",
-    assignedRig: {
-      id: "rig-194",
-      name: "Rig 194",
-      field: "Jafurah",
-      currentWell: "JFR-208",
-      startPoint: { lat: 25.2541, lng: 49.2853 },
-      startLabel: "Jafurah Pad 208",
-      drillingCompletion: 49,
-      dailyTargetHours: 16,
-    },
-  },
-  {
-    id: "foreman-demo",
-    email: "demo@rigsync.com",
-    password: "123123",
-    name: "Demo Foreman",
-    role: "Foreman",
-    managerId: "manager-demo",
-    isDemo: true,
-    assignedRig: {
-      id: "rig-demo",
-      name: "Demo Rig",
-      field: "Training Yard",
-      currentWell: "DEMO-01",
-      startPoint: { lat: 24.7136, lng: 46.6753 },
-      startLabel: "RigSync Demo Yard",
-      drillingCompletion: 0,
-      dailyTargetHours: 8,
-    },
-  },
-  {
-    id: "driver-demo",
-    email: "driver-demo@rigsync.com",
-    password: "123123",
-    name: "Demo Driver",
-    role: "Driver",
-    managerId: "manager-demo",
-    isDemo: true,
-    truckId: "truck-lowbed-1",
-    truckType: "Low-bed",
-  },
-];
-
-export const TEST_USER = TEST_USERS[0];
 let currentSession = null;
 
 function readStoredSession() {
@@ -126,45 +46,21 @@ function buildSessionFromUser(user = {}) {
   };
 }
 
-function canUseStaticFallback(user) {
-  return Boolean(user && (user.role === FIREBASE_USER_ROLES.manager || user.isDemo));
-}
-
 export async function authenticateUser(email, password) {
-  const normalizedEmail = String(email || "").trim().toLowerCase();
-  const staticUser = TEST_USERS.find(
-    (user) => user.email.toLowerCase() === normalizedEmail && user.password === password,
-  );
-
-  if (staticUser) {
-    const remoteProfile =
-      await getUserProfileById(staticUser.id) ||
-      await getUserProfileByEmail(staticUser.email);
-
-    if (remoteProfile && remoteProfile.active !== false) {
-      return buildSessionFromUser(remoteProfile);
-    }
-
-    if (canUseStaticFallback(staticUser)) {
-      await ensureSeedUsers(TEST_USERS);
-      return buildSessionFromUser(staticUser);
-    }
-
-    throw new Error("Invalid credentials. Please check your email and password.");
-  }
-
   try {
     const { profile } = await signInFirebaseUser(email, password);
     if (profile) {
+      if (profile.active === false) {
+        throw new Error("This account is inactive.");
+      }
       return buildSessionFromUser(profile);
     }
-  } catch {
-    // Fall through to invalid credentials.
+  } catch (error) {
+    if (error instanceof Error && error.message === "This account is inactive.") {
+      throw error;
+    }
   }
-
-  if (!staticUser) {
-    throw new Error("Invalid credentials. Please check your email and password.");
-  }
+  throw new Error("Invalid credentials. Please check your email and password.");
 }
 
 export async function createDriverAccount({ name, email, password, managerId, truckId, truckType }) {
@@ -242,10 +138,6 @@ export async function deleteForemanAccount(foremanId) {
   await deleteUserProfile(foremanId);
 }
 
-export function getManagedForemen(managerId) {
-  return TEST_USERS.filter((user) => user.role === "Foreman" && user.managerId === managerId);
-}
-
 export function getSession() {
   if (!currentSession) {
     currentSession = readStoredSession();
@@ -265,12 +157,6 @@ export async function refreshSession() {
     await getUserProfileByEmail(storedSession.email);
 
   if (!remoteProfile) {
-    const staticUser = TEST_USERS.find((user) => user.id === storedSession.id);
-    if (canUseStaticFallback(staticUser)) {
-      currentSession = buildSessionFromUser(staticUser);
-      persistSession(currentSession);
-      return currentSession;
-    }
     clearSession();
     return null;
   }
@@ -285,7 +171,7 @@ export async function refreshSession() {
   return currentSession;
 }
 
-export function createSession(user = TEST_USER) {
+export function createSession(user) {
   currentSession = buildSessionFromUser(user);
   persistSession(currentSession);
   return currentSession;
