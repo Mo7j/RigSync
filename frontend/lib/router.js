@@ -15,6 +15,10 @@ function parseHashRoute() {
     return { page: "dashboard" };
   }
 
+  if (parts[0] === "reports") {
+    return { page: "reports" };
+  }
+
   if (parts[0] === "move" && parts[1]) {
     return { page: "move", moveId: parts[1] };
   }

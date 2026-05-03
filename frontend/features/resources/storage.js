@@ -209,6 +209,57 @@ function normalizeTaskAssignmentEntry(entry, index) {
   };
 }
 
+function normalizeReportEventEntry(entry, index) {
+  return {
+    id: entry?.id || `event-${index + 1}`,
+    reason: String(entry?.reason || "").trim(),
+    driver: String(entry?.driver || "").trim(),
+    stage: String(entry?.stage || "").trim(),
+    trip: String(entry?.trip || "").trim(),
+    destination: String(entry?.destination || "").trim(),
+    time: entry?.time || null,
+    delayMinutes: Math.max(0, Number(entry?.delayMinutes) || 0),
+    state: String(entry?.state || "open").trim().toLowerCase(),
+  };
+}
+
+function normalizeReportEntry(entry, index) {
+  return {
+    id: entry?.id || `report-${index + 1}`,
+    type: String(entry?.type || "daily").trim().toLowerCase(),
+    slot: String(entry?.slot || "").trim(),
+    reportDate: String(entry?.reportDate || "").trim(),
+    moveId: String(entry?.moveId || "").trim(),
+    moveName: String(entry?.moveName || "").trim(),
+    route: String(entry?.route || "").trim(),
+    status: String(entry?.status || "").trim(),
+    progress: Math.max(0, Number(entry?.progress) || 0),
+    completedTasks: Math.max(0, Number(entry?.completedTasks) || 0),
+    totalTasks: Math.max(0, Number(entry?.totalTasks) || 0),
+    remainingTasks: Math.max(0, Number(entry?.remainingTasks) || 0),
+    activeDrivers: Math.max(0, Number(entry?.activeDrivers) || 0),
+    delayEventCount: Math.max(0, Number(entry?.delayEventCount) || 0),
+    delayMinutes: Math.max(0, Number(entry?.delayMinutes) || 0),
+    latestReason: String(entry?.latestReason || "").trim(),
+    latestUpdate: entry?.latestUpdate || null,
+    createdAt: entry?.createdAt || null,
+    createdMinuteBucket: String(entry?.createdMinuteBucket || "").trim(),
+    completedStageTasks: Math.max(0, Number(entry?.completedStageTasks) || 0),
+    latestEvents: (entry?.latestEvents || []).map(normalizeReportEventEntry),
+    stageItems: Array.isArray(entry?.stageItems)
+      ? entry.stageItems.map((item, stageIndex) => ({
+          key: String(item?.key || `stage-${stageIndex + 1}`).trim(),
+          label: String(item?.label || "").trim(),
+          done: Boolean(item?.done),
+        }))
+      : [],
+  };
+}
+
+function normalizeReports(reports) {
+  return (Array.isArray(reports) ? reports : []).map(normalizeReportEntry).filter((entry) => entry.moveId);
+}
+
 function normalizeFleet(fleet) {
   return (fleet || []).map(normalizeFleetEntry).filter((entry) => entry.type);
 }
@@ -318,6 +369,7 @@ function normalizeManagerResources(managerId, resources = {}) {
     trucks,
     drivers,
     taskAssignments: normalizeTaskAssignments(resources.taskAssignments || resources.task_assignments || []),
+    reports: normalizeReports(resources.reports || []),
   };
 }
 
@@ -337,7 +389,7 @@ export function readManagerResources(managerId) {
 
 export async function hydrateManagerResources(managerId) {
   if (!managerId) {
-    return { fleet: [], trucks: [], drivers: [], taskAssignments: [] };
+    return { fleet: [], trucks: [], drivers: [], taskAssignments: [], reports: [] };
   }
 
   const payload = await fetchManagerResourcesDoc(managerId);
@@ -360,6 +412,7 @@ export async function writeManagerResources(managerId, resources) {
     trucks: normalized.trucks,
     drivers: normalized.drivers,
     taskAssignments: normalized.taskAssignments,
+    reports: normalized.reports,
   };
 
   await saveManagerResourcesDoc(managerId, payload);

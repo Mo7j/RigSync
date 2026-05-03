@@ -11,6 +11,7 @@ import { formatCoordinate, formatDate, formatLocationLabel } from "../lib/format
 import { buildFleetAvailability } from "../features/resources/storage.js";
 import { fetchLocationLabel } from "../features/rigMoves/api.js";
 import { translate } from "../lib/language.js";
+import { navigateTo } from "../lib/router.js";
 
 const { useMemo, useRef, useState } = React;
 
@@ -1752,7 +1753,13 @@ export function ManagerDashboardPage({
                   key: item.key,
                   type: "button",
                   className: `manager-dashboard-nav-button${activeSection === item.key ? " is-active" : ""}`,
-                  onClick: () => setActiveSection(item.key),
+                  onClick: () => {
+                  if (item.key === "reports") {
+                    navigateTo("/reports");
+                    return;
+                  }
+                  setActiveSection(item.key);
+                },
                   title: item.label,
                   "aria-label": item.label,
                 },

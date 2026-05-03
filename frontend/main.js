@@ -44,6 +44,7 @@ import { DashboardPage } from "./pages/DashboardPage.js";
 import { ManagerDashboardPage } from "./pages/ManagerDashboardPage.js";
 import { DriverDashboardPage } from "./pages/DriverDashboardPage.js";
 import { RigMovePage } from "./pages/RigMovePage.js";
+import { ReportsPage } from "./pages/ReportsPage.js";
 import { Card } from "./components/ui/Card.js";
 import { AppLayout } from "./layouts/AppLayout.js";
 import { formatCoordinate, formatDate, formatMinutes } from "./lib/format.js";
@@ -1468,7 +1469,7 @@ function App() {
   }, [route.page, activeMove?.id, activeMove?.updatedAt, logicalLoads.length, managerFleetSignature, managerScopedMoves.length, truckSpecs.length, startupRequirements.length]);
 
   useEffect(() => {
-    if (!session && (route.page === "dashboard" || route.page === "move")) {
+    if (!session && (route.page === "dashboard" || route.page === "move" || route.page === "reports")) {
       navigateTo("/login");
     }
   }, [route.page, session]);
@@ -2844,6 +2845,49 @@ function App() {
       language,
       onToggleLanguage: handleToggleLanguage,
       loginProfiles,
+    });
+  }
+
+  if (route.page === "reports" && session) {
+    if (!areMovesHydrated) {
+      return h(
+        AppLayout,
+        {
+          title: "Loading reports",
+          subtitle: formatDate(new Date()),
+          currentUser: session,
+          onLogout: handleLogout,
+          language,
+          onToggleLanguage: handleToggleLanguage,
+          fullBleed: true,
+        },
+        h(
+          "div",
+          { className: "workspace-grid dashboard-grid" },
+          h(
+            "section",
+            { className: "dashboard-column dashboard-column-wide" },
+            h(
+              Card,
+              { className: "empty-state" },
+              h("h2", null, "Loading report data"),
+              h("p", { className: "muted-copy" }, "Waiting for the latest moves and manager resources from Firebase."),
+            ),
+          ),
+        ),
+      );
+    }
+
+    return h(ReportsPage, {
+      moves: visibleMoves,
+      managerResources,
+      currentUser: session,
+      currentDate: new Date(),
+      onSaveResources: handleSaveManagerResources,
+      onBack: () => navigateTo("/dashboard"),
+      onLogout: handleLogout,
+      language,
+      onToggleLanguage: handleToggleLanguage,
     });
   }
 
