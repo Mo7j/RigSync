@@ -48,7 +48,7 @@ import { ReportsPage } from "./pages/ReportsPage.js";
 import { Card } from "./components/ui/Card.js";
 import { AppLayout } from "./layouts/AppLayout.js";
 import { formatCoordinate, formatDate, formatMinutes } from "./lib/format.js";
-import { DEFAULT_LANGUAGE, LANGUAGE_STORAGE_KEY, getLanguageDirection } from "./lib/language.js";
+import { DEFAULT_LANGUAGE, LANGUAGE_STORAGE_KEY, getLanguageDirection, translatePhrase } from "./lib/language.js";
 
 const { useEffect, useRef, useState } = React;
 const NORMAL_PLAYBACK_SPEED = 1500;
@@ -77,6 +77,60 @@ function yieldForUiPaint() {
       window.setTimeout(resolve, 0);
     });
   });
+}
+
+function getLocalizedDatasetKey(attributeName) {
+  return `localized${attributeName.charAt(0).toUpperCase()}${attributeName.slice(1).replace(/-([a-z])/g, (_, char) => char.toUpperCase())}`;
+}
+
+function localizeElementTree(root, language) {
+  if (!root) {
+    return;
+  }
+
+  const stack = [root];
+  while (stack.length) {
+    const node = stack.pop();
+    if (!(node instanceof Element)) {
+      continue;
+    }
+    if (node.tagName === "SCRIPT" || node.tagName === "STYLE") {
+      continue;
+    }
+
+    ["placeholder", "title", "aria-label"].forEach((attributeName) => {
+      const currentValue = node.getAttribute(attributeName);
+      const datasetKey = getLocalizedDatasetKey(attributeName);
+      if (currentValue != null && node.dataset[datasetKey] == null) {
+        node.dataset[datasetKey] = currentValue;
+      }
+      const originalValue = node.dataset[datasetKey];
+      if (originalValue != null) {
+        const localizedValue = translatePhrase(language, originalValue);
+        if (localizedValue !== currentValue) {
+          node.setAttribute(attributeName, localizedValue);
+        }
+      }
+    });
+
+    if (!node.children.length) {
+      const currentText = node.textContent;
+      if (currentText && node.dataset.localizedText == null) {
+        node.dataset.localizedText = currentText;
+      }
+      const originalText = node.dataset.localizedText;
+      if (originalText) {
+        const localizedText = translatePhrase(language, originalText);
+        if (localizedText !== currentText) {
+          node.textContent = localizedText;
+        }
+      }
+    }
+
+    for (let index = node.children.length - 1; index >= 0; index -= 1) {
+      stack.push(node.children[index]);
+    }
+  }
 }
 
 function normalizePlannerTruckType(type) {
@@ -295,6 +349,29 @@ function getAssignmentStageLabel(stageState = {}) {
     return "rigUp";
   }
   return "completed";
+}
+
+function buildVisibleLoginProfiles(profiles = []) {
+  const activeProfiles = (profiles || []).filter((profile) => profile?.active !== false);
+  const managerProfiles = activeProfiles.filter((profile) => String(profile?.role || "").trim() === "Manager");
+  const foremanProfiles = activeProfiles.filter((profile) => String(profile?.role || "").trim() === "Foreman");
+  const preferredForemanOrder = ["foreman a", "foreman b", "foreman c"];
+  const orderedForemen = preferredForemanOrder
+    .map((label) =>
+      foremanProfiles.find((profile) => String(profile?.name || "").trim().toLowerCase() === label)
+      || foremanProfiles.find((profile) => String(profile?.email || "").trim().toLowerCase().includes(label.replace(/\s+/g, ""))),
+    )
+    .filter(Boolean);
+  const fallbackForemen = foremanProfiles.filter(
+    (profile) => !orderedForemen.some((candidate) => candidate.id === profile.id),
+  );
+
+  return [...managerProfiles.slice(0, 1), ...orderedForemen, ...fallbackForemen].slice(0, 4).map((profile) => ({
+    id: profile.id,
+    name: profile.name,
+    email: profile.email,
+    role: profile.role,
+  }));
 }
 
 function getDriverMoveState(assignment = {}) {
@@ -772,6 +849,43 @@ function App() {
     } catch {
       // Ignore storage errors.
     }
+
+    const root = document.getElementById("root");
+    if (!root) {
+      return undefined;
+    }
+
+    let frameId = 0;
+    const runLocalization = () => {
+      frameId = 0;
+      localizeElementTree(root, normalizedLanguage);
+    };
+    const scheduleLocalization = () => {
+      if (frameId) {
+        return;
+      }
+      frameId = window.requestAnimationFrame(runLocalization);
+    };
+
+    scheduleLocalization();
+
+    const observer = new MutationObserver(() => {
+      scheduleLocalization();
+    });
+    observer.observe(root, {
+      childList: true,
+      subtree: true,
+      characterData: true,
+      attributes: true,
+      attributeFilter: ["placeholder", "title", "aria-label"],
+    });
+
+    return () => {
+      observer.disconnect();
+      if (frameId) {
+        window.cancelAnimationFrame(frameId);
+      }
+    };
   }, [language]);
 
   function handleToggleLanguage() {
@@ -789,16 +903,7 @@ function App() {
   useEffect(() => {
     void fetchAllUserProfiles()
       .then((profiles) => {
-        setLoginProfiles(
-          profiles
-            .filter((profile) => profile?.active !== false)
-            .map((profile) => ({
-              id: profile.id,
-              name: profile.name,
-              email: profile.email,
-              role: profile.role,
-            })),
-        );
+        setLoginProfiles(buildVisibleLoginProfiles(profiles));
       })
       .catch(() => {
         setLoginProfiles([]);

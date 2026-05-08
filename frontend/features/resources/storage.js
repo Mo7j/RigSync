@@ -237,6 +237,29 @@ function normalizeReportEventEntry(entry, index) {
   };
 }
 
+function normalizeReportStagePerformanceEntry(entry, index) {
+  return {
+    key: String(entry?.key || `stage-performance-${index + 1}`).trim(),
+    label: String(entry?.label || "").trim(),
+    plannedFinishMinute: Number.isFinite(Number(entry?.plannedFinishMinute)) ? Number(entry.plannedFinishMinute) : null,
+    actualFinishMinute: Number.isFinite(Number(entry?.actualFinishMinute)) ? Number(entry.actualFinishMinute) : null,
+    varianceMinutes: Number.isFinite(Number(entry?.varianceMinutes)) ? Number(entry.varianceMinutes) : null,
+    state: String(entry?.state || "").trim(),
+    summary: String(entry?.summary || "").trim(),
+  };
+}
+
+function normalizeReportDelayHotspotEntry(entry, index) {
+  return {
+    id: String(entry?.id || `delay-hotspot-${index + 1}`).trim(),
+    stage: String(entry?.stage || "").trim(),
+    reason: String(entry?.reason || "").trim(),
+    minutes: Math.max(0, Number(entry?.minutes) || 0),
+    events: Math.max(0, Number(entry?.events) || 0),
+    source: String(entry?.source || "").trim(),
+  };
+}
+
 function normalizeReportEntry(entry, index) {
   return {
     id: entry?.id || `report-${index + 1}`,
@@ -248,6 +271,13 @@ function normalizeReportEntry(entry, index) {
     route: String(entry?.route || "").trim(),
     status: String(entry?.status || "").trim(),
     progress: Math.max(0, Number(entry?.progress) || 0),
+    plannedProgress: Math.max(0, Number(entry?.plannedProgress) || 0),
+    progressVariance: Number.isFinite(Number(entry?.progressVariance)) ? Number(entry.progressVariance) : 0,
+    plannedTotalMinutes: Math.max(0, Number(entry?.plannedTotalMinutes) || 0),
+    plannedRouteMinutes: Math.max(0, Number(entry?.plannedRouteMinutes) || 0),
+    actualElapsedMinutes: Math.max(0, Number(entry?.actualElapsedMinutes) || 0),
+    scheduleVarianceMinutes: Number.isFinite(Number(entry?.scheduleVarianceMinutes)) ? Number(entry.scheduleVarianceMinutes) : null,
+    scheduleStatus: String(entry?.scheduleStatus || "").trim(),
     completedTasks: Math.max(0, Number(entry?.completedTasks) || 0),
     totalTasks: Math.max(0, Number(entry?.totalTasks) || 0),
     remainingTasks: Math.max(0, Number(entry?.remainingTasks) || 0),
@@ -260,6 +290,14 @@ function normalizeReportEntry(entry, index) {
     createdMinuteBucket: String(entry?.createdMinuteBucket || "").trim(),
     completedStageTasks: Math.max(0, Number(entry?.completedStageTasks) || 0),
     latestEvents: (entry?.latestEvents || []).map(normalizeReportEventEntry),
+    stagePerformance: (entry?.stagePerformance || []).map(normalizeReportStagePerformanceEntry),
+    delayHotspots: (entry?.delayHotspots || []).map(normalizeReportDelayHotspotEntry),
+    primaryDelayDriver: String(entry?.primaryDelayDriver || "").trim(),
+    actualVsPlanSummary: String(entry?.actualVsPlanSummary || "").trim(),
+    delaySummary: String(entry?.delaySummary || "").trim(),
+    planStartDate: entry?.planStartDate || null,
+    actualStartDate: entry?.actualStartDate || null,
+    actualEndDate: entry?.actualEndDate || null,
     stageItems: Array.isArray(entry?.stageItems)
       ? entry.stageItems.map((item, stageIndex) => ({
           key: String(item?.key || `stage-${stageIndex + 1}`).trim(),

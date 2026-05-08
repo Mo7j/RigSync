@@ -3,345 +3,26 @@ import { AppLayout } from "../layouts/AppLayout.js";
 import { Button } from "../components/ui/Button.js";
 import { Card, StatCard } from "../components/ui/Card.js";
 import { ProgressBar } from "../components/ui/ProgressBar.js";
-import { formatDate, formatLocationLabel } from "../lib/format.js";
+import { formatDate, formatMinutes } from "../lib/format.js";
 import { translate } from "../lib/language.js";
+import {
+  DAILY_REPORT_TYPE,
+  FINAL_REPORT_TYPE,
+  FLAG_STATE_RESOLVED,
+  buildDailyReportRecord,
+  buildFinalReportRecord,
+  buildLiveFlagEntries,
+  buildMoveSummary,
+  buildPrintMarkup,
+  formatSafeDateTime,
+  getQuarterHourBucketKey,
+  getReportDateKey,
+  isQuarterHourBoundary,
+} from "../features/rigMoves/reporting.js";
 
 const { useEffect, useMemo, useRef, useState } = React;
-const DAILY_REPORT_TYPE = "daily";
-const FINAL_REPORT_TYPE = "final";
 const DAILY_REPORT_INTERVAL_MS = 15 * 60 * 1000;
 const DAILY_REPORT_SLOTS = ["Morning", "Night"];
-const FLAG_STATE_OPEN = "open";
-const FLAG_STATE_RESOLVED = "resolved";
-
-function isSameCalendarDay(value, referenceDate = new Date()) {
-  if (!value) {
-    return false;
-  }
-  const date = value instanceof Date ? value : new Date(value);
-  const reference = referenceDate instanceof Date ? referenceDate : new Date(referenceDate);
-  if (Number.isNaN(date.getTime()) || Number.isNaN(reference.getTime())) {
-    return false;
-  }
-  return date.getFullYear() === reference.getFullYear()
-    && date.getMonth() === reference.getMonth()
-    && date.getDate() === reference.getDate();
-}
-
-function getReportDateKey(value) {
-  const date = value instanceof Date ? value : new Date(value);
-  if (Number.isNaN(date.getTime())) {
-    return "";
-  }
-  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
-}
-
-function getQuarterHourBucketKey(value) {
-  const date = value instanceof Date ? value : new Date(value);
-  if (Number.isNaN(date.getTime())) {
-    return "";
-  }
-  const minuteBucket = Math.floor(date.getMinutes() / 15) * 15;
-  return `${getReportDateKey(date)}-${String(date.getHours()).padStart(2, "0")}-${String(minuteBucket).padStart(2, "0")}`;
-}
-
-function isQuarterHourBoundary(value) {
-  const date = value instanceof Date ? value : new Date(value);
-  if (Number.isNaN(date.getTime())) {
-    return false;
-  }
-  return date.getMinutes() % 15 === 0;
-}
-
-function formatSafeDateTime(value, fallback = "--") {
-  if (!value) {
-    return fallback;
-  }
-  const date = value instanceof Date ? value : new Date(value);
-  if (Number.isNaN(date.getTime())) {
-    return fallback;
-  }
-  return `${formatDate(date)} ${date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`;
-}
-
-function getMoveDisplayName(move) {
-  const explicitName = String(move?.name || "").trim();
-  if (explicitName) {
-    return explicitName;
-  }
-  const start = formatLocationLabel(move?.startLabel, "Source");
-  const end = formatLocationLabel(move?.endLabel, "Destination");
-  return `${start} -> ${end}`;
-}
-
-function getMoveStatus(move, t = (key, fallback) => fallback) {
-  if (move?.operatingState === "drilling") {
-    return t("drilling", "Drilling");
-  }
-  if (move?.executionState === "completed") {
-    return t("completed", "Completed");
-  }
-  if (move?.executionState === "active") {
-    return t("executingNow", "Executing");
-  }
-  return t("planned", "Planning");
-}
-
-function getAssignmentDelayMinutes(assignment) {
-  const notes = assignment?.stageDelayNotes || {};
-  const noteMax = ["rigDown", "rigMove", "rigUp"].reduce((maxMinutes, key) => {
-    const nextMinutes = Math.max(0, Number(notes?.[key]?.lateMinutes) || 0);
-    return Math.max(maxMinutes, nextMinutes);
-  }, 0);
-  const flagMax = (assignment?.flags || []).reduce((maxMinutes, flag) => Math.max(maxMinutes, Math.max(0, Number(flag?.lateMinutes) || 0)), 0);
-  return Math.max(noteMax, flagMax);
-}
-
-function buildLiveFlagEntries(assignments = [], currentDate = new Date()) {
-  const entries = [];
-
-  (assignments || []).forEach((assignment) => {
-    (assignment.flags || []).forEach((flag, index) => {
-      const createdAt = flag.createdAt || assignment.updatedAt || assignment.assignedAt || null;
-      const resolvedAt = flag.resolvedAt || null;
-      const explicitMinutes = Math.max(0, Number(flag.lateMinutes) || 0);
-      let delayMinutes = explicitMinutes;
-      if (!delayMinutes && createdAt) {
-        const createdMs = new Date(createdAt).getTime();
-        const referenceMs = String(flag.status || "open").trim().toLowerCase() === "resolved"
-          ? new Date(resolvedAt || createdAt).getTime()
-          : currentDate.getTime();
-        if (Number.isFinite(createdMs) && Number.isFinite(referenceMs) && referenceMs > createdMs) {
-          delayMinutes = Math.floor((referenceMs - createdMs) / 60000);
-        }
-      }
-      entries.push({
-        id: flag.id || `${assignment.id}-flag-${index + 1}`,
-        moveId: assignment.moveId || null,
-        moveName: assignment.moveName || assignment.moveId || "Rig move",
-        driverName: assignment.driverName || assignment.driverId || "Driver",
-        label: flag.label || flag.type || "Driver flag",
-        reason: flag.reason || "No reason provided.",
-        stage: assignment.currentStage || "move",
-        destination: formatLocationLabel(assignment.endLabel, "Destination"),
-        trip: assignment.tripLabel || assignment.loadCode || assignment.id || "Trip",
-        createdAt,
-        resolvedAt,
-        delayMinutes: Math.max(delayMinutes, getAssignmentDelayMinutes(assignment)),
-        state: String(flag.status || "open").trim().toLowerCase() === "resolved" ? "resolved" : "open",
-      });
-    });
-  });
-
-  return entries.sort((left, right) => new Date(right.createdAt || 0) - new Date(left.createdAt || 0));
-}
-
-function getMoveSummary(move, managerResources, currentDate = new Date(), t = (key, fallback) => fallback) {
-  const taskAssignments = (managerResources?.taskAssignments || []).filter((assignment) => assignment.moveId === move.id);
-  const completedTasks = taskAssignments.filter((assignment) => Boolean(assignment?.stageStatus?.rigUpCompleted || String(assignment?.status || "").trim() === "completed")).length;
-  const totalTasks = taskAssignments.length;
-  const completedToday = taskAssignments.filter((assignment) => isSameCalendarDay(assignment?.stageCompletedAt?.rigUp || assignment?.updatedAt, currentDate)).length;
-  const completedStageTasks = taskAssignments.reduce((sum, assignment) => {
-    const status = assignment?.stageStatus || {};
-    return sum + (status.rigDownCompleted ? 1 : 0) + (status.rigMoveCompleted ? 1 : 0) + (status.rigUpCompleted ? 1 : 0);
-  }, 0);
-  const totalStageTasks = totalTasks * 3;
-  const activeDrivers = [...new Set(taskAssignments
-    .filter((assignment) => String(assignment?.status || "").trim() !== "completed")
-    .map((assignment) => assignment?.driverName || assignment?.driverId || null)
-    .filter(Boolean))];
-  const flagEntries = buildLiveFlagEntries(taskAssignments, currentDate);
-  const flagsToday = flagEntries.filter((entry) => isSameCalendarDay(entry.createdAt, currentDate));
-  const delayMinutesToday = flagsToday.reduce((sum, entry) => sum + Math.max(0, Number(entry.delayMinutes) || 0), 0);
-  const totalDelayMinutes = flagEntries.reduce((sum, entry) => sum + Math.max(0, Number(entry.delayMinutes) || 0), 0);
-  const latestFlag = flagEntries[0] || null;
-  const latestAssignmentUpdate = taskAssignments.reduce((latest, assignment) => {
-    const timestamps = [
-      assignment?.updatedAt,
-      assignment?.stageCompletedAt?.rigDown,
-      assignment?.stageCompletedAt?.rigMove,
-      assignment?.stageCompletedAt?.rigUp,
-    ].map((value) => new Date(value || 0).getTime()).filter((value) => Number.isFinite(value) && value > 0);
-    return Math.max(latest, ...(timestamps.length ? timestamps : [0]));
-  }, 0);
-  const latestActivityMs = Math.max(new Date(move?.updatedAt || move?.createdAt || 0).getTime(), latestAssignmentUpdate, new Date(latestFlag?.createdAt || 0).getTime());
-  const progressPercent = totalTasks ? Math.round((completedTasks / totalTasks) * 100) : Math.max(0, Number(move?.completionPercentage) || 0);
-  const isCompleted = totalTasks > 0 ? completedTasks >= totalTasks : move?.executionState === "completed" || move?.operatingState === "drilling";
-  const isActive = !isCompleted && (move?.executionState === "active" || taskAssignments.some((assignment) => String(assignment?.status || "").trim() !== "completed"));
-
-  return {
-    moveId: move.id,
-    moveName: getMoveDisplayName(move),
-    route: `${formatLocationLabel(move?.startLabel, t("source", "Source"))} -> ${formatLocationLabel(move?.endLabel, t("destination", "Destination"))}`,
-    status: getMoveStatus(move, t),
-    startLabel: move?.startLabel || null,
-    endLabel: move?.endLabel || null,
-    progress: progressPercent,
-    completedTasks,
-    totalTasks,
-    remainingTasks: Math.max(0, totalTasks - completedTasks),
-    completedToday,
-    completedStageTasks,
-    totalStageTasks,
-    activeDrivers,
-    activeDriversCount: activeDrivers.length,
-    delayEventCount: flagEntries.length,
-    delayMinutesToday,
-    totalDelayMinutes,
-    latestReason: latestFlag?.reason || "No delay reason recorded.",
-    latestUpdate: latestActivityMs > 0 ? new Date(latestActivityMs).toISOString() : null,
-    latestEvents: flagEntries.slice(0, 6).map((entry) => ({
-      id: entry.id,
-      reason: entry.reason,
-      driver: entry.driverName,
-      stage: entry.stage,
-      delayMinutes: entry.delayMinutes,
-      time: entry.createdAt,
-      trip: entry.trip,
-      destination: entry.destination,
-      state: entry.state,
-    })),
-    stageItems: [
-      { key: "rigDown", label: t("rigDown", "Rig Down"), done: taskAssignments.every((assignment) => assignment?.stageStatus?.rigDownCompleted) && totalTasks > 0 },
-      { key: "rigMove", label: t("move", "Move"), done: taskAssignments.every((assignment) => assignment?.stageStatus?.rigMoveCompleted) && totalTasks > 0 },
-      { key: "rigUp", label: t("rigUp", "Rig Up"), done: taskAssignments.every((assignment) => assignment?.stageStatus?.rigUpCompleted) && totalTasks > 0 },
-    ],
-    isActive,
-    isCompleted,
-  };
-}
-
-function buildDailyReportRecord(summary, currentDate) {
-  const reportDate = getReportDateKey(currentDate);
-  return {
-    id: `daily-${summary.moveId}-${reportDate}-${summary.slot}`,
-    type: DAILY_REPORT_TYPE,
-    slot: summary.slot,
-    reportDate,
-    moveId: summary.moveId,
-    moveName: summary.moveName,
-    route: summary.route,
-    status: summary.status,
-    progress: summary.progress,
-    completedTasks: summary.completedTasks,
-    totalTasks: summary.totalTasks,
-    remainingTasks: summary.remainingTasks,
-    activeDrivers: summary.activeDriversCount,
-    delayEventCount: summary.delayEventCount,
-    delayMinutes: summary.delayMinutesToday,
-    latestReason: summary.latestReason,
-    latestUpdate: summary.latestUpdate,
-    createdAt: new Date(currentDate).toISOString(),
-    createdMinuteBucket: getQuarterHourBucketKey(currentDate),
-    completedStageTasks: summary.completedStageTasks,
-    latestEvents: summary.latestEvents,
-    stageItems: summary.stageItems,
-  };
-}
-
-function buildPrintMarkup(report, kind, generatedAt) {
-  const title = kind === FINAL_REPORT_TYPE ? "Final Move Report" : `${report.slot || "Daily"} Daily Report`;
-  const metrics = [
-    ["Move", report.moveName || "--"],
-    ["Route", report.route || "--"],
-    ["Status", report.status || "--"],
-    ["Generated At", formatSafeDateTime(report.createdAt || generatedAt)],
-    ["Progress", `${report.progress || 0}%`],
-    ["Completed Tasks", `${report.completedTasks || 0}/${report.totalTasks || 0}`],
-    ["Remaining Tasks", String(report.remainingTasks || 0)],
-    ["Active Drivers", String(report.activeDrivers || 0)],
-    ["Completed Stage Tasks", String(report.completedStageTasks || 0)],
-    ["Delay Events", String(report.delayEventCount || 0)],
-    ["Delay Minutes", `${report.delayMinutes || 0} min`],
-    ["Latest Reason", report.latestReason || "No issue recorded."],
-  ];
-
-  const latestEvents = Array.isArray(report.latestEvents) ? report.latestEvents : [];
-  const eventsMarkup = latestEvents.length
-    ? latestEvents.map((event) => `
-      <tr>
-        <td>${event.reason || "--"}</td>
-        <td>${event.driver || "--"}</td>
-        <td>${event.stage || "--"}</td>
-        <td>${event.trip || "--"}</td>
-        <td>${event.destination || "--"}</td>
-        <td>${formatSafeDateTime(event.time)}</td>
-        <td>${event.delayMinutes || 0} min</td>
-      </tr>`).join("")
-    : '<tr><td colspan="7">No activity captured for this report.</td></tr>' ;
-
-  return `<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="utf-8" />
-  <title>${title}</title>
-  <style>
-    body { font-family: Arial, sans-serif; margin: 24px; color: #0f172a; }
-    h1 { margin: 0 0 6px; font-size: 24px; }
-    .sub { margin: 0 0 22px; color: #475569; }
-    .grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; margin-bottom: 24px; }
-    .tile { border: 1px solid #cbd5e1; border-radius: 12px; padding: 12px 14px; }
-    .label { font-size: 12px; text-transform: uppercase; letter-spacing: .08em; color: #64748b; margin-bottom: 4px; }
-    .value { font-size: 15px; font-weight: 700; }
-    table { width: 100%; border-collapse: collapse; margin-top: 12px; }
-    th, td { border: 1px solid #cbd5e1; padding: 10px; text-align: left; font-size: 13px; }
-    th { background: #e2e8f0; }
-    .note { margin-top: 20px; font-size: 13px; color: #475569; }
-    @media print { body { margin: 12mm; } }
-  </style>
-</head>
-<body>
-  <h1>${title}</h1>
-  <p class="sub">RigSync local report snapshot</p>
-  <div class="grid">
-    ${metrics.map(([label, value]) => `<div class="tile"><div class="label">${label}</div><div class="value">${value}</div></div>`).join("")}
-  </div>
-  <h2>Latest Activity</h2>
-  <table>
-    <thead>
-      <tr>
-        <th>Reason</th>
-        <th>Driver</th>
-        <th>Stage</th>
-        <th>Trip</th>
-        <th>Destination</th>
-        <th>Time</th>
-        <th>Delay</th>
-      </tr>
-    </thead>
-    <tbody>${eventsMarkup}</tbody>
-  </table>
-  <p class="note">Use the browser print dialog and choose Save as PDF.</p>
-</body>
-</html>`;
-}
-
-function buildFinalReportRecord(summary, currentDate) {
-  return {
-    id: `final-${summary.moveId}`,
-    type: FINAL_REPORT_TYPE,
-    slot: "Final",
-    reportDate: getReportDateKey(currentDate),
-    moveId: summary.moveId,
-    moveName: summary.moveName,
-    route: summary.route,
-    status: "Completed",
-    progress: 100,
-    completedTasks: summary.completedTasks,
-    totalTasks: summary.totalTasks,
-    remainingTasks: 0,
-    activeDrivers: summary.activeDriversCount,
-    delayEventCount: summary.delayEventCount,
-    delayMinutes: summary.totalDelayMinutes,
-    latestReason: summary.latestReason,
-    latestUpdate: summary.latestUpdate,
-    createdAt: new Date(currentDate).toISOString(),
-    createdMinuteBucket: getQuarterHourBucketKey(currentDate),
-    completedStageTasks: summary.completedStageTasks,
-    latestEvents: summary.latestEvents,
-    stageItems: summary.stageItems,
-  };
-}
 
 export function ReportsPage({
   currentUser,
@@ -384,7 +65,7 @@ export function ReportsPage({
 
   const reports = Array.isArray(managerResources?.reports) ? managerResources.reports : [];
   const allMoveSummaries = useMemo(
-    () => (moves || []).map((move) => getMoveSummary(move, managerResources, reportNow, t)),
+    () => (moves || []).map((move) => buildMoveSummary(move, managerResources, reportNow, t)),
     [moves, managerResources, reportNow, language],
   );
   const activeMoveSummaries = useMemo(() => allMoveSummaries.filter((summary) => summary.isActive), [allMoveSummaries]);
@@ -577,20 +258,68 @@ export function ReportsPage({
     });
   }
 
+  function renderScheduleStats(item) {
+    const hasActualElapsed = Number.isFinite(Number(item.actualElapsedMinutes));
+    return h(
+      "div",
+      { className: "manager-resource-metrics" },
+      h("div", { className: "manager-rig-stat" }, h("span", null, "Planned Duration"), h("strong", null, item.plannedTotalMinutes ? formatMinutes(item.plannedTotalMinutes) : "--")),
+      h("div", { className: "manager-rig-stat" }, h("span", null, "Actual Elapsed"), h("strong", null, hasActualElapsed ? formatMinutes(item.actualElapsedMinutes) : "--")),
+      h("div", { className: "manager-rig-stat" }, h("span", null, "Schedule Status"), h("strong", null, item.scheduleStatus || "--")),
+      h("div", { className: "manager-rig-stat" }, h("span", null, "Schedule Variance"), h("strong", null, item.scheduleVarianceMinutes == null ? "--" : `${item.scheduleVarianceMinutes > 0 ? "+" : ""}${formatMinutes(Math.abs(item.scheduleVarianceMinutes))}`)),
+      h("div", { className: "manager-rig-stat" }, h("span", null, "Planned Progress"), h("strong", null, `${item.plannedProgress || 0}%`)),
+      h("div", { className: "manager-rig-stat" }, h("span", null, "Progress Variance"), h("strong", null, `${item.progressVariance > 0 ? "+" : ""}${item.progressVariance || 0} pts`)),
+    );
+  }
+
+  function renderStagePerformance(stagePerformance = []) {
+    return stagePerformance.length
+      ? h(
+          "div",
+          { className: "manager-list-stack" },
+          stagePerformance.map((stage) =>
+            h(
+              "article",
+              { key: stage.key, className: "manager-list-row manager-list-row-card" },
+              h("div", null, h("strong", null, stage.label), h("p", { className: "muted-copy" }, stage.summary)),
+              h("strong", null, stage.varianceMinutes == null ? "--" : `${stage.varianceMinutes > 0 ? "+" : ""}${formatMinutes(Math.abs(stage.varianceMinutes))}`),
+            ),
+          ),
+        )
+      : h("p", { className: "muted-copy" }, "No stage performance recorded.");
+  }
+
+  function renderDelayHotspots(delayHotspots = []) {
+    return delayHotspots.length
+      ? h(
+          "div",
+          { className: "manager-list-stack" },
+          delayHotspots.map((item) =>
+            h(
+              "article",
+              { key: item.id, className: "manager-list-row manager-list-row-card" },
+              h("div", null, h("strong", null, item.reason), h("p", { className: "muted-copy" }, `${item.stage} • ${item.events} events`)),
+              h("strong", null, formatMinutes(item.minutes)),
+            ),
+          ),
+        )
+      : h("p", { className: "muted-copy" }, "No dominant delay drivers recorded.");
+  }
+
   function renderActiveTab() {
     return activeMoveSummaries.length
       ? h(
           "div",
-          { className: "manager-resource-grid" },
+          { className: "manager-report-tab-stack" },
           activeMoveSummaries.map((summary) =>
             h(
-              "article",
-              { key: summary.moveId, className: "manager-resource-card" },
+              Card,
+              { key: summary.moveId, className: "dashboard-section-card manager-dashboard-panel" },
               h(
                 "div",
                 { className: "manager-resource-card-head" },
                 h("div", null, h("strong", null, summary.moveName), h("p", { className: "muted-copy" }, summary.route)),
-                h("span", { className: "manager-resource-status manager-resource-status-active" }, summary.status),
+                h("span", { className: "manager-resource-status manager-resource-status-active" }, summary.scheduleStatus || summary.status),
               ),
               h(
                 "div",
@@ -601,6 +330,9 @@ export function ReportsPage({
                 h("div", { className: "manager-rig-stat" }, h("span", null, t("activeDrivers", "Active Drivers")), h("strong", null, String(summary.activeDriversCount))),
               ),
               h(ProgressBar, { value: summary.progress }),
+              renderScheduleStats(summary),
+              h("p", { className: "muted-copy" }, summary.actualVsPlanSummary),
+              h("p", { className: "muted-copy" }, summary.delaySummary),
             ),
           ),
         )
@@ -638,7 +370,13 @@ export function ReportsPage({
                 h("div", { className: "manager-rig-stat" }, h("span", null, t("delayMinutesToday", "Delay Minutes Today")), h("strong", null, `${report.delayMinutes || 0} ${t("min", "min")}`)),
                 h("div", { className: "manager-rig-stat" }, h("span", null, t("activeDrivers", "Active Drivers")), h("strong", null, String(report.activeDrivers || 0))),
               ),
-              h("p", { className: "muted-copy" }, report.latestReason || "No delay reason recorded."),
+              renderScheduleStats(report),
+              h("p", { className: "muted-copy" }, report.actualVsPlanSummary || "No actual-vs-plan analysis available."),
+              h("p", { className: "muted-copy" }, report.delaySummary || report.latestReason || "No delay reason recorded."),
+              h("div", { className: "manager-report-preview-grid" },
+                h("article", { className: "manager-insight-card" }, h("span", { className: "manager-insight-label" }, "Stage Performance"), renderStagePerformance(report.stagePerformance || [])),
+                h("article", { className: "manager-insight-card" }, h("span", { className: "manager-insight-label" }, "Delay Drivers"), renderDelayHotspots(report.delayHotspots || [])),
+              ),
             ),
           ),
         )
@@ -676,7 +414,13 @@ export function ReportsPage({
                 h("div", { className: "manager-rig-stat" }, h("span", null, "Delay Minutes"), h("strong", null, `${report.delayMinutes || 0} ${t("min", "min")}`)),
                 h("div", { className: "manager-rig-stat" }, h("span", null, "Delay Events"), h("strong", null, String(report.delayEventCount || 0))),
               ),
-              h("p", { className: "muted-copy" }, report.latestReason || "No delay reason recorded."),
+              renderScheduleStats(report),
+              h("p", { className: "muted-copy" }, report.actualVsPlanSummary || "No actual-vs-plan analysis available."),
+              h("p", { className: "muted-copy" }, report.delaySummary || report.latestReason || "No delay reason recorded."),
+              h("div", { className: "manager-report-preview-grid" },
+                h("article", { className: "manager-insight-card" }, h("span", { className: "manager-insight-label" }, "Stage Performance"), renderStagePerformance(report.stagePerformance || [])),
+                h("article", { className: "manager-insight-card" }, h("span", { className: "manager-insight-label" }, "Delay Drivers"), renderDelayHotspots(report.delayHotspots || [])),
+              ),
             ),
           ),
         )

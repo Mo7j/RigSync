@@ -7,9 +7,10 @@ import { ProgressBar } from "../components/ui/ProgressBar.js";
 import { LeafletMap } from "../components/map/LeafletMap.js";
 import { ManagerRigsMap } from "../components/map/ManagerRigsMap.js";
 import { ManagerRigsScene3D } from "../components/map/ManagerRigsScene3D.js";
-import { formatCoordinate, formatDate, formatLocationLabel } from "../lib/format.js";
+import { formatCoordinate, formatDate, formatLocationLabel, formatMinutes } from "../lib/format.js";
 import { buildFleetAvailability } from "../features/resources/storage.js";
 import { fetchLocationLabel } from "../features/rigMoves/api.js";
+import { buildMoveSummary } from "../features/rigMoves/reporting.js";
 import { translate } from "../lib/language.js";
 import { navigateTo } from "../lib/router.js";
 
@@ -574,6 +575,22 @@ export function ManagerDashboardPage({
     };
   });
   const reportPlan = buildReportPlan(moves);
+  const reportSummaries = useMemo(
+    () => (moves || []).map((move) => buildMoveSummary(move, managerResources, currentDate, t)),
+    [moves, managerResources, currentDate, language],
+  );
+  const activeReportSummaries = useMemo(
+    () => reportSummaries.filter((summary) => summary.isActive),
+    [reportSummaries],
+  );
+  const behindPlanCount = activeReportSummaries.filter((summary) => (summary.progressVariance || 0) <= -10).length;
+  const onPlanCount = activeReportSummaries.filter((summary) => Math.abs(summary.progressVariance || 0) < 10).length;
+  const totalDelayExposureMinutes = activeReportSummaries.reduce((sum, summary) => sum + Math.max(0, Number(summary.totalDelayMinutes) || 0), 0);
+  const worstScheduleMove = [...activeReportSummaries]
+    .filter((summary) => summary.scheduleVarianceMinutes != null)
+    .sort((left, right) => (right.scheduleVarianceMinutes - left.scheduleVarianceMinutes))[0] || activeReportSummaries[0] || null;
+  const highestDelayMove = [...activeReportSummaries]
+    .sort((left, right) => (right.totalDelayMinutes - left.totalDelayMinutes))[0] || null;
   const pulseMove = activeMoves.find((move) => move.id === activePulseMoveId) || activeMoves[0] || null;
   const pulseStageItems = pulseMove ? getMoveStageItems(pulseMove) : [];
   const delayChartItems = prioritizedMoves
@@ -1260,10 +1277,10 @@ export function ManagerDashboardPage({
       h(MetricStrip, {
         key: "reports-strip",
         items: [
-          { label: "Active move reports", value: String(reportPlan.expectedPerDay), meta: "Expected each day across live moves" },
-          { label: "Shift start reports", value: String(reportPlan.expectedShiftReports), meta: "Per 12h opening cycle" },
-          { label: "Shift end reports", value: String(reportPlan.expectedShiftReports), meta: "Per 12h closing cycle" },
-          { label: "Final closeout", value: String(reportPlan.finalReportsPending), meta: "One final report per move" },
+          { label: "Moves on plan", value: String(onPlanCount), meta: "Active moves within +/-10 pts of planned progress" },
+          { label: "Behind plan", value: String(behindPlanCount), meta: "Active moves needing schedule recovery" },
+          { label: "Delay exposure", value: formatMinutes(totalDelayExposureMinutes), meta: "Recorded across active moves" },
+          { label: "Final closeout", value: String(reportPlan.finalReportsPending), meta: "Moves still waiting final report" },
         ],
       }),
       h(
@@ -1272,16 +1289,33 @@ export function ManagerDashboardPage({
         h(
           "div",
           { className: "section-heading" },
-          h("div", null, h("h2", null, "Reports Pipeline"), h("p", { className: "muted-copy" }, "Prepared layout for the reporting system that will be implemented next.")),
-          h("span", { className: "section-pill" }, "Planned"),
+          h("div", null, h("h2", null, "Operations Reporting Overview"), h("p", { className: "muted-copy" }, "Live assessment of actual execution against plan, using task completions and recorded delay causes.")),
+          h("span", { className: "section-pill" }, `${activeReportSummaries.length} active`),
         ),
-        h(
-          "div",
-          { className: "manager-report-pipeline" },
-          h("article", { className: "manager-report-stage" }, h("span", { className: "manager-report-stage-kicker" }, "Step 01"), h("strong", null, "Shift Start Report"), h("p", { className: "muted-copy" }, "First report at the beginning of each 12h shift to capture rig state, team readiness, and blockers.")),
-          h("article", { className: "manager-report-stage" }, h("span", { className: "manager-report-stage-kicker" }, "Step 02"), h("strong", null, "Shift End Report"), h("p", { className: "muted-copy" }, "Second report at the end of each 12h shift to capture moved loads, delays, and handoff notes.")),
-          h("article", { className: "manager-report-stage" }, h("span", { className: "manager-report-stage-kicker" }, "Step 03"), h("strong", null, "Final Move Report"), h("p", { className: "muted-copy" }, "One final closeout report after the rig move is complete with final route, time, and completion evidence.")),
-        ),
+        worstScheduleMove || highestDelayMove
+          ? h(
+              "div",
+              { className: "manager-report-preview-grid" },
+              worstScheduleMove
+                ? h(
+                    "article",
+                    { className: "manager-insight-card" },
+                    h("span", { className: "manager-insight-label" }, "Highest schedule risk"),
+                    h("strong", null, worstScheduleMove.moveName),
+                    h("p", { className: "muted-copy" }, worstScheduleMove.actualVsPlanSummary),
+                  )
+                : null,
+              highestDelayMove
+                ? h(
+                    "article",
+                    { className: "manager-insight-card" },
+                    h("span", { className: "manager-insight-label" }, "Largest delay exposure"),
+                    h("strong", null, highestDelayMove.moveName),
+                    h("p", { className: "muted-copy" }, highestDelayMove.delaySummary),
+                  )
+                : null,
+            )
+          : h("p", { className: "muted-copy" }, "No live execution data is available yet for actual-vs-plan reporting."),
       ),
       h(
         Card,
@@ -1289,16 +1323,29 @@ export function ManagerDashboardPage({
         h(
           "div",
           { className: "section-heading" },
-          h("div", null, h("h2", null, "Expected Daily Flow"), h("p", { className: "muted-copy" }, "Reporting volume forecast based on current live moves.")),
-          h("span", { className: "section-pill" }, `${reportPlan.activeMoves} live rigs`),
+          h("div", null, h("h2", null, "Actual vs Plan Snapshot"), h("p", { className: "muted-copy" }, "Professional reporting view for the active rig portfolio.")),
+          h("span", { className: "section-pill" }, `${activeReportSummaries.length} live rigs`),
         ),
-        h(
-          "div",
-          { className: "manager-report-preview-grid" },
-          h("article", { className: "manager-insight-card" }, h("span", { className: "manager-insight-label" }, "Per active move"), h("strong", null, "4 daily + 1 final"), h("p", { className: "muted-copy" }, "Two reports every 12h shift during the move, then one closeout report.")),
-          h("article", { className: "manager-insight-card" }, h("span", { className: "manager-insight-label" }, "Current day estimate"), h("strong", null, String(reportPlan.expectedPerDay)), h("p", { className: "muted-copy" }, "Projected total reports if all active moves remain open today.")),
-          h("article", { className: "manager-insight-card" }, h("span", { className: "manager-insight-label" }, "Final reports pending"), h("strong", null, String(reportPlan.finalReportsPending)), h("p", { className: "muted-copy" }, "Final closeout reports expected after completion.")),
-        ),
+        activeReportSummaries.length
+          ? h(
+              "div",
+              { className: "manager-list-stack" },
+              activeReportSummaries.slice(0, 4).map((summary) =>
+                h(
+                  "article",
+                  { key: summary.moveId, className: "manager-list-row manager-list-row-card" },
+                  h(
+                    "div",
+                    null,
+                    h("strong", null, summary.moveName),
+                    h("p", { className: "muted-copy" }, summary.actualVsPlanSummary),
+                    h("p", { className: "muted-copy" }, summary.delaySummary),
+                  ),
+                  h("strong", null, summary.scheduleStatus),
+                ),
+              ),
+            )
+          : h("p", { className: "muted-copy" }, "No active moves are producing live report analysis right now."),
       ),
     ];
   }
@@ -1439,15 +1486,15 @@ export function ManagerDashboardPage({
         h(
           Card,
           { className: "dashboard-section-card manager-dashboard-panel", key: "report-totals" },
-          h("div", { className: "section-heading" }, h("h2", null, "Report Totals"), h("span", { className: "section-pill" }, "Forecast")),
+          h("div", { className: "section-heading" }, h("h2", null, "Report Totals"), h("span", { className: "section-pill" }, "Live")),
           h(
             "div",
             { className: "manager-sidebar-stat-grid" },
             [
-              { label: "Daily estimate", value: String(reportPlan.expectedPerDay), meta: "Across live moves" },
-              { label: "Shift starts", value: String(reportPlan.expectedShiftReports), meta: "Beginning of shift" },
-              { label: "Shift ends", value: String(reportPlan.expectedShiftReports), meta: "End of shift" },
-              { label: "Final reports", value: String(reportPlan.finalReportsPending), meta: "Closeout pending" },
+              { label: "Daily estimate", value: String(reportPlan.expectedPerDay), meta: "Expected snapshots for open moves" },
+              { label: "On plan", value: String(onPlanCount), meta: "Active moves tracking near plan" },
+              { label: "Behind plan", value: String(behindPlanCount), meta: "Need management attention" },
+              { label: "Delay exposure", value: formatMinutes(totalDelayExposureMinutes), meta: "Across recorded delay items" },
             ].map((item) =>
               h(
                 "article",
@@ -1462,14 +1509,16 @@ export function ManagerDashboardPage({
         h(
           Card,
           { className: "dashboard-section-card manager-dashboard-panel", key: "report-notes" },
-          h("div", { className: "section-heading" }, h("h2", null, "Implementation Notes"), h("span", { className: "section-pill" }, "Next")),
-          h(
-            "div",
-            { className: "manager-note-list" },
-            h("p", null, "Each active move should produce 2 reports per 12-hour shift: one at shift start and one at shift end."),
-            h("p", null, "That produces 4 daily reports for every full day the rig move remains active."),
-            h("p", null, "A final move report closes the workflow once the rig reaches the destination and the move is complete."),
-          ),
+          h("div", { className: "section-heading" }, h("h2", null, "Management Notes"), h("span", { className: "section-pill" }, "Current")),
+          worstScheduleMove || highestDelayMove
+            ? h(
+                "div",
+                { className: "manager-note-list" },
+                worstScheduleMove ? h("p", null, `Schedule focus: ${worstScheduleMove.moveName}. ${worstScheduleMove.actualVsPlanSummary}`) : null,
+                highestDelayMove ? h("p", null, `Delay focus: ${highestDelayMove.moveName}. ${highestDelayMove.delaySummary}`) : null,
+                h("p", null, "Daily reports now capture planned progress, actual completion, schedule variance, stage performance, and primary delay drivers."),
+              )
+            : h("p", { className: "muted-copy" }, "Management notes will appear here once active moves begin generating execution data."),
         ),
       ];
     }
