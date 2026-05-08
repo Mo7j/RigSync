@@ -24,7 +24,7 @@ class NavigationService {
       '?overview=full&geometries=geojson&steps=true',
     );
 
-    final http.Response response = await _client.get(uri);
+    final http.Response response = await _client.get(uri).timeout(const Duration(seconds: 5));
     if (response.statusCode < 200 || response.statusCode >= 300) {
       throw NavigationException('OSRM routing failed (${response.statusCode}).');
     }

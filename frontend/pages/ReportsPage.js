@@ -9,8 +9,10 @@ import { translate } from "../lib/language.js";
 const { useEffect, useMemo, useRef, useState } = React;
 const DAILY_REPORT_TYPE = "daily";
 const FINAL_REPORT_TYPE = "final";
-const DAILY_REPORT_INTERVAL_MS = 60 * 1000;
+const DAILY_REPORT_INTERVAL_MS = 15 * 60 * 1000;
 const DAILY_REPORT_SLOTS = ["Morning", "Night"];
+const FLAG_STATE_OPEN = "open";
+const FLAG_STATE_RESOLVED = "resolved";
 
 function isSameCalendarDay(value, referenceDate = new Date()) {
   if (!value) {
@@ -34,12 +36,21 @@ function getReportDateKey(value) {
   return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
 }
 
-function getMinuteBucketKey(value) {
+function getQuarterHourBucketKey(value) {
   const date = value instanceof Date ? value : new Date(value);
   if (Number.isNaN(date.getTime())) {
     return "";
   }
-  return `${getReportDateKey(date)}-${String(date.getHours()).padStart(2, "0")}-${String(date.getMinutes()).padStart(2, "0")}`;
+  const minuteBucket = Math.floor(date.getMinutes() / 15) * 15;
+  return `${getReportDateKey(date)}-${String(date.getHours()).padStart(2, "0")}-${String(minuteBucket).padStart(2, "0")}`;
+}
+
+function isQuarterHourBoundary(value) {
+  const date = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return false;
+  }
+  return date.getMinutes() % 15 === 0;
 }
 
 function formatSafeDateTime(value, fallback = "--") {
@@ -221,7 +232,7 @@ function buildDailyReportRecord(summary, currentDate) {
     latestReason: summary.latestReason,
     latestUpdate: summary.latestUpdate,
     createdAt: new Date(currentDate).toISOString(),
-    createdMinuteBucket: getMinuteBucketKey(currentDate),
+    createdMinuteBucket: getQuarterHourBucketKey(currentDate),
     completedStageTasks: summary.completedStageTasks,
     latestEvents: summary.latestEvents,
     stageItems: summary.stageItems,
@@ -325,7 +336,7 @@ function buildFinalReportRecord(summary, currentDate) {
     latestReason: summary.latestReason,
     latestUpdate: summary.latestUpdate,
     createdAt: new Date(currentDate).toISOString(),
-    createdMinuteBucket: getMinuteBucketKey(currentDate),
+    createdMinuteBucket: getQuarterHourBucketKey(currentDate),
     completedStageTasks: summary.completedStageTasks,
     latestEvents: summary.latestEvents,
     stageItems: summary.stageItems,
@@ -350,8 +361,25 @@ export function ReportsPage({
   const finalGenerationRef = useRef("");
 
   useEffect(() => {
-    const intervalId = window.setInterval(() => setReportNow(new Date()), DAILY_REPORT_INTERVAL_MS);
-    return () => window.clearInterval(intervalId);
+    function syncNow() {
+      setReportNow(new Date());
+    }
+
+    syncNow();
+    const delayMs = 60000 - ((Date.now() % 60000) || 60000);
+    const timeoutId = window.setTimeout(() => {
+      syncNow();
+      const intervalId = window.setInterval(syncNow, 60000);
+      window.__rigsyncReportsMinuteInterval = intervalId;
+    }, delayMs);
+
+    return () => {
+      window.clearTimeout(timeoutId);
+      if (window.__rigsyncReportsMinuteInterval) {
+        window.clearInterval(window.__rigsyncReportsMinuteInterval);
+        window.__rigsyncReportsMinuteInterval = null;
+      }
+    };
   }, []);
 
   const reports = Array.isArray(managerResources?.reports) ? managerResources.reports : [];
@@ -369,9 +397,17 @@ export function ReportsPage({
     () => reports.filter((report) => String(report?.type || "").trim().toLowerCase() === FINAL_REPORT_TYPE).sort((a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0)),
     [reports],
   );
+  const allTaskAssignments = useMemo(
+    () => (Array.isArray(managerResources?.taskAssignments) ? managerResources.taskAssignments : []),
+    [managerResources],
+  );
+  const allFlagEntries = useMemo(
+    () => buildLiveFlagEntries(allTaskAssignments, reportNow),
+    [allTaskAssignments, reportNow],
+  );
   const latestDelayEvents = useMemo(
-    () => allMoveSummaries.flatMap((summary) => summary.latestEvents.map((event) => ({ ...event, moveName: summary.moveName }))).sort((a, b) => new Date(b.time || 0) - new Date(a.time || 0)).slice(0, 8),
-    [allMoveSummaries],
+    () => allFlagEntries.slice(0, 8),
+    [allFlagEntries],
   );
   const reportTotals = useMemo(() => ({
     activeRigsToday: activeMoveSummaries.length,
@@ -379,16 +415,19 @@ export function ReportsPage({
     generatedDailyReports: dailyReports.length,
     generatedFinalReports: finalReports.length,
     delayedRigs: allMoveSummaries.filter((summary) => summary.delayEventCount > 0 || summary.delayMinutesToday > 0).length,
-    openFlags: latestDelayEvents.filter((event) => event.state !== "resolved").length,
+    openFlags: allFlagEntries.filter((event) => event.state !== FLAG_STATE_RESOLVED).length,
     activeDrivers: allMoveSummaries.reduce((sum, summary) => sum + summary.activeDriversCount, 0),
     completedMoves: completedMoveSummaries.length,
-  }), [activeMoveSummaries, allMoveSummaries, dailyReports, finalReports, latestDelayEvents, completedMoveSummaries]);
+  }), [activeMoveSummaries, allMoveSummaries, dailyReports, finalReports, allFlagEntries, completedMoveSummaries]);
 
   useEffect(() => {
     if (typeof onSaveResources !== "function" || !activeMoveSummaries.length) {
       return;
     }
-    const bucketKey = getMinuteBucketKey(reportNow);
+    if (!isQuarterHourBoundary(reportNow)) {
+      return;
+    }
+    const bucketKey = getQuarterHourBucketKey(reportNow);
     if (!bucketKey || minuteGenerationRef.current === bucketKey) {
       return;
     }
@@ -400,6 +439,12 @@ export function ReportsPage({
         .filter((report) => report.moveId === summary.moveId && report.reportDate === reportDate)
         .sort((left, right) => new Date(left.createdAt || 0) - new Date(right.createdAt || 0));
       if (moveReportsToday.length >= DAILY_REPORT_SLOTS.length) {
+        return;
+      }
+      const latestReport = moveReportsToday[moveReportsToday.length - 1] || null;
+      const latestReportMs = latestReport ? new Date(latestReport.createdAt || 0).getTime() : 0;
+      const reportNowMs = reportNow.getTime();
+      if (latestReportMs > 0 && Number.isFinite(latestReportMs) && reportNowMs - latestReportMs < DAILY_REPORT_INTERVAL_MS) {
         return;
       }
       const nextSlot = DAILY_REPORT_SLOTS[moveReportsToday.length];
@@ -455,6 +500,55 @@ export function ReportsPage({
     }, 250);
   }
 
+  function handleDeleteReport(reportId) {
+    if (typeof onSaveResources !== "function") {
+      return;
+    }
+    void onSaveResources({
+      ...(managerResources || {}),
+      reports: reports.filter((report) => report.id !== reportId),
+    });
+  }
+
+  function handleUpdateFlag(flagId, mutateFlag) {
+    if (typeof onSaveResources !== "function") {
+      return;
+    }
+    const nextTaskAssignments = allTaskAssignments.map((assignment) => {
+      const flags = Array.isArray(assignment.flags) ? assignment.flags : [];
+      if (!flags.some((flag) => flag?.id === flagId)) {
+        return assignment;
+      }
+      return {
+        ...assignment,
+        flags: mutateFlag(flags),
+        updatedAt: new Date().toISOString(),
+      };
+    });
+    void onSaveResources({
+      ...(managerResources || {}),
+      taskAssignments: nextTaskAssignments,
+    });
+  }
+
+  function handleResolveFlag(flagId) {
+    handleUpdateFlag(flagId, (flags) =>
+      flags.map((flag) =>
+        flag?.id === flagId
+          ? {
+              ...flag,
+              status: FLAG_STATE_RESOLVED,
+              resolvedAt: flag.resolvedAt || new Date().toISOString(),
+            }
+          : flag,
+      ),
+    );
+  }
+
+  function handleDeleteFlag(flagId) {
+    handleUpdateFlag(flagId, (flags) => flags.filter((flag) => flag?.id !== flagId));
+  }
+
   function renderPrintButton(report, kind) {
     return h(Button, {
       type: "button",
@@ -470,6 +564,16 @@ export function ReportsPage({
           h("path", { fill: "currentColor", d: "M7 3h10v4H7V3zm10 8h2v6h-3v4H8v-4H5v-6h2v4h10v-4zm-3 8v-4H10v4h4zM6 9h12a3 3 0 0 1 3 3v5h-3v-2H6v2H3v-5a3 3 0 0 1 3-3z" })
         )
       ),
+    });
+  }
+
+  function renderDeleteButton(onClick, label = "Delete") {
+    return h(Button, {
+      type: "button",
+      variant: "ghost",
+      size: "sm",
+      onClick,
+      children: label,
     });
   }
 
@@ -521,6 +625,7 @@ export function ReportsPage({
                   { className: "driver-task-actions" },
                   h("span", { className: "manager-resource-status manager-resource-status-active" }, report.slot || "Morning"),
                   renderPrintButton(report, DAILY_REPORT_TYPE),
+                  renderDeleteButton(() => handleDeleteReport(report.id)),
                 ),
               ),
               h(
@@ -537,7 +642,7 @@ export function ReportsPage({
             ),
           ),
         )
-      : h("p", { className: "muted-copy" }, "No saved daily reports yet. Reports are generated every 1 minute for active rig moves, up to Morning and Night per day.");
+      : h("p", { className: "muted-copy" }, "No saved daily reports yet. Reports are generated every 15 minutes for active rig moves, up to Morning and Night per day.");
   }
 
   function renderFinalTab() {
@@ -558,6 +663,7 @@ export function ReportsPage({
                   { className: "driver-task-actions" },
                   h("span", { className: "manager-resource-status manager-resource-status-active" }, "Final"),
                   renderPrintButton(report, FINAL_REPORT_TYPE),
+                  renderDeleteButton(() => handleDeleteReport(report.id)),
                 ),
               ),
               h(
@@ -647,7 +753,7 @@ export function ReportsPage({
                 h("p", { className: "muted-copy" }, activeTab === "active"
                   ? "Current active rig status from the local operation flow."
                   : activeTab === "daily"
-                    ? "Saved Morning and Night daily snapshots generated automatically every minute for testing."
+                  ? "Saved Morning and Night daily snapshots generated automatically every 15 minutes for testing."
                     : "Final move closeout reports generated automatically when all tasks are completed."),
               ),
               activeTab === "daily"
@@ -701,13 +807,17 @@ export function ReportsPage({
                     h(
                       "article",
                       { key: event.id, className: "manager-resource-card" },
-                      h("div", { className: "manager-resource-card-head" }, h("div", null, h("strong", null, event.reason), h("p", { className: "muted-copy" }, event.moveName)), h("span", { className: `manager-resource-status ${event.state === "resolved" ? "manager-resource-status-active" : "manager-resource-status-busy"}` }, event.state === "resolved" ? "Resolved" : "Open")),
-                      h("p", { className: "muted-copy" }, `${event.driver || "Driver"} - ${event.stage || "move"}`),
+                      h("div", { className: "manager-resource-card-head" }, h("div", null, h("strong", null, event.reason), h("p", { className: "muted-copy" }, event.moveName)), h("span", { className: `manager-resource-status ${event.state === FLAG_STATE_RESOLVED ? "manager-resource-status-active" : "manager-resource-status-busy"}` }, event.state === FLAG_STATE_RESOLVED ? "Resolved" : "Open")),
+                      h("p", { className: "muted-copy" }, `${event.driverName || "Driver"} - ${event.stage || "move"}`),
                       h("div", { className: "manager-resource-metrics" },
                         h("div", { className: "manager-rig-stat" }, h("span", null, "Trip"), h("strong", null, event.trip || "--")),
                         h("div", { className: "manager-rig-stat" }, h("span", null, "Destination"), h("strong", null, event.destination || "--")),
                         h("div", { className: "manager-rig-stat" }, h("span", null, "Time"), h("strong", null, formatSafeDateTime(event.time))),
                         h("div", { className: "manager-rig-stat" }, h("span", null, "Delay"), h("strong", null, `${event.delayMinutes || 0} min`)),
+                      ),
+                      h("div", { className: "driver-task-actions" },
+                        event.state !== FLAG_STATE_RESOLVED ? renderDeleteButton(() => handleResolveFlag(event.id), "Resolve") : null,
+                        renderDeleteButton(() => handleDeleteFlag(event.id)),
                       ),
                     ),
                   ),
@@ -719,3 +829,4 @@ export function ReportsPage({
     ),
   );
 }
+

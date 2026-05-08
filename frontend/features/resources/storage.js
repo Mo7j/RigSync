@@ -201,6 +201,20 @@ function normalizeTaskAssignmentEntry(entry, index) {
           }
         : null,
     },
+    flags: Array.isArray(entry.flags)
+      ? entry.flags
+          .map((flag, flagIndex) => ({
+            id: String(flag?.id || `flag-${index + 1}-${flagIndex + 1}`).trim(),
+            type: String(flag?.type || "").trim(),
+            label: String(flag?.label || flag?.type || "Driver flag").trim(),
+            reason: String(flag?.reason || "").trim(),
+            status: String(flag?.status || "open").trim() || "open",
+            createdAt: flag?.createdAt || null,
+            resolvedAt: flag?.resolvedAt || null,
+            lateMinutes: Math.max(0, Number(flag?.lateMinutes) || 0),
+          }))
+          .filter((flag) => flag.type || flag.reason || flag.createdAt)
+      : [],
     status: String(entry.status || "").trim() || (currentStage === "completed" ? "completed" : "queued"),
     sequence: Math.max(1, Number.parseInt(entry.sequence, 10) || index + 1),
     assignedAt: entry.assignedAt || null,

@@ -1,24 +1,36 @@
 import 'package:flutter/material.dart';
 
-import '../models/driver_task.dart';
+import '../l10n/app_strings.dart';
+import '../models/driver_assignment.dart';
 
 class TaskBoardScreen extends StatelessWidget {
   const TaskBoardScreen({
     super.key,
     required this.driverName,
-    required this.tasks,
+    required this.driverStatus,
+    required this.currentTasks,
+    required this.upcomingTasks,
     required this.onLogout,
-    required this.onOpenTask,
+    required this.onToggleLanguage,
+    required this.onOpenAssignment,
+    required this.onSetAvailable,
+    required this.onSetBusy,
   });
 
   final String driverName;
-  final List<DriverTask> tasks;
+  final String driverStatus;
+  final List<DriverAssignment> currentTasks;
+  final List<DriverAssignment> upcomingTasks;
   final VoidCallback onLogout;
-  final ValueChanged<DriverTask> onOpenTask;
+  final VoidCallback onToggleLanguage;
+  final ValueChanged<DriverAssignment> onOpenAssignment;
+  final Future<void> Function() onSetAvailable;
+  final Future<void> Function() onSetBusy;
 
   @override
   Widget build(BuildContext context) {
-    final theme = Theme.of(context);
+    final ThemeData theme = Theme.of(context);
+    final AppStrings strings = AppStrings.of(context);
 
     return Scaffold(
       appBar: AppBar(
@@ -26,21 +38,19 @@ class TaskBoardScreen extends StatelessWidget {
         title: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: <Widget>[
-            Text(
-              'Assigned tasks',
-              style: theme.textTheme.titleLarge,
-            ),
+            Text(strings.tr('taskQueue', 'Task queue'), style: theme.textTheme.titleLarge),
             const SizedBox(height: 2),
-            Text(
-              driverName,
-              style: theme.textTheme.bodyMedium,
-            ),
+            Text(driverName, style: theme.textTheme.bodyMedium),
           ],
         ),
         actions: <Widget>[
           TextButton(
+            onPressed: onToggleLanguage,
+            child: Text(strings.isArabic ? 'EN' : 'AR'),
+          ),
+          TextButton(
             onPressed: onLogout,
-            child: const Text('Logout'),
+            child: Text(strings.tr('logout', 'Logout')),
           ),
           const SizedBox(width: 8),
         ],
@@ -54,73 +64,121 @@ class TaskBoardScreen extends StatelessWidget {
               color: const Color(0xFF11161D),
               borderRadius: BorderRadius.circular(26),
             ),
-            child: Row(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
               children: <Widget>[
-                Expanded(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: <Widget>[
-                      Text(
-                        'Today''s route board',
-                        style: theme.textTheme.titleLarge,
-                      ),
-                      const SizedBox(height: 6),
-                      Text(
-                        'View task details, start navigation, and keep dispatch updated with your live position.',
-                        style: theme.textTheme.bodyMedium,
-                      ),
-                    ],
-                  ),
+                Text(strings.tr('assignedToYou', 'Assigned to you'), style: theme.textTheme.titleLarge),
+                const SizedBox(height: 8),
+                Text(
+                  '${strings.tr('driverStatus', 'Driver status')}: ${_statusLabel(strings, driverStatus)}',
+                  style: theme.textTheme.bodyMedium,
                 ),
-                const SizedBox(width: 12),
-                Container(
-                  padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
-                  decoration: BoxDecoration(
-                    color: const Color(0x19C6FF00),
-                    borderRadius: BorderRadius.circular(16),
-                  ),
-                  child: Text(
-                    '${tasks.length} tasks',
-                    style: theme.textTheme.titleMedium?.copyWith(
-                      color: const Color(0xFFC6FF00),
+                const SizedBox(height: 16),
+                Row(
+                  children: <Widget>[
+                    Expanded(
+                      child: OutlinedButton(
+                        onPressed: () async {
+                          await onSetAvailable();
+                        },
+                        child: Text(strings.tr('available', 'Available')),
+                      ),
                     ),
-                  ),
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: OutlinedButton(
+                        onPressed: () async {
+                          await onSetBusy();
+                        },
+                        child: Text(strings.tr('busy', 'Busy')),
+                      ),
+                    ),
+                  ],
                 ),
               ],
             ),
           ),
           const SizedBox(height: 18),
-          ...tasks.map(
-            (DriverTask task) => Padding(
-              padding: const EdgeInsets.only(bottom: 14),
-              child: _TaskCard(
-                task: task,
-                onTap: () => onOpenTask(task),
-              ),
+          _SectionTitle(title: strings.tr('currentTasks', 'Current tasks')),
+          if (currentTasks.isEmpty)
+            Padding(
+              padding: const EdgeInsets.only(top: 10),
+              child: Text(strings.tr('noCurrentTasks', 'No current tasks.'), style: theme.textTheme.bodyMedium),
             ),
-          ),
+          ...currentTasks.map((DriverAssignment assignment) => Padding(
+                padding: const EdgeInsets.only(top: 12),
+                child: _AssignmentCard(
+                  assignment: assignment,
+                  strings: strings,
+                  onTap: () => onOpenAssignment(assignment),
+                ),
+              )),
+          const SizedBox(height: 18),
+          _SectionTitle(title: strings.tr('upcomingTasks', 'Upcoming tasks')),
+          if (upcomingTasks.isEmpty)
+            Padding(
+              padding: const EdgeInsets.only(top: 10),
+              child: Text(strings.tr('noUpcomingTasks', 'No upcoming tasks.'), style: theme.textTheme.bodyMedium),
+            ),
+          ...upcomingTasks.map((DriverAssignment assignment) => Padding(
+                padding: const EdgeInsets.only(top: 12),
+                child: _AssignmentCard(
+                  assignment: assignment,
+                  strings: strings,
+                  onTap: () => onOpenAssignment(assignment),
+                ),
+              )),
         ],
       ),
     );
   }
+
+  static String _statusLabel(AppStrings strings, String status) {
+    switch (status) {
+      case 'busy':
+        return strings.tr('busy', 'Busy');
+      case 'active':
+        return strings.tr('active', 'Active');
+      case 'offline':
+        return strings.tr('offline', 'Offline');
+      default:
+        return strings.tr('available', 'Available');
+    }
+  }
 }
 
-class _TaskCard extends StatelessWidget {
-  const _TaskCard({
-    required this.task,
+class _SectionTitle extends StatelessWidget {
+  const _SectionTitle({required this.title});
+
+  final String title;
+
+  @override
+  Widget build(BuildContext context) {
+    return Text(title, style: Theme.of(context).textTheme.titleLarge);
+  }
+}
+
+class _AssignmentCard extends StatelessWidget {
+  const _AssignmentCard({
+    required this.assignment,
+    required this.strings,
     required this.onTap,
   });
 
-  final DriverTask task;
+  final DriverAssignment assignment;
+  final AppStrings strings;
   final VoidCallback onTap;
 
   @override
   Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-    final (_StatusPalette palette, String actionLabel) = switch (task.status) {
-      DriverTaskStatus.pending => (const _StatusPalette(Color(0xFFFFB74D), Color(0x22FFB74D)), 'View task'),
-      DriverTaskStatus.ready => (const _StatusPalette(Color(0xFFC6FF00), Color(0x19C6FF00)), 'Start task'),
-      DriverTaskStatus.inProgress => (const _StatusPalette(Color(0xFF58D1FF), Color(0x2258D1FF)), 'Resume drive'),
+    final ThemeData theme = Theme.of(context);
+    final (_StatusPalette palette, String actionLabel) = switch (assignment.status) {
+      AssignmentStatus.assigned => (const _StatusPalette(Color(0xFFC6FF00), Color(0x19C6FF00)), strings.tr('acceptAndStart', 'Accept and open map')),
+      AssignmentStatus.accepted => (const _StatusPalette(Color(0xFF58D1FF), Color(0x2258D1FF)), strings.tr('openMap', 'Open map')),
+      AssignmentStatus.active => (const _StatusPalette(Color(0xFF58D1FF), Color(0x2258D1FF)), strings.tr('openMap', 'Open map')),
+      AssignmentStatus.paused => (const _StatusPalette(Color(0xFFFFD466), Color(0x22FFD466)), strings.tr('resumeTask', 'Resume task')),
+      AssignmentStatus.completed => (const _StatusPalette(Color(0xFF8DA39C), Color(0x228DA39C)), strings.tr('taskDetails', 'Task details')),
+      AssignmentStatus.queued => (const _StatusPalette(Color(0xFFFFB74D), Color(0x22FFB74D)), strings.tr('queuedTaskLocked', 'Waiting for current trip')),
     };
 
     return Card(
@@ -135,9 +193,16 @@ class _TaskCard extends StatelessWidget {
               Row(
                 children: <Widget>[
                   Expanded(
-                    child: Text(
-                      task.title,
-                      style: theme.textTheme.titleLarge,
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: <Widget>[
+                        Text(assignment.moveName, style: theme.textTheme.titleLarge),
+                        const SizedBox(height: 4),
+                        Text(
+                          assignment.tripLabel,
+                          style: theme.textTheme.bodyMedium?.copyWith(color: Colors.white70),
+                        ),
+                      ],
                     ),
                   ),
                   Container(
@@ -147,40 +212,21 @@ class _TaskCard extends StatelessWidget {
                       borderRadius: BorderRadius.circular(14),
                     ),
                     child: Text(
-                      _statusLabel(task.status),
-                      style: theme.textTheme.bodyMedium?.copyWith(
-                        color: palette.foreground,
-                      ),
+                      _statusLabel(strings, assignment.status),
+                      style: theme.textTheme.bodyMedium?.copyWith(color: palette.foreground),
                     ),
                   ),
                 ],
               ),
               const SizedBox(height: 10),
-              Text(
-                task.assetName,
-                style: theme.textTheme.bodyLarge?.copyWith(
-                  color: Colors.white,
-                ),
-              ),
+              Text(_stageLabel(strings, assignment.currentStage), style: theme.textTheme.bodyLarge?.copyWith(color: Colors.white)),
               const SizedBox(height: 14),
               Wrap(
                 spacing: 12,
                 runSpacing: 12,
                 children: <Widget>[
-                  SizedBox(
-                    width: 140,
-                    child: _MetaBlock(
-                      label: 'From',
-                      value: task.origin.label,
-                    ),
-                  ),
-                  SizedBox(
-                    width: 140,
-                    child: _MetaBlock(
-                      label: 'To',
-                      value: task.destination.label,
-                    ),
-                  ),
+                  SizedBox(width: 150, child: _MetaBlock(label: strings.tr('from', 'From'), value: assignment.startLabel)),
+                  SizedBox(width: 150, child: _MetaBlock(label: strings.tr('to', 'To'), value: assignment.endLabel)),
                 ],
               ),
               const SizedBox(height: 14),
@@ -191,24 +237,22 @@ class _TaskCard extends StatelessWidget {
                   SizedBox(
                     width: 110,
                     child: _MetaBlock(
-                      label: 'Window',
-                      value: task.scheduledWindow,
+                      label: strings.tr('trip', 'Trip'),
+                      value: assignment.plannedTripCount > 0
+                          ? '${assignment.tripNumber}/${assignment.plannedTripCount}'
+                          : (assignment.tripNumber > 0 ? '${assignment.tripNumber}' : '--'),
                     ),
                   ),
                   SizedBox(
-                    width: 110,
+                    width: 130,
                     child: _MetaBlock(
-                      label: 'ETA',
-                      value: '${task.etaMinutes} min',
+                      label: strings.tr('load', 'Load'),
+                      value: assignment.loadCode.isNotEmpty ? assignment.loadCode : '--',
                     ),
                   ),
-                  SizedBox(
-                    width: 110,
-                    child: _MetaBlock(
-                      label: 'Distance',
-                      value: '${task.totalDistanceKm} km',
-                    ),
-                  ),
+                  SizedBox(width: 110, child: _MetaBlock(label: strings.tr('taskState', 'Task state'), value: _statusLabel(strings, assignment.status))),
+                  SizedBox(width: 110, child: _MetaBlock(label: strings.tr('stage', 'Stage'), value: _stageLabel(strings, assignment.currentStage))),
+                  SizedBox(width: 110, child: _MetaBlock(label: '#', value: '${assignment.sequence}')),
                 ],
               ),
               const SizedBox(height: 18),
@@ -226,12 +270,34 @@ class _TaskCard extends StatelessWidget {
     );
   }
 
-  static String _statusLabel(DriverTaskStatus status) {
-    return switch (status) {
-      DriverTaskStatus.pending => 'Pending',
-      DriverTaskStatus.ready => 'Ready',
-      DriverTaskStatus.inProgress => 'In progress',
-    };
+  static String _statusLabel(AppStrings strings, AssignmentStatus status) {
+    switch (status) {
+      case AssignmentStatus.assigned:
+        return strings.tr('stateAssigned', 'Assigned');
+      case AssignmentStatus.accepted:
+        return strings.tr('stateAccepted', 'Accepted');
+      case AssignmentStatus.active:
+        return strings.tr('active', 'Active');
+      case AssignmentStatus.paused:
+        return strings.tr('statePaused', 'Paused');
+      case AssignmentStatus.completed:
+        return strings.tr('stateCompleted', 'Completed');
+      case AssignmentStatus.queued:
+        return strings.tr('stateQueued', 'Queued');
+    }
+  }
+
+  static String _stageLabel(AppStrings strings, AssignmentStage stage) {
+    switch (stage) {
+      case AssignmentStage.rigDown:
+        return strings.tr('stageRigDown', 'Rig Down');
+      case AssignmentStage.rigMove:
+        return strings.tr('stageRigMove', 'Rig Move');
+      case AssignmentStage.rigUp:
+        return strings.tr('stageRigUp', 'Rig Up');
+      case AssignmentStage.completed:
+        return strings.tr('stageCompleted', 'Completed');
+    }
   }
 }
 
@@ -246,7 +312,7 @@ class _MetaBlock extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final theme = Theme.of(context);
+    final ThemeData theme = Theme.of(context);
     return Container(
       padding: const EdgeInsets.all(14),
       decoration: BoxDecoration(
@@ -256,17 +322,9 @@ class _MetaBlock extends StatelessWidget {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: <Widget>[
-          Text(
-            label,
-            style: theme.textTheme.bodyMedium,
-          ),
+          Text(label, style: theme.textTheme.bodyMedium),
           const SizedBox(height: 6),
-          Text(
-            value,
-            style: theme.textTheme.titleMedium?.copyWith(
-              color: Colors.white,
-            ),
-          ),
+          Text(value, style: theme.textTheme.titleMedium?.copyWith(color: Colors.white)),
         ],
       ),
     );

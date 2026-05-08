@@ -298,7 +298,7 @@ class LiveDriverRepository {
     }
 
     final String routeTime = _asString(move?['routeTime']);
-    final RegExp match = RegExp(r'(\d+)').firstMatch(routeTime);
+    final RegExpMatch? match = RegExp(r'(\d+)').firstMatch(routeTime);
     if (match != null) {
       return int.tryParse(match.group(1) ?? '') ?? 0;
     }
@@ -313,7 +313,7 @@ class LiveDriverRepository {
     }
 
     final String routeLabel = _asString(move?['routeKm']);
-    final RegExp match = RegExp(r'(\d+)').firstMatch(routeLabel);
+    final RegExpMatch? match = RegExp(r'(\d+)').firstMatch(routeLabel);
     if (match != null) {
       return int.tryParse(match.group(1) ?? '') ?? 0;
     }
@@ -457,3 +457,4 @@ class LiveDriverRepository {
     return double.tryParse(value?.toString() ?? '');
   }
 }
+

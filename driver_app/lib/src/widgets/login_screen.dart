@@ -1,12 +1,16 @@
 import 'package:flutter/material.dart';
 
+import '../l10n/app_strings.dart';
+
 class LoginScreen extends StatefulWidget {
   const LoginScreen({
     super.key,
     required this.onLogin,
+    required this.onToggleLanguage,
   });
 
   final Future<void> Function(String email, String password) onLogin;
+  final VoidCallback onToggleLanguage;
 
   @override
   State<LoginScreen> createState() => _LoginScreenState();
@@ -32,10 +36,7 @@ class _LoginScreenState extends State<LoginScreen> {
     });
 
     try {
-      await widget.onLogin(
-        _emailController.text,
-        _passwordController.text,
-      );
+      await widget.onLogin(_emailController.text, _passwordController.text);
     } catch (error) {
       setState(() {
         _error = error.toString().replaceFirst('Exception: ', '');
@@ -51,7 +52,8 @@ class _LoginScreenState extends State<LoginScreen> {
 
   @override
   Widget build(BuildContext context) {
-    final theme = Theme.of(context);
+    final ThemeData theme = Theme.of(context);
+    final AppStrings strings = AppStrings.of(context);
 
     return Scaffold(
       body: SafeArea(
@@ -67,8 +69,15 @@ class _LoginScreenState extends State<LoginScreen> {
                     mainAxisSize: MainAxisSize.min,
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: <Widget>[
+                      Align(
+                        alignment: AlignmentDirectional.centerEnd,
+                        child: TextButton(
+                          onPressed: widget.onToggleLanguage,
+                          child: Text(strings.isArabic ? 'EN' : 'AR'),
+                        ),
+                      ),
                       Text(
-                        'RigSync Driver',
+                        strings.tr('appTitle', 'RigSync Driver'),
                         style: theme.textTheme.bodyMedium?.copyWith(
                           color: const Color(0xFFC6FF00),
                           letterSpacing: 1.2,
@@ -76,20 +85,20 @@ class _LoginScreenState extends State<LoginScreen> {
                       ),
                       const SizedBox(height: 10),
                       Text(
-                        'Driver login',
+                        strings.tr('loginTitle', 'Driver login'),
                         style: theme.textTheme.displaySmall,
                       ),
                       const SizedBox(height: 10),
                       Text(
-                        'A focused mobile view for assigned tasks, route guidance, speed, and live location updates.',
+                        strings.tr('loginSubtitle', 'Sign in to see your current and upcoming tasks.'),
                         style: theme.textTheme.bodyLarge,
                       ),
                       const SizedBox(height: 24),
                       TextField(
                         controller: _emailController,
                         keyboardType: TextInputType.emailAddress,
-                        decoration: const InputDecoration(
-                          labelText: 'Email',
+                        decoration: InputDecoration(
+                          labelText: strings.tr('email', 'Email'),
                           hintText: 'driver@rigsync.com',
                         ),
                       ),
@@ -97,9 +106,9 @@ class _LoginScreenState extends State<LoginScreen> {
                       TextField(
                         controller: _passwordController,
                         obscureText: true,
-                        decoration: const InputDecoration(
-                          labelText: 'Password',
-                          hintText: 'Enter password',
+                        decoration: InputDecoration(
+                          labelText: strings.tr('password', 'Password'),
+                          hintText: '******',
                         ),
                       ),
                       if (_error != null) ...<Widget>[
@@ -115,20 +124,16 @@ class _LoginScreenState extends State<LoginScreen> {
                       SizedBox(
                         width: double.infinity,
                         child: ElevatedButton(
-                          onPressed: _isSubmitting ? null : _submit,
-                          child: Text(_isSubmitting ? 'Signing in...' : 'Login'),
-                        ),
-                      ),
-                      const SizedBox(height: 14),
-                      Container(
-                        padding: const EdgeInsets.all(16),
-                        decoration: BoxDecoration(
-                          color: const Color(0xFF171D26),
-                          borderRadius: BorderRadius.circular(18),
-                        ),
-                        child: Text(
-                          'This screen now uses the live Firebase driver account created from the manager portal.',
-                          style: theme.textTheme.bodyMedium,
+                          onPressed: _isSubmitting
+                              ? null
+                              : () {
+                                  _submit();
+                                },
+                          child: Text(
+                            _isSubmitting
+                                ? strings.tr('loggingIn', 'Signing in...')
+                                : strings.tr('login', 'Login'),
+                          ),
                         ),
                       ),
                     ],
