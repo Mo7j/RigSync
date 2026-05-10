@@ -1,10 +1,32 @@
 # RigSync
 
+**Digital twin platform for rig move planning, fleet coordination, and execution tracking.**
+
+![Status](https://img.shields.io/badge/status-prototype-3b82f6)
+![Stack](https://img.shields.io/badge/stack-Flask%20%7C%20JavaScript%20%7C%20Flutter-111827)
+![Focus](https://img.shields.io/badge/focus-operations%20simulation%20%26%20execution-0f766e)
+
 RigSync is a full-stack platform for planning, simulating, and executing land rig moves. It combines planning data, fleet coordination, route visibility, execution tracking, and driver workflows in a single system.
 
 The project includes a web platform for managers and foremen, a Python backend for planning data and operational APIs, and a separate Flutter driver app for field execution.
 
-## Overview
+![RigSync Poster](./TEAM_M034_POSTER.jpg)
+
+## Why This Project
+
+Rig moves are high-cost, multi-stage operations that usually depend on fragmented coordination across spreadsheets, calls, static schedules, and manual status updates. That makes planning slower, execution harder to track, and operational decisions less reliable once conditions change in the field.
+
+RigSync was built to bring those workflows into one system. Instead of treating planning, tracking, and driver coordination as separate tasks, the project models them as one connected operational flow.
+
+## Problem It Solves
+
+- Reduces fragmented planning across disconnected tools
+- Improves visibility into truck, driver, and rig readiness
+- Makes execution progress easier to monitor across move stages
+- Supports better planning decisions through scenario comparison
+- Connects office-level coordination with field-level execution
+
+## Features
 
 - Plan rig moves from structured load and truck data
 - Compare execution scenarios by time, cost, and utilization
